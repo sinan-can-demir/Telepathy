@@ -339,6 +339,7 @@
             if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/';return;}
             if(!r.ok)return;
             const data=await r.json();
+            if(data.current_user_id){localStorage.setItem('my_user_id',data.current_user_id);}
             if(data.both_joined){
                 waitingOverlay.style.display='none';
                 chatHeader.style.display='flex';
@@ -359,6 +360,7 @@
             const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:{'Authorization':'Token '+token}});
             if(!r.ok){if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/';}return;}
             const data=await r.json();
+            if(data.current_user_id){localStorage.setItem('my_user_id',data.current_user_id);}
             if(data.partner&&data.partner!==partnerUsername){partnerUsername=data.partner;partnerNameEl.textContent=partnerUsername;await loadPartnerKey();}
             await appendNewMessages(data.messages, data.current_user);
         }catch(e){console.error('fetchNewMessages:',e);}
@@ -391,7 +393,7 @@
 
         try{
             cryptoSteps.push({label:'RSA-OAEP key unwrap', ok:null});
-            const wk = isMine ? (msg.sender_encrypted_symmetric_key||msg.encrypted_symmetric_key) : msg.encrypted_symmetric_key;
+            const wk = msg.my_encrypted_symmetric_key;
             if(!wk) throw new Error('No wrapped key');
             const aesKeyBuf = await crypto.subtle.decrypt({name:'RSA-OAEP'},myEncKeys.privateKey,b642ab(wk));
             cryptoSteps[0].ok = true;
@@ -504,7 +506,10 @@
             advanceSendStep(5);
             const resp=await fetch(`/chat/send-message/${chatId}/`,{
                 method:'POST',headers:{'Content-Type':'application/json','Authorization':'Token '+token},
-                body:JSON.stringify({encrypted_text:aesEnc.ciphertext,encrypted_symmetric_key:ab2b64(wPartner),sender_encrypted_symmetric_key:ab2b64(wSelf),aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,signature:ab2b64(sig)})
+                body:JSON.stringify({encrypted_text:aesEnc.ciphertext,wrapped_keys:[
+                    {recipient_id:Number(localStorage.getItem('my_user_id')),encrypted_symmetric_key:ab2b64(wSelf)},
+                    {recipient_id:Number(localStorage.getItem('partner_id')),encrypted_symmetric_key:ab2b64(wPartner)},
+                ],aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,signature:ab2b64(sig)})
             });
             completeSendStep(5,resp.ok);
 

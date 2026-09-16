@@ -1,5 +1,4 @@
 from django.contrib.auth import authenticate, login as django_login, logout as django_logout
-from django.db.models import Q
 from rest_framework.views import APIView
 from rest_framework import status, permissions
 from rest_framework.authtoken.models import Token
@@ -7,7 +6,7 @@ from rest_framework.generics import CreateAPIView
 from .serializers import UserSerializer, MessageSerializer
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
-from .models import Message
+from .models import Message, MessageKey
 import logging
 import pyotp
 import qrcode
@@ -21,7 +20,8 @@ import re
 import random
 import time
 from django.views.decorators.csrf import ensure_csrf_cookie
-from .models import Chat
+from .models import Chat, ChatParticipant
+from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from .models import User
 from rest_framework.decorators import api_view
@@ -80,8 +80,11 @@ def chatbox(request):
         chat = Chat.objects.get(pin=chat_id)
     except Chat.DoesNotExist:
         return redirect("/chat/usermenu/")
-    participants = [chat.user1.username if chat.user1 else None,
-                    chat.user2.username if chat.user2 else None]
+    participants = list(
+        chat.participants.filter(left_at__isnull=True)
+        .order_by("joined_at")
+        .values_list("user__username", flat=True)
+    )
 
     context = {
         "chat_id": chat_id,
@@ -89,9 +92,6 @@ def chatbox(request):
         "participants": participants,
     }
     return render(request, "chatbox.html", context)
-
-
-active_chats = {}
 
 
 
@@ -354,17 +354,12 @@ class CreateChatView(APIView):
                 break
 
         # Create database record
-        chat = Chat.objects.create(pin=pin, user1=request.user)
-        logger.info(f"[CREATE-CHAT] Created chat in database: {chat}, PIN: {chat.pin}")
+        chat = Chat.objects.create(pin=pin)
+        ChatParticipant.objects.create(chat=chat, user=request.user)
+        logger.info(f"[CREATE-CHAT] Created chat {chat}, PIN: {chat.pin}")
 
-        # Verify it was saved
-        saved_chat = Chat.objects.get(pin=pin)
-        logger.info(f"[CREATE-CHAT] Verified chat exists: {saved_chat}")
-
-        # Also initialize in-memory for compatibility
-        active_chats[pin] = [request.user]
         request.session["chat_id"] = chat.pin
-        logger.info(f"[CREATE-CHAT] PIN '{pin}' created (no participants yet).")
+        logger.info(f"[CREATE-CHAT] PIN '{pin}' created by '{request.user.username}'.")
         return Response({"chat_id": pin}, status=201)
 
 
@@ -417,32 +412,20 @@ class JoinChatView(APIView):
 
         logger.debug(f"[JOIN-CHAT] Current user: {user.username} (id={user.pk})")
 
-        #  Persist the user into an open slot
-        if chat.user1 is None:
-            chat.user1 = user
-            logger.info(f"[JOIN-CHAT] Assigned '{user.username}' to user1.")
-        elif chat.user2 is None and chat.user1 != user:
-            chat.user2 = user
-            logger.info(f"[JOIN-CHAT] Assigned '{user.username}' to user2.")
-        elif user in (chat.user1, chat.user2):
+        #  Persist the user as a participant, respecting the chat's capacity
+        active_participants = chat.participants.filter(left_at__isnull=True)
+        if active_participants.filter(user=user).exists():
             logger.info(f"[JOIN-CHAT] '{user.username}' was already in this chat.")
-        else:
+        elif active_participants.count() >= chat.max_participants:
             logger.warning(f"[JOIN-CHAT] Chat {chat_id} is already full.")
             return Response({"message": "Chat is full."}, status=400)
-
-        #  Save the updated Chat record
-        chat.save()
-        logger.debug(f"[JOIN-CHAT] Chat record saved. user1={chat.user1}, user2={chat.user2}")
+        else:
+            ChatParticipant.objects.create(chat=chat, user=user)
+            logger.info(f"[JOIN-CHAT] Assigned '{user.username}' to chat '{chat_id}'.")
 
         #  Store chat_id in session so GetMessagesView sees it
         request.session["chat_id"] = chat.pin
         logger.debug(f"[JOIN-CHAT] chat_id stored in session.")
-
-        #  Mirror in-memory tracking (optional, but useful if you rely on it elsewhere)
-        active_list = active_chats.setdefault(chat.pin, [])
-        if user not in active_list:
-            active_list.append(user)
-            logger.debug(f"[JOIN-CHAT] Added to active_chats in-memory list.")
 
         logger.info(f"[JOIN-CHAT] User '{user.username}' successfully joined chat '{chat_id}'.")
         return Response({"message": "Joined chat successfully."}, status=200)
@@ -456,18 +439,17 @@ class CheckChatView(APIView):
     def get(self, request, chat_id):
         try:
             chat = Chat.objects.get(pin=chat_id)
-            participants = []
-            if chat.user1:
-                participants.append(chat.user1.username)
-            if chat.user2:
-                participants.append(chat.user2.username)
-
+            participants = list(
+                chat.participants.filter(left_at__isnull=True)
+                .order_by("joined_at")
+                .values_list("user__username", flat=True)
+            )
             return Response({"exists": True, "participants": participants}, status=status.HTTP_200_OK)
         except Chat.DoesNotExist:
             return Response({"exists": False}, status=status.HTTP_404_NOT_FOUND)
 
 
-# Leave Chat View - deletes the chat session and clears the message history
+# Leave Chat View - marks the participant as left, clearing history once the chat fully empties
 class LeaveChatView(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [permissions.IsAuthenticated]
@@ -480,35 +462,26 @@ class LeaveChatView(APIView):
         except Chat.DoesNotExist:
             return Response({"message": "Chat not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        user = request.user
-        partner = chat.user2 if(chat.user1==user) else chat.user1
-
-        # Remove user from chat
-        if chat.user1 == request.user:
-            chat.user1 = None
-        elif chat.user2 == request.user:
-            chat.user2 = None
-        else:
+        try:
+            participant = chat.participants.get(user=request.user, left_at__isnull=True)
+        except ChatParticipant.DoesNotExist:
             return Response({"message": "Not in this chat."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # If no users left, mark as inactive or delete
-        if chat.user1 is None and chat.user2 is None:
+        participant.left_at = timezone.now()
+        participant.save(update_fields=["left_at"])
+
+        remaining = chat.participants.filter(left_at__isnull=True).count()
+        if remaining == 0:
             chat.is_active = False
-            chat.save()
-            # Remove from in-memory tracking
-            if chat_id in active_chats:
-                del active_chats[chat_id]
+            chat.save(update_fields=["is_active"])
+            chat.messages.all().delete()
+            logger.info(f"[LEAVE-CHAT] Chat '{chat_id}' emptied; history cleared.")
         else:
-            chat.save()
-            # Update in-memory tracking
-            if chat_id in active_chats and request.user in active_chats[chat_id]:
-                active_chats[chat_id].remove(request.user)
-        if partner:
-            Message.objects.filter(
-                (Q(sender=user) & Q(receiver=partner)) |
-                (Q(sender = partner) & Q(receiver=user))
-            ).delete()
-        logger.info(f"[LEAVE-CHAT] User '{request.user.username}' left chat '{chat_id}'.")
+            logger.info(
+                f"[LEAVE-CHAT] User '{request.user.username}' left chat '{chat_id}'; "
+                f"{remaining} participant(s) remain."
+            )
+
         return Response({"message": "Left chat."}, status=status.HTTP_200_OK)
 
 
@@ -551,45 +524,52 @@ class SendMessageView(APIView):
     def post(self, request, chat_id=None):
         chat = get_object_or_404(Chat, pin=chat_id)
         me = request.user
-        if me not in (chat.user1, chat.user2):
+        if not chat.participants.filter(user=me, left_at__isnull=True).exists():
             return Response({"detail": "Forbidden"}, status=403)
 
         # Extract ALL required cryptographic fields
         encrypted_text = request.data.get("encrypted_text")
-        encrypted_symmetric_key = request.data.get("encrypted_symmetric_key")
-        sender_encrypted_symmetric_key = request.data.get("sender_encrypted_symmetric_key")
         aes_nonce = request.data.get("aes_nonce")
         aes_tag = request.data.get("aes_tag")
         signature = request.data.get("signature")
+        wrapped_keys = request.data.get("wrapped_keys")
 
         # Validate presence
-        if not all([encrypted_text,
-                    encrypted_symmetric_key,
-                    sender_encrypted_symmetric_key,
-                    aes_nonce,
-                    aes_tag,
-                    signature]):
+        if not all([encrypted_text, aes_nonce, aes_tag, signature]) or not wrapped_keys:
             return Response(
                 {"message": "Missing required encryption fields."},
                 status=400
             )
 
-        # Determine the other party
-        recipient = chat.user2 if (me == chat.user1) else chat.user1
+        active_participant_ids = set(
+            chat.participants.filter(left_at__isnull=True).values_list("user_id", flat=True)
+        )
+        submitted = {
+            wk.get("recipient_id"): wk.get("encrypted_symmetric_key")
+            for wk in wrapped_keys
+            if wk.get("recipient_id") is not None and wk.get("encrypted_symmetric_key")
+        }
+        if not active_participant_ids.issubset(submitted.keys()):
+            return Response(
+                {"message": "Missing wrapped key for a chat participant."},
+                status=400
+            )
 
-        # Save **both** wrapped keys
         msg = Message.objects.create(
+            chat=chat,
             sender=me,
-            receiver=recipient,
             encrypted_text=encrypted_text,
-            encrypted_symmetric_key=encrypted_symmetric_key,
-            sender_encrypted_symmetric_key=sender_encrypted_symmetric_key,
             aes_nonce=aes_nonce,
             aes_tag=aes_tag,
             signature=signature,
         )
+        MessageKey.objects.bulk_create([
+            MessageKey(message=msg, recipient_id=recipient_id, encrypted_symmetric_key=key)
+            for recipient_id, key in submitted.items()
+            if recipient_id in active_participant_ids
+        ])
 
-        return Response(MessageSerializer(msg).data, status=201)
+        return Response(MessageSerializer(msg, context={"request": request}).data, status=201)
 
 
 class GetMessagesView(APIView):
@@ -599,35 +579,37 @@ class GetMessagesView(APIView):
     def get(self, request, chat_id):
         """
         GET /chat/get-messages/<chat_id>/
-        Returns the encrypted messages between the two participants of this chat.
+        Returns the encrypted messages visible to the requesting participant.
         """
         # 1) Load (or 404) the Chat by its 4-digit PIN
         chat = get_object_or_404(Chat, pin=chat_id)
 
-        # 2) Verify the requesting user is one of the two participants
+        # 2) Verify the requesting user is an active participant
         me = request.user
-        if me != chat.user1 and me != chat.user2:
+        active_participants = list(
+            chat.participants.filter(left_at__isnull=True).select_related("user")
+        )
+        if not any(p.user_id == me.id for p in active_participants):
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
-        # 3) Determine who the “partner” is
-        partner = chat.user2 if (me == chat.user1) else chat.user1
+        # 3) Determine who the "partner" is (only meaningful for a 1:1 chat)
+        others = [p.user for p in active_participants if p.user_id != me.id]
+        partner = others[0] if len(others) == 1 else None
 
-        # 4) Fetch every Message whose (sender, receiver) pair matches (me ↔ partner)
-        messages_qs = Message.objects.filter(
-            (Q(sender=me) & Q(receiver=partner)) |
-            (Q(sender=partner) & Q(receiver=me))
-        ).order_by("timestamp")
+        # 4) Fetch every Message in this chat
+        messages_qs = chat.messages.order_by("timestamp").prefetch_related("wrapped_keys")
 
         # 5) Serialize those messages
-        serializer_data = MessageSerializer(messages_qs, many=True, context={'request': request}).data 
+        serializer_data = MessageSerializer(messages_qs, many=True, context={'request': request}).data
 
-        # 6) Return JSON (including partner’s username/id and “both_joined” flag)
+        # 6) Return JSON (including partner's username/id and "both_joined" flag)
         return Response({
-            "messages":     serializer_data,
-            "partner":      partner.username if partner else None,
-            "partner_id":   partner.id if partner else None,
-            "current_user": me.username,
-            "both_joined":  bool(chat.user1 and chat.user2),
+            "messages":        serializer_data,
+            "partner":         partner.username if partner else None,
+            "partner_id":      partner.id if partner else None,
+            "current_user":    me.username,
+            "current_user_id": me.id,
+            "both_joined":     len(active_participants) >= 2,
         }, status=status.HTTP_200_OK)
 
 
