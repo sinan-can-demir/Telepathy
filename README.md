@@ -243,8 +243,8 @@ When deploying to production, set these environment variables instead of editing
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DJANGO_SECRET_KEY` | Django secret key | Insecure dev fallback |
-| `DJANGO_DEBUG` | Set to `false` for production | `true` |
-| `DJANGO_SECURE` | Set to `true` to enable HTTPS-only cookies, HSTS | `false` |
+| `DJANGO_DEBUG` | Set to `true` to enable debug mode locally | `false` (fails closed) |
+| `DJANGO_SECURE` | Set to `false` to disable HTTPS-only cookies/HSTS for local HTTP dev | `true` (fails closed) |
 | `DB_NAME` | PostgreSQL database name | `my_database` |
 | `DB_USER` | PostgreSQL user | `myproject_user` |
 | `DB_PASSWORD` | PostgreSQL password | `mysecretpassword` |

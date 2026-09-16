@@ -26,7 +26,9 @@ SECRET_KEY = os.environ.get(
 )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DJANGO_DEBUG', 'true').lower() != 'false'
+# Fails closed: DEBUG is off unless explicitly enabled, so a missing env var
+# in a production deployment doesn't silently turn debug mode on.
+DEBUG = os.environ.get('DJANGO_DEBUG', 'false').lower() == 'true'
 
 
 ALLOWED_HOSTS = [
@@ -223,8 +225,9 @@ REST_FRAMEWORK = {
 
 
 
-# Force HTTPS and secure cookies only in production (set DJANGO_SECURE=true in prod env)
-_SECURE = os.environ.get('DJANGO_SECURE', 'false').lower() == 'true'
+# Force HTTPS and secure cookies unless explicitly disabled (set DJANGO_SECURE=false
+# for local dev over plain HTTP). Fails closed: a missing env var means secure.
+_SECURE = os.environ.get('DJANGO_SECURE', 'true').lower() != 'false'
 
 SECURE_SSL_REDIRECT = _SECURE
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
