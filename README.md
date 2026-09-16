@@ -33,7 +33,7 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 ## 🏗️ Architecture
 
 ```
-pentour/
+Telepathy/
 ├── chat/                       # Main Django application
 │   ├── models.py               # User, Chat, Message models
 │   ├── views.py                # REST API views (register, login, send/get messages, etc.)
@@ -97,8 +97,8 @@ SENDER (Browser A)                          SERVER                    RECEIVER (
 ### 1. Clone & enter the project
 
 ```bash
-git clone https://github.com/Rarees404/pentour.git
-cd pentour
+git clone https://github.com/sinan-can-demir/Telepathy.git
+cd Telepathy
 ```
 
 ### 2. Install & start PostgreSQL
@@ -195,7 +195,7 @@ Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your browser.
 | `GET` | `/chat/usermenu/` | User dashboard | Session |
 | `POST` | `/chat/create-chat/` | Generate a new 4-digit chat PIN | Token |
 | `POST` | `/chat/join-chat/` | Join an existing chat by PIN | Token |
-| `GET` | `/chat/check-chat/` | Verify chat room exists and participants | Token |
+| `GET` | `/chat/check-chat/<chat_id>/` | Verify chat room exists and participants | Token |
 | `POST` | `/chat/send-message/<chat_id>/` | Send an encrypted message | Token |
 | `GET` | `/chat/get-messages/<chat_id>/` | Retrieve encrypted messages | Token |
 | `GET` | `/chat/get-public-key/<user_id>/` | Fetch user's encryption + signing public keys | Token |
