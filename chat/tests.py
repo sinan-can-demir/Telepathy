@@ -7,7 +7,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 from rest_framework import status
 
-from chat.views import failed_login_ips, failed_register_ips, failed_join_attempts
+from chat.views import failed_login_attempts, failed_register_ips, failed_join_attempts
 
 User = get_user_model()
 
@@ -24,10 +24,13 @@ def _fake_public_key_pem():
 
 class LoginSecurityTests(TestCase):
     """Regression coverage for the 2FA-bypass and rate-limiting removal
-    found in the final-clientside audit."""
+    found in the final-clientside audit. Login throttling is keyed by the
+    targeted username, not the client's source IP -- see failed_login_attempts
+    in chat/views.py for why (a Tor hidden-service deployment collapses every
+    client to the same source address)."""
 
     def setUp(self):
-        failed_login_ips.clear()
+        failed_login_attempts.clear()
         self.client = APIClient()
 
     def test_login_without_2fa_works(self):
@@ -108,6 +111,36 @@ class LoginSecurityTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_throttle_is_keyed_per_username_not_per_source(self):
+        """The Django test client always reports the same source address for
+        every request; if throttling were still IP-keyed this test would fail
+        because 'other_target's failures would already have tripped the
+        cooldown. Proves the fix actually applies to a shared-source scenario
+        (e.g. every client behind a Tor hidden service looking like one IP)."""
+        for username in ("target_one", "target_two"):
+            User.objects.create_user(
+                username=username,
+                password="a-strong-unguessable-pass1",
+                public_key=_fake_public_key_pem(),
+            )
+
+        for _ in range(3):
+            response = self.client.post(
+                "/chat/login/",
+                {"username": "target_one", "password": "wrong-password"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # target_two has had zero failed attempts of its own, so a correct
+        # login for it must succeed even though target_one is cooling down.
+        response = self.client.post(
+            "/chat/login/",
+            {"username": "target_two", "password": "a-strong-unguessable-pass1"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
 class RegistrationValidationTests(TestCase):

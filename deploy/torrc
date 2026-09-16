@@ -1,0 +1,14 @@
+# Tor hidden-service config for the Telepathy app. Mounted read-only into the
+# `tor` container; the app container is never reachable except through this.
+SocksPort 0
+RunAsDaemon 0
+Log notice stdout
+User debian-tor
+
+HiddenServiceDir /var/lib/tor/telepathy_hidden_service/
+HiddenServicePort 80 127.0.0.1:8000
+
+# Tor's own connection-flood defense at the protocol level, before any request
+# reaches the app -- see ARCHITECTURE.md for why this replaces IP-based
+# throttling for the registration endpoint specifically.
+HiddenServicePoWDefensesEnabled 1

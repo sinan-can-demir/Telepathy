@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+env
+chat_debug.log
+staticfiles
+docs
+*.md
+_test_settings_scratch.py

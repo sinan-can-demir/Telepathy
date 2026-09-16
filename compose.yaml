@@ -1,0 +1,51 @@
+# Run with: podman-compose up --build
+# (docker-compose reads this file identically, if that's ever preferred instead)
+#
+# Nothing here publishes a port to the host's public interface. The only way
+# into `app` is through `tor`, which shares its network namespace and proxies
+# 127.0.0.1:8000 -- see README.md's "Running as a Tor hidden service" section.
+
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${DB_NAME:-telepathy}
+      POSTGRES_USER: ${DB_USER:-telepathy}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Containerfile
+    depends_on:
+      - db
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
+      DJANGO_DEBUG: "false"
+      DJANGO_SECURE: "false" # Tor's onion transport provides E2E encryption/auth already; see README.
+      DB_NAME: ${DB_NAME:-telepathy}
+      DB_USER: ${DB_USER:-telepathy}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      DB_HOST: db
+      DB_PORT: "5432"
+      ONION_HOSTNAME: ${ONION_HOSTNAME:-}
+    # No `ports:` entry on purpose -- not reachable except via the tor container.
+    restart: unless-stopped
+
+  tor:
+    build:
+      context: .
+      dockerfile: deploy/Containerfile.tor
+    network_mode: "service:app"
+    volumes:
+      - tor_data:/var/lib/tor/telepathy_hidden_service
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  tor_data:

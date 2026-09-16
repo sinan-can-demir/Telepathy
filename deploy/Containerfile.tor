@@ -1,0 +1,17 @@
+# Deliberately built from the official Debian package rather than a
+# prebuilt third-party "tor hidden service" image -- for a component whose
+# whole job is anonymity, trusting an unaudited image's supply chain is the
+# wrong tradeoff. This is the same official `tor` binary Debian ships.
+FROM debian:stable-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tor \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/torrc /etc/tor/torrc
+
+# Stays root at the container level so it can fix ownership on the mounted
+# tor_data volume on first boot; torrc's `User debian-tor` directive makes Tor
+# itself drop privileges after that, which is Tor's documented way to handle
+# this rather than fighting volume ownership at the container layer.
+CMD ["tor", "-f", "/etc/tor/torrc"]

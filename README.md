@@ -250,6 +250,32 @@ When deploying to production, set these environment variables instead of editing
 | `DB_PASSWORD` | PostgreSQL password | `mysecretpassword` |
 | `DB_HOST` | Database host | `localhost` |
 | `DB_PORT` | Database port | `5432` |
+| `ONION_HOSTNAME` | Set once a Tor hidden-service `.onion` address exists (see below) | unset |
+
+---
+
+## 🧅 Running as a Tor Hidden Service (Podman)
+
+This runs the whole stack — app, Postgres, and a Tor hidden service in front of it — in containers, so the server's hosting location is never exposed and connecting users' real IPs never reach the app either (a Tor onion service has no exit node; traffic stays inside the Tor network end-to-end). Uses [Podman](https://podman.io/) (rootless, no root daemon) rather than Docker, via `podman-compose` (same compose schema as Docker Compose).
+
+**Before you start:** two settings are easy to get backwards and will silently break the deployment if you do:
+- **`DJANGO_SECURE` must stay `false`.** Tor's onion transport already provides end-to-end encryption and server authentication (the `.onion` address *is* the server's public key) — there's no TLS certificate for an onion address, so turning on `SECURE_SSL_REDIRECT`/HSTS/secure-cookies breaks the plain-HTTP hop between Tor and the app for no benefit.
+- **No container in `compose.yaml` publishes a port to the host.** The only path in is through the `tor` container, which shares the `app` container's network namespace. If you find yourself adding a `ports:` mapping to reach it directly, that defeats the point.
+
+### Steps
+
+1. Copy `.env.example` to `.env` and fill in `DJANGO_SECRET_KEY`/`DB_PASSWORD` (leave `ONION_HOSTNAME` blank for now).
+2. `podman-compose up --build` — starts `db`, `app` (migrates + collects static + gunicorn on `127.0.0.1:8000`, not published), and `tor` (which shares `app`'s network namespace and proxies port 80 on the hidden service to it).
+3. Wait for the `tor` container's logs to show `Bootstrapped 100%`, then read the generated address:
+   ```
+   podman exec <tor-container-name> cat /var/lib/tor/telepathy_hidden_service/hostname
+   ```
+4. Set `ONION_HOSTNAME` in `.env` to that value and recreate the `app` service (`podman-compose up -d --build app`) so it's accepted by `ALLOWED_HOSTS`.
+5. Connect to the printed `.onion` address using Tor Browser.
+
+The hidden service's private key lives in the `tor_data` named volume — **that's the one piece of state in this stack that must persist**; deleting it changes the `.onion` address. Everything else (`app`, `db`'s actual rows) can be recreated freely.
+
+If your `podman-compose` version doesn't support the `network_mode: "service:app"` syntax used in `compose.yaml`, the fallback is a native Podman pod (`podman pod create`) with both containers attached to it instead — same effect, different plumbing.
 
 ---
 

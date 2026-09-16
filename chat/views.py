@@ -31,8 +31,12 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.authentication import TokenAuthentication
 
 
-# Track failed login attempts per IP: {ip: (last_attempt_time, wait_time)}
-failed_login_ips = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
+# Track failed login attempts per targeted username (not per source IP: behind
+# a Tor hidden service every client shares one loopback address, so an IP-keyed
+# throttle would become a single bucket one attacker could lock everyone out of;
+# keying on the account actually being brute-forced is the correct mitigation
+# either way, Tor or not).
+failed_login_attempts = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
 
 # Track failed registration attempts per IP
 failed_register_ips = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
@@ -203,10 +207,10 @@ class LoginView(APIView):
                 {"message": "Username and password are required."}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        # —— Rate limiting by IP ——
-        ip = request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
+        # —— Rate limiting by targeted username (not source IP -- see the
+        # failed_login_attempts comment above) ——
         now_time = time.time()
-        entry = failed_login_ips[ip]
+        entry = failed_login_attempts[username]
         if entry["fail_count"] >= 3 and now_time < entry["last_time"] + entry["wait_time"]:
             wait_remaining = int(entry["last_time"] + entry["wait_time"] - now_time)
             return Response(
@@ -214,14 +218,14 @@ class LoginView(APIView):
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
 
-        logger.info(f"[LOGIN] Attempt login for '{username}' from IP {ip}")
+        logger.info(f"[LOGIN] Attempt login for '{username}'")
         user = authenticate(username=username, password=password)
         if not user:
             entry["fail_count"] += 1
             if entry["fail_count"] >= 3:
                 entry["wait_time"] = entry["wait_time"] * 2 if entry["wait_time"] else 10
                 entry["last_time"] = now_time
-                logger.warning(f"[LOGIN] IP {ip} exceeded login attempts. Timeout started for {entry['wait_time']}s")
+                logger.warning(f"[LOGIN] '{username}' exceeded login attempts. Timeout started for {entry['wait_time']}s")
                 return Response(
                     {"message": f"Too many failed attempts. Try again in {entry['wait_time']} seconds."},
                     status=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -243,8 +247,8 @@ class LoginView(APIView):
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
 
-        # Reset the failure record for this IP on full success
-        failed_login_ips.pop(ip, None)
+        # Reset the failure record for this username on full success
+        failed_login_attempts.pop(username, None)
 
         django_login(request, user)
 
