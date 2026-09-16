@@ -17,6 +17,7 @@ from django.contrib import messages
 from collections import defaultdict
 import re
 import random
+import time
 from django.views.decorators.csrf import ensure_csrf_cookie
 from .models import Chat
 from django.shortcuts import get_object_or_404
@@ -159,11 +160,48 @@ class LoginView(APIView):
                 {"message": "Username and password are required."}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        logger.info(f"[LOGIN] Attempt login for '{username}' from IP {request.META.get('REMOTE_ADDR')}")
+        # —— Rate limiting by IP ——
+        ip = request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
+        now_time = time.time()
+        entry = failed_login_ips[ip]
+        if entry["fail_count"] >= 3 and now_time < entry["last_time"] + entry["wait_time"]:
+            wait_remaining = int(entry["last_time"] + entry["wait_time"] - now_time)
+            return Response(
+                {"message": f"Too many failed attempts. Try again in {wait_remaining} seconds."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        logger.info(f"[LOGIN] Attempt login for '{username}' from IP {ip}")
         user = authenticate(username=username, password=password)
         if not user:
+            entry["fail_count"] += 1
+            if entry["fail_count"] >= 3:
+                entry["wait_time"] = entry["wait_time"] * 2 if entry["wait_time"] else 10
+                entry["last_time"] = now_time
+                logger.warning(f"[LOGIN] IP {ip} exceeded login attempts. Timeout started for {entry['wait_time']}s")
+                return Response(
+                    {"message": f"Too many failed attempts. Try again in {entry['wait_time']} seconds."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+            remaining_attempts = max(0, 2 - entry["fail_count"])
             logger.warning(f"[LOGIN] Invalid credentials for '{username}'.")
-            return Response({"message": "Invalid username or password."}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(
+                {"message": f"Invalid username or password. Remaining attempts before timeout: {remaining_attempts}"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # —— 2FA check, BEFORE establishing a session or issuing a token ——
+        if getattr(user, "is_2fa_enabled", False):
+            totp = pyotp.TOTP(user.totp_secret)
+            if not otp_code or not totp.verify(otp_code):
+                logger.warning(f"[LOGIN] Invalid or missing 2FA code for '{username}'.")
+                return Response(
+                    {"detail": "Invalid or missing 2FA code."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+
+        # Reset the failure record for this IP on full success
+        failed_login_ips.pop(ip, None)
 
         django_login(request, user)
 
