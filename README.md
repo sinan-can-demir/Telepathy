@@ -292,6 +292,14 @@ python manage.py flush --no-input
 
 ---
 
+## 🕰️ Legacy / Fork Notice
+
+This repository was originally created by other contributors (the commit history predates this fork and includes the original "pentour" project). It has since been forked and is now actively maintained here, independently of the original repo.
+
+**If you have questions, bug reports, or want to contribute going forward, please reach out via this fork rather than the original repository or its original contact email.**
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please read [ContributorGuide.md](./ContributorGuide.md) for details on the project structure, where to place static files, and Git workflow conventions.
@@ -300,9 +308,9 @@ Contributions are welcome! Please read [ContributorGuide.md](./ContributorGuide.
 
 ## 📬 Contact
 
-For bugs, questions, or setup issues:
+For bugs, questions, or setup issues, reach out via GitHub:
 
-📧 **r.boghean@student.maastrichuniversity.nl**
+👤 **[@sinan-can-demir](https://github.com/sinan-can-demir)**
 
 ---
 
