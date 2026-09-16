@@ -21,8 +21,6 @@ pentour/
 │   ├── tests.py
 │   ├── urls.py
 │   └── views.py
-├── client/
-│   └── enc_test_keygen/ # Contains helper scripts (not relevant for frontend work)
 ├── pc/
 │   ├── __init__.py
 │   ├── asgi.py
