@@ -304,6 +304,8 @@ This repository was originally created by other contributors (the commit history
 
 Contributions are welcome! Please read [ContributorGuide.md](./ContributorGuide.md) for details on the project structure, where to place static files, and Git workflow conventions.
 
+Before proposing a feature that touches chat/message data, read [ARCHITECTURE.md](./ARCHITECTURE.md) — it documents known structural limitations (e.g. the PIN space, message-to-chat linkage) that will affect how new features should be designed.
+
 ---
 
 ## 📬 Contact
