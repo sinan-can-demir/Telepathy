@@ -6,17 +6,19 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 from rest_framework import status
 
-from chat.views import failed_login_ips
+from chat.views import failed_login_ips, failed_register_ips
 
 User = get_user_model()
 
 
 def _fake_public_key_pem():
+    # .strip() matches the client's arrayBufferToPem(), which emits PEM with
+    # no trailing newline -- RegisterUserView's format check is exact-match.
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     return key.public_key().public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode()
+    ).decode().strip()
 
 
 class LoginSecurityTests(TestCase):
@@ -104,4 +106,43 @@ class LoginSecurityTests(TestCase):
             {"username": "ratetarget", "password": "a-strong-unguessable-pass1"},
             format="json",
         )
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+class RegistrationValidationTests(TestCase):
+    """Regression coverage for #9/#10: registration must enforce Django's
+    password validators and rate-limit repeated failures by IP."""
+
+    def setUp(self):
+        failed_register_ips.clear()
+        self.client = APIClient()
+
+    def _register(self, username="newuser", password="a-strong-unguessable-pass1"):
+        return self.client.post(
+            "/chat/register/",
+            {"username": username, "password": password, "public_key": _fake_public_key_pem()},
+            format="json",
+        )
+
+    def test_weak_password_rejected(self):
+        response = self._register(password="123")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(User.objects.filter(username="newuser").exists())
+
+    def test_strong_password_accepted(self):
+        response = self._register()
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(User.objects.filter(username="newuser").exists())
+
+    def test_repeated_failed_registrations_are_rate_limited(self):
+        for _ in range(4):
+            response = self._register(username="rateuser", password="123")
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # The 5th failure crosses the threshold and starts the cooldown immediately.
+        response = self._register(username="rateuser", password="123")
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        # Even a valid registration is throttled during the cooldown window.
+        response = self._register(username="rateuser2")
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
