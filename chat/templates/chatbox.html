@@ -125,9 +125,10 @@
 <div class="waiting-overlay" id="waitingOverlay">
     <div class="waiting-card">
         <div class="waiting-pulse">🔐</div>
-        <h2>Waiting for partner…</h2>
-        <p>Share the PIN below. Your partner needs to join from a <strong>different browser</strong>.</p>
+        <h2>Waiting for others to join…</h2>
+        <p>Share the PIN below. Others need to join from a <strong>different browser</strong>.</p>
         <div class="waiting-pin" id="waiting-pin"></div>
+        <p id="waiting-count" style="font-size:0.8rem;color:var(--cyan);margin-top:0.25rem"></p>
         <p style="font-size:0.75rem;color:var(--text-muted);margin-top:0.5rem">Keys loaded. Connection will start automatically.</p>
     </div>
 </div>
@@ -137,7 +138,7 @@
     <div class="header-left">
         <div class="header-avatar">💬</div>
         <div class="header-info">
-            <h2>Talking with <span id="partner-name">…</span></h2>
+            <h2 id="partner-name">…</h2>
             <p><span class="status-dot"></span> E2E Encrypted</p>
         </div>
     </div>
@@ -208,11 +209,29 @@
     const importPubVer=p=>importKey(p,'spki','RSA-PSS',['verify']);
 
     // ── State ───────────────────────────────────────────────────────────────
-    let myEncKeys, mySignKeys, partnerPubKey=null, partnerSignKey=null;
+    let myEncKeys, mySignKeys;
     const chatId=localStorage.getItem('chat_id'), token=localStorage.getItem('token');
     let partnerUsername=localStorage.getItem('partner')||'…';
     let pollInterval=null;
     const renderedIds = new Set(); // track rendered message IDs to avoid duplicates
+    const signVerifyKeyCache = new Map(); // PEM string -> imported RSA-PSS verify CryptoKey
+
+    async function getVerifyKey(pem){
+        if(!pem) return null;
+        if(!signVerifyKeyCache.has(pem)) signVerifyKeyCache.set(pem, await importPubVer(pem));
+        return signVerifyKeyCache.get(pem);
+    }
+
+    // Fetches every other active participant's id/username/encryption public key,
+    // used only right before sending so the AES key gets wrapped for whoever is
+    // currently in the chat (fetched fresh each time to include last-second joiners).
+    async function fetchRecipientKeys(){
+        const r = await fetch(`/chat/get-chat-participants/${chatId}/`,{headers:{'Authorization':'Token '+token}});
+        if(!r.ok) throw new Error('Failed to fetch chat participants');
+        const {participants} = await r.json();
+        const myId = localStorage.getItem('my_user_id');
+        return participants.filter(p => String(p.id) !== myId);
+    }
 
     document.getElementById('waiting-pin').textContent = chatId||'';
 
@@ -233,8 +252,7 @@
     const SEND_STEPS = [
         'Generating AES-256 session key…',
         'Encrypting message (AES-256-GCM)…',
-        'Wrapping key for partner (RSA-OAEP)…',
-        'Wrapping key for self (RSA-OAEP)…',
+        'Wrapping key for each participant (RSA-OAEP)…',
         'Signing message (RSA-PSS)…',
         'Sending encrypted payload…'
     ];
@@ -310,16 +328,6 @@
         }
     }
 
-    async function loadPartnerKey(){
-        const pid=localStorage.getItem('partner_id');
-        if(!pid) throw new Error('No partner_id');
-        const resp=await fetch(`/chat/get-public-key/${pid}/`,{headers:{'Authorization':'Token '+token}});
-        if(!resp.ok) throw new Error('Failed to fetch partner key');
-        const {public_key:pk,signing_public_key:sk}=await resp.json();
-        partnerPubKey=await importPubEnc(pk);
-        if(sk) partnerSignKey=await importPubVer(sk);
-    }
-
     // ── Chat logic ──────────────────────────────────────────────────────────
     async function startChat(){
         if(!chatId||!token){window.location.href='/';return;}
@@ -344,13 +352,13 @@
                 waitingOverlay.style.display='none';
                 chatHeader.style.display='flex';
                 chatMain.style.display='flex';
-                if(data.partner_id){localStorage.setItem('partner_id',data.partner_id);await loadPartnerKey();}
-                if(data.partner&&data.partner!==partnerUsername){
-                    partnerUsername=data.partner;partnerNameEl.textContent=partnerUsername;localStorage.setItem('partner',partnerUsername);
-                }
+                if(data.partner_id){localStorage.setItem('partner_id',data.partner_id);}
+                updateHeader(data);
                 await appendNewMessages(data.messages, data.current_user);
                 clearInterval(pollInterval);
                 pollInterval=setInterval(fetchNewMessages,2000);
+            } else {
+                updateWaitingOverlay(data);
             }
         }catch(e){console.error('checkChatReady:',e);}
     }
@@ -361,9 +369,30 @@
             if(!r.ok){if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/';}return;}
             const data=await r.json();
             if(data.current_user_id){localStorage.setItem('my_user_id',data.current_user_id);}
-            if(data.partner&&data.partner!==partnerUsername){partnerUsername=data.partner;partnerNameEl.textContent=partnerUsername;await loadPartnerKey();}
+            updateHeader(data);
             await appendNewMessages(data.messages, data.current_user);
         }catch(e){console.error('fetchNewMessages:',e);}
+    }
+
+    // Reflects the current roster (others/is_group/max_participants) in the header,
+    // so a mid-conversation joiner shows up without a page reload.
+    function updateHeader(data){
+        const others = data.others || [];
+        if(!data.is_group){
+            if(data.partner && data.partner!==partnerUsername){
+                partnerUsername=data.partner; localStorage.setItem('partner',partnerUsername);
+            }
+            partnerNameEl.textContent = `Talking with ${partnerUsername}`;
+        } else {
+            partnerNameEl.textContent = `Group — ${1+others.length} people (${others.map(o=>o.username).join(', ')})`;
+        }
+    }
+
+    function updateWaitingOverlay(data){
+        const others = data.others || [];
+        const max = data.max_participants || 2;
+        const countEl = document.getElementById('waiting-count');
+        if(countEl) countEl.textContent = `${1+others.length}/${max} joined`;
     }
 
     // ── Only render NEW messages (by ID) ────────────────────────────────────
@@ -402,10 +431,11 @@
             text = await decryptWithAES(new Uint8Array(aesKeyBuf),{ciphertext:msg.encrypted_text,nonce:msg.aes_nonce,tag:msg.aes_tag});
             cryptoSteps[1].ok = true;
 
-            if(!isMine && msg.signature && partnerSignKey){
+            if(!isMine && msg.signature && msg.sender_signing_public_key){
                 cryptoSteps.push({label:'RSA-PSS signature verify', ok:null});
                 try{
-                    const v = await crypto.subtle.verify({name:'RSA-PSS',saltLength:32},partnerSignKey,b642ab(msg.signature),new TextEncoder().encode(text));
+                    const senderSignKey = await getVerifyKey(msg.sender_signing_public_key);
+                    const v = await crypto.subtle.verify({name:'RSA-PSS',saltLength:32},senderSignKey,b642ab(msg.signature),new TextEncoder().encode(text));
                     cryptoSteps[2].ok = v;
                 }catch(e){cryptoSteps[2].ok=false;}
             } else if(isMine){
@@ -477,7 +507,7 @@
         e.preventDefault();
         const plaintext=messageInput.value.trim();
         if(!plaintext) return;
-        if(!myEncKeys?.publicKey||!mySignKeys?.privateKey||!partnerPubKey){showError('Keys not loaded.');return;}
+        if(!myEncKeys?.publicKey||!mySignKeys?.privateKey){showError('Keys not loaded.');return;}
 
         sendBtn.disabled=true;
         showSendModal();
@@ -492,26 +522,26 @@
             completeSendStep(1);
 
             advanceSendStep(2);
-            const wPartner=await crypto.subtle.encrypt({name:'RSA-OAEP'},partnerPubKey,aesKey);
+            const recipients=await fetchRecipientKeys();
+            const wSelf=await crypto.subtle.encrypt({name:'RSA-OAEP'},myEncKeys.publicKey,aesKey);
+            const wrapped_keys=[{recipient_id:Number(localStorage.getItem('my_user_id')),encrypted_symmetric_key:ab2b64(wSelf)}];
+            for(const r of recipients){
+                const pub=await importPubEnc(r.public_key);
+                const wrapped=await crypto.subtle.encrypt({name:'RSA-OAEP'},pub,aesKey);
+                wrapped_keys.push({recipient_id:r.id,encrypted_symmetric_key:ab2b64(wrapped)});
+            }
             completeSendStep(2);
 
             advanceSendStep(3);
-            const wSelf=await crypto.subtle.encrypt({name:'RSA-OAEP'},myEncKeys.publicKey,aesKey);
+            const sig=await crypto.subtle.sign({name:'RSA-PSS',saltLength:32},mySignKeys.privateKey,new TextEncoder().encode(plaintext));
             completeSendStep(3);
 
             advanceSendStep(4);
-            const sig=await crypto.subtle.sign({name:'RSA-PSS',saltLength:32},mySignKeys.privateKey,new TextEncoder().encode(plaintext));
-            completeSendStep(4);
-
-            advanceSendStep(5);
             const resp=await fetch(`/chat/send-message/${chatId}/`,{
                 method:'POST',headers:{'Content-Type':'application/json','Authorization':'Token '+token},
-                body:JSON.stringify({encrypted_text:aesEnc.ciphertext,wrapped_keys:[
-                    {recipient_id:Number(localStorage.getItem('my_user_id')),encrypted_symmetric_key:ab2b64(wSelf)},
-                    {recipient_id:Number(localStorage.getItem('partner_id')),encrypted_symmetric_key:ab2b64(wPartner)},
-                ],aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,signature:ab2b64(sig)})
+                body:JSON.stringify({encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,signature:ab2b64(sig)})
             });
-            completeSendStep(5,resp.ok);
+            completeSendStep(4,resp.ok);
 
             if(resp.ok){
                 messageInput.value='';
@@ -531,7 +561,7 @@
 
     // ── Leave chat ──────────────────────────────────────────────────────────
     leaveBtn.addEventListener('click',async function(){
-        if(!confirm('Leave this chat? Messages will be lost.'))return;
+        if(!confirm('Leave this chat?'))return;
         try{await fetch('/chat/leave-chat/',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Token '+token},body:JSON.stringify({chat_id:chatId})});}catch(e){}
         localStorage.removeItem('chat_id');localStorage.removeItem('partner');localStorage.removeItem('partner_id');
         clearInterval(pollInterval);window.location.href='/chat/usermenu/';

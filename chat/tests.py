@@ -270,3 +270,137 @@ class GroupChatSchemaTests(TestCase):
         self.assertEqual(leave2.status_code, 200)
         self.assertEqual(Message.objects.count(), 0)
         self.assertFalse(Chat.objects.get(pin=chat_id).is_active)
+
+
+def _make_client(username):
+    User.objects.create_user(
+        username=username,
+        password="a-strong-unguessable-pass1",
+        public_key=_fake_public_key_pem(),
+    )
+    user = User.objects.get(username=username)
+    token, _ = Token.objects.get_or_create(user=user)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
+    return user, client
+
+
+class GroupChatFeatureTests(TestCase):
+    """Coverage for Phase 2: group chats with max_participants > 2."""
+
+    def setUp(self):
+        self.alice, self.alice_client = _make_client("alice")
+        self.bob, self.bob_client = _make_client("bob")
+        self.carol, self.carol_client = _make_client("carol")
+        self.dave, self.dave_client = _make_client("dave")
+
+    def test_create_chat_rejects_out_of_range_max_participants(self):
+        for bad in (0, 1, 9):
+            response = self.alice_client.post(
+                "/chat/create-chat/", {"max_participants": bad}, format="json"
+            )
+            self.assertEqual(response.status_code, 400, bad)
+
+        for good in (2, 8):
+            response = self.alice_client.post(
+                "/chat/create-chat/", {"max_participants": good}, format="json"
+            )
+            self.assertEqual(response.status_code, 201, good)
+
+    def test_group_chat_allows_joins_up_to_cap_then_rejects(self):
+        create = self.alice_client.post(
+            "/chat/create-chat/", {"max_participants": 3}, format="json"
+        )
+        chat_id = create.data["chat_id"]
+
+        self.assertEqual(
+            self.bob_client.post("/chat/join-chat/", {"chat_id": chat_id}, format="json").status_code,
+            200,
+        )
+        self.assertEqual(
+            self.carol_client.post("/chat/join-chat/", {"chat_id": chat_id}, format="json").status_code,
+            200,
+        )
+        full = self.dave_client.post("/chat/join-chat/", {"chat_id": chat_id}, format="json")
+        self.assertEqual(full.status_code, 400)
+        self.assertIn("full", full.data["message"].lower())
+
+    def test_get_chat_participants_requires_active_membership(self):
+        create = self.alice_client.post(
+            "/chat/create-chat/", {"max_participants": 3}, format="json"
+        )
+        chat_id = create.data["chat_id"]
+        self.bob_client.post("/chat/join-chat/", {"chat_id": chat_id}, format="json")
+
+        forbidden = self.carol_client.get(f"/chat/get-chat-participants/{chat_id}/")
+        self.assertEqual(forbidden.status_code, 403)
+
+        ok = self.alice_client.get(f"/chat/get-chat-participants/{chat_id}/")
+        self.assertEqual(ok.status_code, 200)
+        ids = {p["id"] for p in ok.data["participants"]}
+        self.assertEqual(ids, {self.alice.id, self.bob.id})
+        by_id = {p["id"]: p for p in ok.data["participants"]}
+        self.assertEqual(by_id[self.bob.id]["username"], "bob")
+        self.assertEqual(by_id[self.bob.id]["public_key"], self.bob.public_key)
+
+    def test_send_message_with_group_wrapped_keys_creates_one_key_per_participant(self):
+        from chat.models import Message, MessageKey
+
+        create = self.alice_client.post(
+            "/chat/create-chat/", {"max_participants": 3}, format="json"
+        )
+        chat_id = create.data["chat_id"]
+        self.bob_client.post("/chat/join-chat/", {"chat_id": chat_id}, format="json")
+        self.carol_client.post("/chat/join-chat/", {"chat_id": chat_id}, format="json")
+
+        send = self.alice_client.post(
+            f"/chat/send-message/{chat_id}/",
+            {
+                "encrypted_text": "ciphertext", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "wrapped_keys": [
+                    {"recipient_id": self.alice.id, "encrypted_symmetric_key": "key-a"},
+                    {"recipient_id": self.bob.id, "encrypted_symmetric_key": "key-b"},
+                    {"recipient_id": self.carol.id, "encrypted_symmetric_key": "key-c"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(send.status_code, 201, send.data)
+        self.assertEqual(Message.objects.count(), 1)
+        self.assertEqual(MessageKey.objects.count(), 3)
+
+        for client, expected_key in (
+            (self.alice_client, "key-a"),
+            (self.bob_client, "key-b"),
+            (self.carol_client, "key-c"),
+        ):
+            view = client.get(f"/chat/get-messages/{chat_id}/")
+            self.assertEqual(view.data["messages"][0]["my_encrypted_symmetric_key"], expected_key)
+
+    def test_get_messages_others_and_group_metadata(self):
+        # 2-person chat: is_group False, others has exactly 1 entry.
+        create = self.alice_client.post("/chat/create-chat/", format="json")
+        chat_id = create.data["chat_id"]
+        self.bob_client.post("/chat/join-chat/", {"chat_id": chat_id}, format="json")
+
+        alice_view = self.alice_client.get(f"/chat/get-messages/{chat_id}/").data
+        self.assertFalse(alice_view["is_group"])
+        self.assertEqual(alice_view["max_participants"], 2)
+        self.assertTrue(alice_view["both_joined"])
+        self.assertEqual([o["username"] for o in alice_view["others"]], ["bob"])
+
+        # 3-person group chat: is_group True, others has 2 entries.
+        group = self.alice_client.post(
+            "/chat/create-chat/", {"max_participants": 3}, format="json"
+        )
+        group_id = group.data["chat_id"]
+        self.bob_client.post("/chat/join-chat/", {"chat_id": group_id}, format="json")
+        self.carol_client.post("/chat/join-chat/", {"chat_id": group_id}, format="json")
+
+        alice_group_view = self.alice_client.get(f"/chat/get-messages/{group_id}/").data
+        self.assertTrue(alice_group_view["is_group"])
+        self.assertEqual(alice_group_view["max_participants"], 3)
+        self.assertTrue(alice_group_view["both_joined"])
+        self.assertEqual(
+            sorted(o["username"] for o in alice_group_view["others"]), ["bob", "carol"]
+        )

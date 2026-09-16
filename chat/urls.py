@@ -16,7 +16,7 @@ from .views import (
     CreateChatView,
     JoinChatView,
     setup_2fa, chatbox, GetPublicKeyView,
-    UploadPublicKeyView
+    UploadPublicKeyView, GetChatParticipantsView
 )
 
 urlpatterns = [
@@ -42,6 +42,7 @@ urlpatterns = [
     ),
     path('send-message/<str:chat_id>/', views.SendMessageView.as_view(), name='send_message'),
     path('get-messages/<str:chat_id>/', views.GetMessagesView.as_view(), name='get_messages'),
+    path('get-chat-participants/<str:chat_id>/', GetChatParticipantsView.as_view(), name='get-chat-participants'),
     
     path("create-chat/",    CreateChatView.as_view(),   name="create-chat"),
     path("join-chat/",      JoinChatView.as_view(),     name="join-chat"),

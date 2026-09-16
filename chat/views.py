@@ -345,8 +345,18 @@ class CreateChatView(APIView):
     def post(self, request):
         """
         Create a new 4-digit PIN for a chat and save to database.
+        Optionally accepts { "max_participants": <2-8> } to create a group chat;
+        defaults to a 1:1 chat (max_participants=2).
         Returns: { "chat_id": "<4-digit-string>" }
         """
+        raw_max_participants = request.data.get("max_participants", 2)
+        try:
+            max_participants = int(raw_max_participants)
+        except (TypeError, ValueError):
+            return Response({"message": "max_participants must be an integer."}, status=400)
+        if not (2 <= max_participants <= 8):
+            return Response({"message": "max_participants must be between 2 and 8."}, status=400)
+
         # Generate a unique 4-digit PIN
         while True:
             pin = f"{random.randint(0, 9999):04d}"
@@ -354,7 +364,11 @@ class CreateChatView(APIView):
                 break
 
         # Create database record
-        chat = Chat.objects.create(pin=pin)
+        chat = Chat.objects.create(
+            pin=pin,
+            max_participants=max_participants,
+            is_group=max_participants > 2,
+        )
         ChatParticipant.objects.create(chat=chat, user=request.user)
         logger.info(f"[CREATE-CHAT] Created chat {chat}, PIN: {chat.pin}")
 
@@ -517,6 +531,35 @@ class GetPublicKeyView(APIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
 
+class GetChatParticipantsView(APIView):
+    """
+    GET /chat/get-chat-participants/<chat_id>/
+    Returns every active participant's id/username/public keys, so the sender
+    can wrap the per-message AES key for each of them. Requires the caller to
+    be an active participant themselves.
+    """
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id):
+        chat = get_object_or_404(Chat, pin=chat_id)
+        me = request.user
+        active = list(chat.participants.filter(left_at__isnull=True).select_related("user"))
+        if not any(p.user_id == me.id for p in active):
+            return Response({"detail": "Forbidden"}, status=403)
+        return Response({
+            "participants": [
+                {
+                    "id": p.user_id,
+                    "username": p.user.username,
+                    "public_key": p.user.public_key,
+                    "signing_public_key": p.user.signing_public_key,
+                }
+                for p in active
+            ]
+        }, status=200)
+
+
 class SendMessageView(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [permissions.IsAuthenticated]
@@ -592,7 +635,8 @@ class GetMessagesView(APIView):
         if not any(p.user_id == me.id for p in active_participants):
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
-        # 3) Determine who the "partner" is (only meaningful for a 1:1 chat)
+        # 3) Determine the other active participants ("partner" stays meaningful
+        #    only for a 1:1 chat; "others" generalizes it to N participants)
         others = [p.user for p in active_participants if p.user_id != me.id]
         partner = others[0] if len(others) == 1 else None
 
@@ -604,12 +648,15 @@ class GetMessagesView(APIView):
 
         # 6) Return JSON (including partner's username/id and "both_joined" flag)
         return Response({
-            "messages":        serializer_data,
-            "partner":         partner.username if partner else None,
-            "partner_id":      partner.id if partner else None,
-            "current_user":    me.username,
-            "current_user_id": me.id,
-            "both_joined":     len(active_participants) >= 2,
+            "messages":         serializer_data,
+            "others":           [{"id": u.id, "username": u.username} for u in others],
+            "partner":          partner.username if partner else None,
+            "partner_id":       partner.id if partner else None,
+            "current_user":     me.username,
+            "current_user_id":  me.id,
+            "both_joined":      len(active_participants) >= 2,
+            "is_group":         chat.is_group,
+            "max_participants": chat.max_participants,
         }, status=status.HTTP_200_OK)
 
 

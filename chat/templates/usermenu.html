@@ -105,6 +105,31 @@
                 </div>
             </div>
 
+            <div class="action-card" id="group-toggle" onclick="toggleGroup()">
+                <div class="action-icon join" style="background:linear-gradient(135deg,var(--green),#16a34a)">👥</div>
+                <div class="action-info">
+                    <h3>Create Group</h3>
+                    <p>Create a room for more than two people</p>
+                </div>
+            </div>
+
+            <!-- Expandable group-size section -->
+            <div class="join-section" id="group-section">
+                <div class="pin-input-row">
+                    <label for="group-size" style="align-self:center;font-size:0.85rem;color:var(--text-dim)">Participants:</label>
+                    <select class="pin-input" id="group-size" style="font-size:1rem;letter-spacing:normal">
+                        <option value="3">3</option>
+                        <option value="4" selected>4</option>
+                        <option value="5">5</option>
+                        <option value="6">6</option>
+                        <option value="7">7</option>
+                        <option value="8">8</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" onclick="createGroupChat()">Create Group Chat</button>
+                <p class="join-status" id="group-status"></p>
+            </div>
+
             <div class="action-card" id="join-toggle" onclick="toggleJoin()">
                 <div class="action-icon join">🔗</div>
                 <div class="action-info">
@@ -168,6 +193,29 @@
         document.getElementById('join-section').classList.toggle('show');
         const inp = document.getElementById('pin-input');
         if (inp) setTimeout(() => inp.focus(), 100);
+    }
+
+    function toggleGroup() {
+        document.getElementById('group-section').classList.toggle('show');
+    }
+
+    async function createGroupChat() {
+        const token = localStorage.getItem('token');
+        const maxParticipants = Number(document.getElementById('group-size').value);
+        const st = document.getElementById('group-status');
+        const res = await fetch('/chat/create-chat/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Token ' + token },
+            body: JSON.stringify({ max_participants: maxParticipants })
+        });
+        const data = await res.json();
+        if (res.ok) {
+            createdChatId = data.chat_id;
+            document.getElementById('pin-display').textContent = createdChatId;
+            document.getElementById('pin-modal').classList.add('show');
+        } else {
+            st.style.color = 'var(--red)'; st.textContent = data.message || 'Failed to create group.';
+        }
     }
 
     async function createChat() {
