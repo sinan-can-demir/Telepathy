@@ -3,10 +3,11 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 from rest_framework import status
 
-from chat.views import failed_login_ips
+from chat.views import failed_login_ips, failed_join_attempts
 
 User = get_user_model()
 
@@ -105,3 +106,39 @@ class LoginSecurityTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+class JoinChatRateLimitTests(TestCase):
+    """Regression coverage for #20: brute-forcing the 4-digit chat PIN
+    space via repeated JoinChatView calls must be throttled."""
+
+    def setUp(self):
+        failed_join_attempts.clear()
+        user = User.objects.create_user(
+            username="joiner",
+            password="a-strong-unguessable-pass1",
+            public_key=_fake_public_key_pem(),
+        )
+        token, _ = Token.objects.get_or_create(user=user)
+        self.client = APIClient()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
+
+    def test_repeated_wrong_pins_are_rate_limited(self):
+        for _ in range(4):
+            response = self.client.post("/chat/join-chat/", {"chat_id": "0000"}, format="json")
+            self.assertEqual(response.status_code, 404)
+
+        # The 5th failed guess crosses the threshold and starts the cooldown immediately.
+        response = self.client.post("/chat/join-chat/", {"chat_id": "0000"}, format="json")
+        self.assertEqual(response.status_code, 429)
+
+        # Even a real PIN is throttled during the cooldown window.
+        from chat.models import Chat
+        other = User.objects.create_user(
+            username="creator",
+            password="a-strong-unguessable-pass1",
+            public_key=_fake_public_key_pem(),
+        )
+        Chat.objects.create(pin="1234", user1=other)
+        response = self.client.post("/chat/join-chat/", {"chat_id": "1234"}, format="json")
+        self.assertEqual(response.status_code, 429)
