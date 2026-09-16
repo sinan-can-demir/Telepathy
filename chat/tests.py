@@ -180,6 +180,93 @@ class JoinChatRateLimitTests(TestCase):
             password="a-strong-unguessable-pass1",
             public_key=_fake_public_key_pem(),
         )
-        Chat.objects.create(pin="1234", user1=other)
+        Chat.objects.create(pin="1234")
         response = self.client.post("/chat/join-chat/", {"chat_id": "1234"}, format="json")
         self.assertEqual(response.status_code, 429)
+
+
+class GroupChatSchemaTests(TestCase):
+    """Regression coverage for the Phase 1 ChatParticipant/MessageKey schema
+    migration (#34/#38): a 1:1 chat must behave identically to the old
+    user1/user2 + sender/receiver model from the caller's point of view."""
+
+    def setUp(self):
+        self.alice = APIClient()
+        self.bob = APIClient()
+        for username, client in (("alice", self.alice), ("bob", self.bob)):
+            User.objects.create_user(
+                username=username,
+                password="a-strong-unguessable-pass1",
+                public_key=_fake_public_key_pem(),
+            )
+            token, _ = Token.objects.get_or_create(user=User.objects.get(username=username))
+            client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
+        self.alice_id = User.objects.get(username="alice").id
+        self.bob_id = User.objects.get(username="bob").id
+
+    def test_round_trip_creates_one_message_and_two_keys(self):
+        from chat.models import Message, MessageKey
+
+        create = self.alice.post("/chat/create-chat/", format="json")
+        self.assertEqual(create.status_code, 201)
+        chat_id = create.data["chat_id"]
+
+        join = self.bob.post("/chat/join-chat/", {"chat_id": chat_id}, format="json")
+        self.assertEqual(join.status_code, 200)
+
+        send = self.alice.post(
+            f"/chat/send-message/{chat_id}/",
+            {
+                "encrypted_text": "ciphertext",
+                "aes_nonce": "nonce",
+                "aes_tag": "tag",
+                "signature": "sig",
+                "wrapped_keys": [
+                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-for-alice"},
+                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-for-bob"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(send.status_code, 201, send.data)
+        self.assertEqual(Message.objects.count(), 1)
+        self.assertEqual(MessageKey.objects.count(), 2)
+
+        alice_view = self.alice.get(f"/chat/get-messages/{chat_id}/")
+        self.assertEqual(alice_view.data["current_user_id"], self.alice_id)
+        self.assertEqual(alice_view.data["messages"][0]["my_encrypted_symmetric_key"], "key-for-alice")
+
+        bob_view = self.bob.get(f"/chat/get-messages/{chat_id}/")
+        self.assertEqual(bob_view.data["current_user_id"], self.bob_id)
+        self.assertEqual(bob_view.data["messages"][0]["my_encrypted_symmetric_key"], "key-for-bob")
+
+    def test_leave_only_clears_history_once_chat_fully_empties(self):
+        from chat.models import Chat, Message
+
+        create = self.alice.post("/chat/create-chat/", format="json")
+        chat_id = create.data["chat_id"]
+        self.bob.post("/chat/join-chat/", {"chat_id": chat_id}, format="json")
+        self.alice.post(
+            f"/chat/send-message/{chat_id}/",
+            {
+                "encrypted_text": "ciphertext", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "wrapped_keys": [
+                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": "a"},
+                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": "b"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(Message.objects.count(), 1)
+
+        # Alice leaves; Bob remains -- history must survive.
+        leave = self.alice.post("/chat/leave-chat/", {"chat_id": chat_id}, format="json")
+        self.assertEqual(leave.status_code, 200)
+        self.assertEqual(Message.objects.count(), 1)
+        self.assertTrue(Chat.objects.get(pin=chat_id).is_active)
+
+        # Bob leaves too; chat is now fully empty -- history is cleared.
+        leave2 = self.bob.post("/chat/leave-chat/", {"chat_id": chat_id}, format="json")
+        self.assertEqual(leave2.status_code, 200)
+        self.assertEqual(Message.objects.count(), 0)
+        self.assertFalse(Chat.objects.get(pin=chat_id).is_active)
