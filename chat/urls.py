@@ -34,7 +34,7 @@ urlpatterns = [
 
     path("upload-public-key/",UploadPublicKeyView.as_view(),name="upload_public_key"),
     #  Chat‐related API endpoints
-    path("check-chat/",     CheckChatView.as_view(),    name="check-chat"),
+    path("check-chat/<str:chat_id>/", CheckChatView.as_view(), name="check-chat"),
     path(
         "leave-chat/",
         LeaveChatView.as_view(),
