@@ -4,9 +4,6 @@ from django.urls import path
 
 from . import views
 from .views import (
-    RegisterUserView,
-    LoginView,
-    LogoutView,
     CheckChatView,
     LeaveChatView,
     auth_page,
@@ -15,24 +12,13 @@ from .views import (
     user_menu,
     CreateChatView,
     JoinChatView,
-    setup_2fa, chatbox, GetPublicKeyView,
-    UploadPublicKeyView
+    chatbox,
 )
 
 urlpatterns = [
-    # Registration & Login
-    path("register/", RegisterUserView.as_view(), name="register"),
-    path("login/", LoginView.as_view(), name="login"),
-    path("logout/", LogoutView.as_view(), name="logout"),
-
     #  User Menu (renders usermenu.html)
     path("usermenu/", user_menu, name="user_menu"),
 
-    # 2FA setup route (keep this exactly as before)
-    path("2fa/setup/", setup_2fa, name="setup_2fa"),
-    path("get-public-key/<int:user_id>/", GetPublicKeyView.as_view(), name="get-public-key"),
-
-    path("upload-public-key/",UploadPublicKeyView.as_view(),name="upload_public_key"),
     #  Chat‐related API endpoints
     path("check-chat/<str:chat_id>/", CheckChatView.as_view(), name="check-chat"),
     path(
@@ -42,13 +28,13 @@ urlpatterns = [
     ),
     path('send-message/<str:chat_id>/', views.SendMessageView.as_view(), name='send_message'),
     path('get-messages/<str:chat_id>/', views.GetMessagesView.as_view(), name='get_messages'),
-    
+
     path("create-chat/",    CreateChatView.as_view(),   name="create-chat"),
     path("join-chat/",      JoinChatView.as_view(),     name="join-chat"),
 
     # Chatbox page (renders chatbox.html)
     path("chatbox/", chatbox, name="chatbox"),
 
-    #  Root of /chat/ serves your auth page (login/register form)
+    #  Root of /chat/ serves your auth page (landing page; no login/register anymore)
     path("", views.auth_page, name="auth_page"),
 ]

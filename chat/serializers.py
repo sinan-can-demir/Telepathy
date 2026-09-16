@@ -1,26 +1,16 @@
-from django.contrib.auth import get_user_model
 from rest_framework import serializers
 from .models import Message
-User = get_user_model()
-
-
-class UserSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = [
-            "id",
-            "username",
-            "email",
-            "public_key",
-            "is_2fa_enabled",
-        ]
-        read_only_fields = ["is_2fa_enabled", "id"]
 
 
 class MessageSerializer(serializers.ModelSerializer):
+    # Display names are chosen per-chat and not required to be unique (there's
+    # no account to enforce global uniqueness against anymore), so the
+    # frontend must tell "is this my message" apart by sender_id, not by
+    # comparing display-name strings.
+    sender_id = serializers.IntegerField(read_only=True)
     sender_public_key = serializers.CharField(source="sender.public_key",         read_only=True)
     sender_signing_public_key = serializers.CharField(source="sender.signing_public_key", read_only=True)
-    sender_username = serializers.CharField(source="sender.username",       read_only=True)
+    sender_username = serializers.CharField(source="sender.display_name",       read_only=True)
     my_encrypted_symmetric_key = serializers.SerializerMethodField()
 
     class Meta:
@@ -33,6 +23,7 @@ class MessageSerializer(serializers.ModelSerializer):
             "aes_tag",
             "signature",
             "timestamp",
+            "sender_id",
             "sender_public_key",
             "sender_signing_public_key",
             "sender_username",
@@ -47,4 +38,3 @@ class MessageSerializer(serializers.ModelSerializer):
             None,
         )
         return key.encrypted_symmetric_key if key else None
-
