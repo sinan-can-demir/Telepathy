@@ -5,6 +5,8 @@ from rest_framework import status, permissions
 from rest_framework.authtoken.models import Token
 from rest_framework.generics import CreateAPIView
 from .serializers import UserSerializer, MessageSerializer
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import Message
 import logging
 import pyotp
@@ -32,10 +34,26 @@ from rest_framework.authentication import TokenAuthentication
 # Track failed login attempts per IP: {ip: (last_attempt_time, wait_time)}
 failed_login_ips = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
 
+# Track failed registration attempts per IP
+failed_register_ips = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
 # Track failed chat-join attempts per user, to slow brute-forcing the 4-digit PIN space
 failed_join_attempts = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
 
 logger = logging.getLogger(__name__)
+
+
+def _record_registration_failure(entry, now_time, message, http_status):
+    """Bumps the per-IP failure counter and returns the response to send:
+    either the specific failure message, or a 429 once the threshold is crossed."""
+    entry["fail_count"] += 1
+    if entry["fail_count"] >= 5:
+        entry["wait_time"] = entry["wait_time"] * 2 if entry["wait_time"] else 10
+        entry["last_time"] = now_time
+        return Response(
+            {"message": f"Too many registration attempts. Try again in {entry['wait_time']} seconds."},
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+    return Response({"message": message}, status=http_status)
 
 
 # Home Page View - renders index.html
@@ -90,27 +108,45 @@ class RegisterUserView(CreateAPIView):
         public_key = request.data.get("public_key")
         signing_public_key = request.data.get("signing_public_key")
 
+        # —— Rate limiting by IP ——
+        ip = request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
+        now_time = time.time()
+        entry = failed_register_ips[ip]
+        if entry["fail_count"] >= 5 and now_time < entry["last_time"] + entry["wait_time"]:
+            wait_remaining = int(entry["last_time"] + entry["wait_time"] - now_time)
+            return Response(
+                {"message": f"Too many registration attempts. Try again in {wait_remaining} seconds."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         # Basic input validation
         if not username or not is_valid_username(username):
-            return Response(
-                {"message": "Username contains invalid characters."},
-                status=status.HTTP_400_BAD_REQUEST,
+            return _record_registration_failure(
+                entry, now_time, "Username contains invalid characters.", status.HTTP_400_BAD_REQUEST
             )
         if not password:
-            return Response(
-                {"message": "Password cannot be empty."}, status=status.HTTP_400_BAD_REQUEST
+            return _record_registration_failure(
+                entry, now_time, "Password cannot be empty.", status.HTTP_400_BAD_REQUEST
             )
+
+        try:
+            validate_password(password)
+        except DjangoValidationError as e:
+            return _record_registration_failure(
+                entry, now_time, list(e.messages), status.HTTP_400_BAD_REQUEST
+            )
+
         if not public_key:
-            return Response(
-                {"message": "Public key is required."}, status=status.HTTP_400_BAD_REQUEST
+            return _record_registration_failure(
+                entry, now_time, "Public key is required.", status.HTTP_400_BAD_REQUEST
             )
 
         # Very basic PEM‐format validation
         if not public_key.startswith("-----BEGIN PUBLIC KEY-----") or not public_key.endswith(
                 "-----END PUBLIC KEY-----"
         ):
-            return Response(
-                {"message": "Invalid public key format."}, status=status.HTTP_400_BAD_REQUEST
+            return _record_registration_failure(
+                entry, now_time, "Invalid public key format.", status.HTTP_400_BAD_REQUEST
             )
 
         try:
@@ -120,15 +156,19 @@ class RegisterUserView(CreateAPIView):
             serialization.load_pem_public_key(public_key.encode())
         except Exception as e:
             logger.warning(f"[REGISTER] Invalid public key provided: {e}")
-            return Response(
-                {"message": "Invalid public key."}, status=status.HTTP_400_BAD_REQUEST
+            return _record_registration_failure(
+                entry, now_time, "Invalid public key.", status.HTTP_400_BAD_REQUEST
             )
 
         logger.info(f"[REGISTER] New registration request for username: {username}")
         if User.objects.filter(username=username).exists():
-            return Response(
-                {"message": "Username already exists."}, status=status.HTTP_400_BAD_REQUEST
+            return _record_registration_failure(
+                entry, now_time, "Username already exists.", status.HTTP_400_BAD_REQUEST
             )
+
+        # Reset the failure record for this IP on success
+        failed_register_ips.pop(ip, None)
+
         user = User(
                 username=username,
                 public_key=public_key,
