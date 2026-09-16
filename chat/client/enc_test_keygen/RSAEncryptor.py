@@ -29,30 +29,36 @@ def decrypt_with_aes(key: bytes, data: dict) -> str:
     return plaintext.decode()
 
 
-def encrypt_aes_key_with_rsa(public_key_pem: str, aes_key: bytes) -> str:
-    public_key = RSA.import_key(public_key_pem)
+def _as_rsa_key(key_or_pem):
+    """Accepts either a PEM string or an already-imported RSA key object,
+    so callers can parse a key once and reuse it across many operations."""
+    return key_or_pem if isinstance(key_or_pem, RSA.RsaKey) else RSA.import_key(key_or_pem)
+
+
+def encrypt_aes_key_with_rsa(public_key_pem, aes_key: bytes) -> str:
+    public_key = _as_rsa_key(public_key_pem)
     cipher_rsa = PKCS1_OAEP.new(public_key)
     encrypted_key = cipher_rsa.encrypt(aes_key)
     return base64.b64encode(encrypted_key).decode()
 
 
-def decrypt_aes_key_with_rsa(private_key_pem: str, encrypted_key_b64: str) -> bytes:
+def decrypt_aes_key_with_rsa(private_key_pem, encrypted_key_b64: str) -> bytes:
     encrypted_key = base64.b64decode(encrypted_key_b64)
-    private_key = RSA.import_key(private_key_pem)
+    private_key = _as_rsa_key(private_key_pem)
     cipher_rsa = PKCS1_OAEP.new(private_key)
     return cipher_rsa.decrypt(encrypted_key)
 
 
-def sign_message(private_key_pem: str, message: str) -> str:
-    key = RSA.import_key(private_key_pem)
+def sign_message(private_key_pem, message: str) -> str:
+    key = _as_rsa_key(private_key_pem)
     h = SHA256.new(message.encode())
     signer = pss.new(key)
     signature = signer.sign(h)
     return base64.b64encode(signature).decode()
 
 
-def verify_signature(public_key_pem: str, message: str, signature_b64: str) -> bool:
-    key = RSA.import_key(public_key_pem)
+def verify_signature(public_key_pem, message: str, signature_b64: str) -> bool:
+    key = _as_rsa_key(public_key_pem)
     h = SHA256.new(message.encode())
     verifier = pss.new(key)
     signature = base64.b64decode(signature_b64)

@@ -15,6 +15,8 @@ from rest_framework.authtoken.models import Token
 from rest_framework.generics import CreateAPIView
 from .serializers import UserSerializer
 from .models import Message
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from threading import Lock
 import os
 import uuid
@@ -34,6 +36,9 @@ import re
 
 # Track failed login attempts per IP: {ip: (last_attempt_time, wait_time)}
 failed_login_ips = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
+
+# Track failed/rejected registration attempts per IP, same shape as failed_login_ips
+failed_register_ips = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
 
 
 # In-memory storage for matchmaking; in production, consider a persistent solution.
@@ -81,18 +86,46 @@ class RegisterUserView(CreateAPIView):
         username = request.data.get("username")
         password = request.data.get("password")
 
+        # —— Rate limiting by IP (same cooldown pattern as LoginView) ——
+        ip = request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
+        now_time = time.time()
+        entry = failed_register_ips[ip]
+        if entry["fail_count"] >= 3 and now_time < entry["last_time"] + entry["wait_time"]:
+            wait_remaining = int(entry["last_time"] + entry["wait_time"] - now_time)
+            return Response(
+                {"message": f"Too many registration attempts. Try again in {wait_remaining} seconds."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         # Backend input validation
         if not is_valid_username(username):
             return Response({"message": "Username contains invalid characters."}, status=400)
 
         logger.info(f"[REGISTER] New registration request for username: {username}")
         if User.objects.filter(username=username).exists():
+            entry["fail_count"] += 1
+            if entry["fail_count"] >= 3:
+                entry["wait_time"] = entry["wait_time"] * 2 if entry["wait_time"] else 10
+                entry["last_time"] = now_time
             return Response({"message": "Username already exists"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Generate RSA Key Pair
+        try:
+            validate_password(password)
+        except DjangoValidationError as e:
+            entry["fail_count"] += 1
+            if entry["fail_count"] >= 3:
+                entry["wait_time"] = entry["wait_time"] * 2 if entry["wait_time"] else 10
+                entry["last_time"] = now_time
+            return Response({"message": list(e.messages)}, status=status.HTTP_400_BAD_REQUEST)
+
+        failed_register_ips.pop(ip, None)
+
+        # Generate RSA Key Pair (2048-bit: keys are short-lived/per-user rather than
+        # long-term identity keys, so 4096-bit's extra margin isn't needed and costs
+        # significant sign/verify/decrypt latency)
         private_key = rsa.generate_private_key(
             public_exponent=65537,
-            key_size=4096
+            key_size=2048
         )
         logger.debug(f"[REGISTER] RSA key pair generated for user: {username}")
 
@@ -182,13 +215,12 @@ class LoginView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        # —— Successful authentication ——        
+        # —— Successful authentication ——
         logger.info(f"[LOGIN] Login successful for {username} from IP: {ip}")
 
-        # Create a Django session so request.user is set later
-        django_login(request, user)
-
-        # If the user has 2FA enabled, verify the OTP code
+        # If the user has 2FA enabled, verify the OTP code BEFORE establishing a
+        # session — otherwise a session-authenticated view could be reached without
+        # ever supplying a valid OTP code.
         if getattr(user, "is_2fa_enabled", False):
             totp = pyotp.TOTP(user.totp_secret)
             if not otp_code or not totp.verify(otp_code):
@@ -196,6 +228,9 @@ class LoginView(APIView):
                     {"detail": "Invalid or missing 2FA code"},
                     status=status.HTTP_401_UNAUTHORIZED
                 )
+
+        # Create a Django session so request.user is set later
+        django_login(request, user)
 
         # Reset the failure record for this IP
         failed_login_ips.pop(ip, None)
@@ -317,7 +352,7 @@ class SendMessageView(APIView):
             message_text = request.data.get("message")
             chat_id = request.data.get("chat_id")
 
-            logger.debug("[SEND] message_text='%s', chat_id='%s'", message_text, chat_id)
+            logger.debug("[SEND] chat_id='%s'", chat_id)
             if chat_id not in active_chats:
                 logger.warning("[SEND] Invalid chat_id '%s'", chat_id)
                 return Response({"message": "Invalid chat ID."},
@@ -379,7 +414,7 @@ class SendMessageView(APIView):
 
 
 from chat.client.enc_test_keygen.RSAEncryptor import (
-    decrypt_with_aes, decrypt_aes_key_with_rsa
+    decrypt_with_aes, decrypt_aes_key_with_rsa, _as_rsa_key
 )
 
 
@@ -402,11 +437,15 @@ class GetMessagesView(APIView):
             Q(sender=user1, receiver=user2) | Q(sender=user2, receiver=user1)
         ).order_by("timestamp")
 
-        # Load private key
+        # Load and parse the private key once per request, not once per message.
         priv_path = f"chat/client/enc_test_keygen/static/keys/{request.user.username}_private_key.pem"
         with open(priv_path, "r") as f:
             private_pem = f.read()
+        private_key = _as_rsa_key(private_pem)
         logger.debug("[GET] Loaded private key for '%s'", request.user.username)
+
+        # Cache parsed sender public keys across the loop (a 1:1 chat has at most 2 senders).
+        sender_key_cache = {}
 
         out = []
         for m in msgs:
@@ -415,7 +454,7 @@ class GetMessagesView(APIView):
                 try:
                     # RSA-decrypt AES key
                     logger.debug("[GET] RSA-decrypting AES key for Message(id=%d)", m.id)
-                    aes_key = decrypt_aes_key_with_rsa(private_pem, m.encrypted_symmetric_key)
+                    aes_key = decrypt_aes_key_with_rsa(private_key, m.encrypted_symmetric_key)
                     logger.debug("[GET] AES key decrypted for Message(id=%d)", m.id)
 
                     # AES-decrypt message
@@ -429,7 +468,10 @@ class GetMessagesView(APIView):
 
                     # Verify signature
                     logger.debug("[GET] Verifying signature for Message(id=%d)", m.id)
-                    if verify_signature(m.sender.public_key, plaintext, m.signature):
+                    sender_key = sender_key_cache.setdefault(
+                        m.sender.username, _as_rsa_key(m.sender.public_key)
+                    )
+                    if verify_signature(sender_key, plaintext, m.signature):
                         logger.debug("[GET] Signature valid for Message(id=%d)", m.id)
                     else:
                         logger.warning("[GET] Signature INVALID for Message(id=%d) — possible tampering", m.id)

@@ -16,7 +16,6 @@ class User(AbstractUser):
 
 
     public_key = models.TextField(null=True, blank=True)
-    private_kyte = models.TextField(null=True, blank=True)# Stores user's RSA public key
 
     # Avoid conflicts with Django's built-in User model
     groups = models.ManyToManyField(Group, related_name="chat_users", blank=True)

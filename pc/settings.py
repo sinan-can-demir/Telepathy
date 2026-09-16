@@ -11,22 +11,29 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 
 from pathlib import Path
 import os
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_dotenv(BASE_DIR / ".env")
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-ky^56xg5&kg2&8ualp++lplthx@*x7s%g)7eyhq*&(@bohhcle'
+# Must be set via the SECRET_KEY env var (e.g. in a local .env file, never committed).
+# The value previously hardcoded here was committed to git and must be treated as
+# compromised — generate a fresh one per deployment, e.g.:
+#   python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+SECRET_KEY = os.environ["SECRET_KEY"]
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False 
+DEBUG = os.environ.get("DJANGO_DEBUG", "False") == "True"
 
 
-ALLOWED_HOSTS = ["my_database", "178.238.108.26", "localhost", "127.0.0.1","10.10.9.108", "188.91.214.104"]
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
 
 LOGGING = {
     'version': 1,
@@ -125,11 +132,11 @@ ASGI_APPLICATIOn='pc.asgi.application'
 DATABASES = {
     'default': {
         'ENGINE':   'django.db.backends.postgresql',
-        'NAME':     'my_database',       # your database name
-        'USER':     'myproject_user',    # the Postgres role you made
-        'PASSWORD': 'mysecretpassword',  # that role’s password
-        'HOST':     'localhost',
-        'PORT':     '5432',
+        'NAME':     os.environ.get('DB_NAME', 'my_database'),
+        'USER':     os.environ.get('DB_USER', 'myproject_user'),
+        'PASSWORD': os.environ['DB_PASSWORD'],
+        'HOST':     os.environ.get('DB_HOST', 'localhost'),
+        'PORT':     os.environ.get('DB_PORT', '5432'),
     }
 }
 
@@ -210,18 +217,21 @@ REST_FRAMEWORK = {
     ]
 }
 
+# TLS/cookie hardening: secure by default, only relaxed when DEBUG (local dev over
+# HTTP). Production deployments must run with DJANGO_DEBUG unset/False.
+
 # Force all requests to be redirected to HTTPS
-SECURE_SSL_REDIRECT = False
+SECURE_SSL_REDIRECT = not DEBUG
 
 # If you're behind a reverse proxy (e.g., Nginx), set the following header:
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # HTTP Strict Transport Security (HSTS) settings
-SECURE_HSTS_SECONDS = 0  # 1 year in seconds
-SECURE_HSTS_INCLUDE_SUBDOMAINS = False
-SECURE_HSTS_PRELOAD = False
+SECURE_HSTS_SECONDS = 0 if DEBUG else 31536000  # 1 year in seconds
+SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
+SECURE_HSTS_PRELOAD = not DEBUG
 
-# Optionally, ensure cookies are only sent over HTTPS
-SESSION_COOKIE_SECURE = False
-CSRF_COOKIE_SECURE = False
+# Ensure cookies are only sent over HTTPS in production
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
 

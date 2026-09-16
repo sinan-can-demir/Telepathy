@@ -99,7 +99,7 @@ DROP ROLE IF EXISTS myproject_user;
 
 CREATE ROLE myproject_user
   WITH LOGIN
-  PASSWORD 'mysecretpassword'
+  PASSWORD 'choose-your-own-password-here'
   CREATEDB
   CREATEROLE
   INHERIT;
@@ -159,6 +159,23 @@ pip install --upgrade pip
 pip install -r requirements.txt
 pip install colorlog django-postgrespool2 pillow channels==4.2.0 channels_redis psycopg2-binary
 ```
+
+---
+
+### 6b. Configure Secrets (`.env`)
+
+The app reads its secrets from environment variables instead of hardcoding them. Copy the example file and fill it in:
+
+```bash
+cp .env.example .env
+```
+
+Generate a fresh `SECRET_KEY`:
+```bash
+python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+```
+
+Then edit `.env` and set `SECRET_KEY` and `DB_PASSWORD` to match the password you chose for `myproject_user` above. **Never commit `.env`.**
 
 ---
 
