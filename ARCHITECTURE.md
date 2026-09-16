@@ -60,3 +60,5 @@ Chat-pairing logic (slot assignment, in-memory mirroring, message cleanup on lea
 ## Relationship to feature planning
 
 Limitations #1 and #2 should shape any near-term feature scoping rather than follow it — a `Message → Chat` foreign key is a prerequisite for group chats, message search scoped to a conversation, or any multi-conversation feature, and the PIN-recycling fix determines whether the app can survive past ~10,000 total chats. Worth deciding on these before committing to a feature design that assumes the current schema.
+
+See [docs/GROUP_CHATS_PLAN.md](docs/GROUP_CHATS_PLAN.md) for a concrete plan that resolves limitation #1 as groundwork before building group chat support on top of it.
