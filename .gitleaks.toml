@@ -1,0 +1,10 @@
+title = "Telepathy gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore fake credentials in test fixtures"
+paths = [
+  '''chat/tests\.py''',
+]
