@@ -32,6 +32,9 @@ from rest_framework.authentication import TokenAuthentication
 # Track failed login attempts per IP: {ip: (last_attempt_time, wait_time)}
 failed_login_ips = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
 
+# Track failed chat-join attempts per user, to slow brute-forcing the 4-digit PIN space
+failed_join_attempts = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
+
 logger = logging.getLogger(__name__)
 
 
@@ -340,15 +343,38 @@ class JoinChatView(APIView):
             logger.warning("[JOIN-CHAT] No 'chat_id' provided in payload.")
             return Response({"message": "Chat ID is required."}, status=400)
 
+        user = request.user
+
+        # —— Rate limiting per user, to slow brute-forcing the 4-digit PIN space ——
+        entry = failed_join_attempts[user.pk]
+        now_time = time.time()
+        if entry["fail_count"] >= 5 and now_time < entry["last_time"] + entry["wait_time"]:
+            wait_remaining = int(entry["last_time"] + entry["wait_time"] - now_time)
+            return Response(
+                {"message": f"Too many failed join attempts. Try again in {wait_remaining} seconds."},
+                status=429,
+            )
+
         #  Look up the Chat
         try:
             chat = Chat.objects.get(pin=chat_id)
             logger.info(f"[JOIN-CHAT] Chat found: {chat} (id={chat.pk})")
         except Chat.DoesNotExist:
+            entry["fail_count"] += 1
+            if entry["fail_count"] >= 5:
+                entry["wait_time"] = entry["wait_time"] * 2 if entry["wait_time"] else 10
+                entry["last_time"] = now_time
+                logger.warning(f"[JOIN-CHAT] User '{user.username}' exceeded join attempts. Timeout started for {entry['wait_time']}s")
+                return Response(
+                    {"message": f"Too many failed join attempts. Try again in {entry['wait_time']} seconds."},
+                    status=429,
+                )
             logger.warning(f"[JOIN-CHAT] No chat matching PIN={chat_id}")
             return Response({"message": "Chat not found."}, status=404)
 
-        user = request.user
+        # Reset the failure record for this user on a successful PIN lookup
+        failed_join_attempts.pop(user.pk, None)
+
         logger.debug(f"[JOIN-CHAT] Current user: {user.username} (id={user.pk})")
 
         #  Persist the user into an open slot
