@@ -85,6 +85,13 @@ class Message(models.Model):
     seq = models.PositiveIntegerField(default=0)
     prev_hash = models.CharField(max_length=64, default="0" * 64)
 
+    # Forward secrecy: which epoch of the SENDER's own sending chain (see
+    # ChainKey) this message's AES key was ratcheted from. Recipients other
+    # than the sender derive the key locally by advancing their cached copy
+    # of that chain rather than unwrapping a per-message key -- see
+    # docs/FORWARD_SECRECY.md.
+    sender_chain_epoch = models.PositiveIntegerField(default=0)
+
     timestamp = models.DateTimeField(
         auto_now_add=True,
         db_index=True,
@@ -104,6 +111,11 @@ class Message(models.Model):
 
 
 class MessageKey(models.Model):
+    """As of forward secrecy (Phase 2), only ever holds the SENDER's own
+    self-wrapped copy of a message's AES key (so they can always redisplay
+    their own sent history) -- other participants derive the key locally
+    from their cached copy of the sender's chain instead of unwrapping a
+    per-message key. See docs/FORWARD_SECRECY.md."""
     message = models.ForeignKey(Message, related_name="wrapped_keys", on_delete=models.CASCADE)
     recipient = models.ForeignKey(
         ChatParticipant,
@@ -117,3 +129,37 @@ class MessageKey(models.Model):
 
     def __str__(self):
         return f"Key for {self.recipient} on {self.message_id}"
+
+
+class ChainKey(models.Model):
+    """One epoch of a participant's own sending-chain seed. A participant
+    issues a new epoch (fanned out, wrapped per current other participant)
+    before their first send in a chat, and again any time the roster has
+    changed since they last issued one -- re-keying on membership change
+    bounds a leaver's/new-joiner's exposure to messages sent under an epoch
+    they were actually part of. See docs/FORWARD_SECRECY.md."""
+    chat = models.ForeignKey(Chat, related_name="chain_keys", on_delete=models.CASCADE)
+    sender = models.ForeignKey(ChatParticipant, related_name="issued_chain_keys", on_delete=models.CASCADE)
+    epoch = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("sender", "epoch")]
+
+    def __str__(self):
+        return f"{self.sender}'s chain epoch {self.epoch}"
+
+
+class ChainKeyWrap(models.Model):
+    """The chain seed for one ChainKey epoch, RSA-OAEP-wrapped for one
+    recipient. Only the sender ever generates the raw seed; the server only
+    ever sees/stores it encrypted."""
+    chain_key = models.ForeignKey(ChainKey, related_name="wraps", on_delete=models.CASCADE)
+    recipient = models.ForeignKey(ChatParticipant, related_name="chain_key_wraps", on_delete=models.CASCADE)
+    encrypted_seed = models.TextField()
+
+    class Meta:
+        unique_together = [("chain_key", "recipient")]
+
+    def __str__(self):
+        return f"Seed for {self.recipient} on {self.chain_key}"

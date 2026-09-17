@@ -196,7 +196,6 @@
     }
     function ab2b64(buf) { const b = new Uint8Array(buf); let s=''; for(let i=0;i<b.byteLength;i++) s+=String.fromCharCode(b[i]); return btoa(s); }
     function b642ab(b64) { const bin=atob(b64); const a=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i); return a.buffer; }
-    function generateAESKey() { return crypto.getRandomValues(new Uint8Array(32)); }
 
     // ── Transcript chain (tamper-evidence) ──────────────────────────────────
     // Mirrors chat/chain.py's compute_chain_hash exactly -- every message is
@@ -221,6 +220,129 @@
     // position in the chain -- its signature simply won't match there anymore.
     function signedPayloadBytes(seq, prevHash, cid, plaintext) {
         return new TextEncoder().encode(`${seq}|${prevHash}|${cid}|${plaintext}`);
+    }
+
+    // ── Forward secrecy: sender-chain ratchet ───────────────────────────────
+    // Mirrors a Signal "Sender Key"-style symmetric ratchet: HMAC-SHA256 with
+    // a one-byte label, exactly like the message-key/chain-key derivation in
+    // Signal's own KDF chain. Each step is one-way (you can't run HMAC
+    // backward), so stealing chainKeyBytes at some point only yields message
+    // keys from there forward, never the ones already ratcheted past --
+    // that's the actual forward-secrecy property. What this does NOT give:
+    // post-compromise security (self-healing) -- see docs/FORWARD_SECRECY.md.
+    async function hmacSha256(keyBytes, labelByte) {
+        const key = await crypto.subtle.importKey('raw', keyBytes, {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
+        const sig = await crypto.subtle.sign('HMAC', key, new Uint8Array([labelByte]));
+        return new Uint8Array(sig);
+    }
+    async function ratchetStep(chainKeyBytes) {
+        const messageKey = await hmacSha256(chainKeyBytes, 0x01);
+        const nextChainKey = await hmacSha256(chainKeyBytes, 0x02);
+        return { messageKey, nextChainKey };
+    }
+
+    const myChainEpochName = cid => `chain_my_epoch_${cid}`;
+    const myChainKeyName = cid => `chain_my_key_${cid}`;
+    const myChainRosterName = cid => `chain_my_roster_${cid}`;
+    const recvChainEpochName = (cid, sid) => `chain_recv_epoch_${cid}_${sid}`;
+    const recvChainKeyName = (cid, sid) => `chain_recv_key_${cid}_${sid}`;
+    const msgKeyName = (cid, msgId) => `msgkey_${cid}_${msgId}`;
+
+    function destroyChainState(cid) {
+        localStorage.removeItem(myChainEpochName(cid));
+        localStorage.removeItem(myChainKeyName(cid));
+        localStorage.removeItem(myChainRosterName(cid));
+        const prefixes = [`chain_recv_epoch_${cid}_`, `chain_recv_key_${cid}_`, `msgkey_${cid}_`];
+        const toRemove = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && prefixes.some(p => key.startsWith(p))) toRemove.push(key);
+        }
+        toRemove.forEach(k => localStorage.removeItem(k));
+    }
+
+    // Issues a fresh chain-key epoch (wrapped RSA-OAEP per recipient) iff the
+    // roster has changed since we last issued one, or we never have. One
+    // retry on a 400 (another join/leave raced us) after refetching the
+    // roster -- mirrors the send flow's 409-retry pattern in spirit.
+    async function ensureMyChainKey(recipients, attempt=0){
+        const sortedIds = recipients.map(r=>String(r.id)).sort();
+        const storedRoster = localStorage.getItem(myChainRosterName(chatId));
+        const storedEpoch = localStorage.getItem(myChainEpochName(chatId));
+        if (storedEpoch !== null && storedRoster === JSON.stringify(sortedIds)) return;
+
+        const seed = crypto.getRandomValues(new Uint8Array(32));
+        const wraps = [];
+        for (const r of recipients) {
+            const pub = await importPubEnc(r.public_key);
+            const wrapped = await crypto.subtle.encrypt({name:'RSA-OAEP'}, pub, seed);
+            wraps.push({recipient_id: r.id, encrypted_seed: ab2b64(wrapped)});
+        }
+        const resp = await fetch(`/chat/issue-chain-key/${chatId}/`, {
+            method:'POST', headers: authHeaders({'Content-Type':'application/json'}),
+            body: JSON.stringify({wraps}),
+        });
+        if (!resp.ok) {
+            if (attempt < 1) {
+                const freshRecipients = await fetchRecipientKeys();
+                return ensureMyChainKey(freshRecipients, attempt+1);
+            }
+            const err = await resp.json().catch(()=>({}));
+            throw new Error('Failed to issue chain key: ' + (err.message || resp.statusText));
+        }
+        const data = await resp.json();
+        localStorage.setItem(myChainEpochName(chatId), String(data.epoch));
+        localStorage.setItem(myChainKeyName(chatId), ab2b64(seed));
+        localStorage.setItem(myChainRosterName(chatId), JSON.stringify(sortedIds));
+    }
+
+    // Called once per NEW message from someone else, in strict seq order
+    // (see appendNewMessages). Caches the derived key under the message's
+    // own id first -- a page reload must be able to redisplay a message it
+    // already showed once without needing to re-run the ratchet backward
+    // (which is by construction impossible once it's advanced past that
+    // point). Only genuinely NEW messages ever touch the live ratchet state.
+    // Reset at the top of every appendNewMessages call (not cached across
+    // polls) -- otherwise a sender's re-key after our first fetch would be
+    // invisible to us for the rest of the session.
+    let chainKeysFetchCache = new Map();
+    let chainKeysFetchedThisBatch = false;
+    async function fetchChainKeysOnce(){
+        if (chainKeysFetchedThisBatch) return chainKeysFetchCache;
+        const r = await fetch(`/chat/get-chain-keys/${chatId}/`, {headers: authHeaders()});
+        chainKeysFetchCache = new Map();
+        if (r.ok) {
+            const data = await r.json();
+            for (const entry of data.chain_keys) chainKeysFetchCache.set(entry.sender_id, entry);
+        }
+        chainKeysFetchedThisBatch = true;
+        return chainKeysFetchCache;
+    }
+
+    async function deriveReceivedMessageKey(msg){
+        const cached = localStorage.getItem(msgKeyName(chatId, msg.id));
+        if (cached) return new Uint8Array(b642ab(cached));
+
+        const senderId = msg.sender_id, msgEpoch = msg.sender_chain_epoch;
+        let epoch = localStorage.getItem(recvChainEpochName(chatId, senderId));
+        epoch = epoch === null ? null : Number(epoch);
+
+        if (epoch === null || epoch < msgEpoch) {
+            const remote = await fetchChainKeysOnce();
+            const entry = remote.get(senderId);
+            if (!entry || entry.epoch < msgEpoch) throw new Error('No chain key available for this sender/epoch');
+            const seedBuf = await crypto.subtle.decrypt({name:'RSA-OAEP'}, myEncKeys.privateKey, b642ab(entry.encrypted_seed));
+            localStorage.setItem(recvChainEpochName(chatId, senderId), String(entry.epoch));
+            localStorage.setItem(recvChainKeyName(chatId, senderId), ab2b64(seedBuf));
+            epoch = entry.epoch;
+        }
+        if (epoch !== msgEpoch) throw new Error('Chain epoch mismatch; cannot derive message key');
+
+        const currentBytes = new Uint8Array(b642ab(localStorage.getItem(recvChainKeyName(chatId, senderId))));
+        const { messageKey, nextChainKey } = await ratchetStep(currentBytes);
+        localStorage.setItem(recvChainKeyName(chatId, senderId), ab2b64(nextChainKey.buffer));
+        localStorage.setItem(msgKeyName(chatId, msg.id), ab2b64(messageKey.buffer));
+        return messageKey;
     }
 
     async function encryptWithAES(key, plaintext) {
@@ -319,9 +441,9 @@
 
     // ── Send Modal helpers ──────────────────────────────────────────────────
     const SEND_STEPS = [
-        'Generating AES-256 session key…',
+        'Deriving forward-secret session key (ratchet)…',
         'Encrypting message (AES-256-GCM)…',
-        'Wrapping key for each participant (RSA-OAEP)…',
+        'Wrapping key for yourself (RSA-OAEP)…',
         'Signing message (RSA-PSS)…',
         'Sending encrypted payload…'
     ];
@@ -411,6 +533,7 @@
         localStorage.removeItem(signPubKeyName(cid));
         localStorage.removeItem(tokenName(cid));
         localStorage.removeItem(participantIdName(cid));
+        destroyChainState(cid);
     }
 
     // ── Establish participation: either resume an existing chat (page
@@ -533,10 +656,19 @@
         }catch(e){console.error('fetchNewMessages:',e);}
     }
 
-    // ── Only render NEW messages (by ID) ────────────────────────────────────
+    // ── Only render NEW messages (by ID), strictly in seq order ─────────────
+    // Order matters here beyond display: deriveReceivedMessageKey advances a
+    // per-sender ratchet exactly once per new message, so processing out of
+    // seq order would derive the wrong keys. renderedIds already guarantees
+    // "exactly once ever" (not just "once per batch") for that advancement,
+    // since it's never cleared and a page reload starts a fresh in-memory
+    // Set but relies on deriveReceivedMessageKey's own per-message cache
+    // (keyed by msg.id, in localStorage) to avoid re-advancing on reload.
     async function appendNewMessages(msgs){
+        chainKeysFetchedThisBatch = false;
+        const sorted = [...msgs].sort((a,b)=>a.seq-b.seq);
         let added = false;
-        for(const msg of msgs){
+        for(const msg of sorted){
             if(renderedIds.has(msg.id)) continue;
             renderedIds.add(msg.id);
             await renderMsg(msg);
@@ -559,14 +691,21 @@
         const cryptoSteps = []; // {label, ok}
 
         try{
-            cryptoSteps.push({label:'RSA-OAEP key unwrap', ok:null});
-            const wk = msg.my_encrypted_symmetric_key;
-            if(!wk) throw new Error('No wrapped key');
-            const aesKeyBuf = await crypto.subtle.decrypt({name:'RSA-OAEP'},myEncKeys.privateKey,b642ab(wk));
-            cryptoSteps[0].ok = true;
+            let aesKeyBytes;
+            if(isMine){
+                cryptoSteps.push({label:'RSA-OAEP key unwrap (self)', ok:null});
+                const wk = msg.my_encrypted_symmetric_key;
+                if(!wk) throw new Error('No self-wrapped key');
+                aesKeyBytes = new Uint8Array(await crypto.subtle.decrypt({name:'RSA-OAEP'},myEncKeys.privateKey,b642ab(wk)));
+                cryptoSteps[0].ok = true;
+            } else {
+                cryptoSteps.push({label:'Chain ratchet (forward-secret)', ok:null});
+                aesKeyBytes = await deriveReceivedMessageKey(msg);
+                cryptoSteps[0].ok = true;
+            }
 
             cryptoSteps.push({label:'AES-256-GCM decrypt', ok:null});
-            text = await decryptWithAES(new Uint8Array(aesKeyBuf),{ciphertext:msg.encrypted_text,nonce:msg.aes_nonce,tag:msg.aes_tag});
+            text = await decryptWithAES(aesKeyBytes,{ciphertext:msg.encrypted_text,nonce:msg.aes_nonce,tag:msg.aes_tag});
             cryptoSteps[1].ok = true;
 
             if(!isMine && msg.signature && msg.sender_signing_public_key){
@@ -653,22 +792,23 @@
 
         try{
             advanceSendStep(0);
-            const aesKey=generateAESKey();
+            const recipients=await fetchRecipientKeys();
+            await ensureMyChainKey(recipients);
+            const currentChainBytes = new Uint8Array(b642ab(localStorage.getItem(myChainKeyName(chatId))));
+            const { messageKey, nextChainKey } = await ratchetStep(currentChainBytes);
+            // Advance-then-discard immediately: once this is overwritten, the
+            // key just derived can never be recovered from local state again.
+            localStorage.setItem(myChainKeyName(chatId), ab2b64(nextChainKey.buffer));
+            const senderChainEpoch = Number(localStorage.getItem(myChainEpochName(chatId)));
             completeSendStep(0);
 
             advanceSendStep(1);
-            const aesEnc=await encryptWithAES(aesKey,plaintext);
+            const aesEnc=await encryptWithAES(messageKey,plaintext);
             completeSendStep(1);
 
             advanceSendStep(2);
-            const recipients=await fetchRecipientKeys();
-            const wSelf=await crypto.subtle.encrypt({name:'RSA-OAEP'},myEncKeys.publicKey,aesKey);
+            const wSelf=await crypto.subtle.encrypt({name:'RSA-OAEP'},myEncKeys.publicKey,messageKey);
             const wrapped_keys=[{recipient_id:Number(myParticipantId),encrypted_symmetric_key:ab2b64(wSelf)}];
-            for(const r of recipients){
-                const pub=await importPubEnc(r.public_key);
-                const wrapped=await crypto.subtle.encrypt({name:'RSA-OAEP'},pub,aesKey);
-                wrapped_keys.push({recipient_id:r.id,encrypted_symmetric_key:ab2b64(wrapped)});
-            }
             completeSendStep(2);
 
             advanceSendStep(3);
@@ -683,7 +823,10 @@
             advanceSendStep(4);
             const resp=await fetch(`/chat/send-message/${chatId}/`,{
                 method:'POST',headers:authHeaders({'Content-Type':'application/json'}),
-                body:JSON.stringify({encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,signature:ab2b64(sig),prev_hash:prevHash})
+                body:JSON.stringify({
+                    encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,
+                    signature:ab2b64(sig),prev_hash:prevHash,sender_chain_epoch:senderChainEpoch,
+                })
             });
             completeSendStep(4,resp.ok);
 

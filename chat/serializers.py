@@ -24,6 +24,7 @@ class MessageSerializer(serializers.ModelSerializer):
             "signature",
             "seq",
             "prev_hash",
+            "sender_chain_epoch",
             "timestamp",
             "sender_id",
             "sender_public_key",

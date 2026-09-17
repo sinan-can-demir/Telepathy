@@ -34,6 +34,17 @@ def _join_chat(client, chat_id, display_name="bob", public_key=None):
     return client.post("/chat/join-chat/", body, format="json")
 
 
+def _issue_chain_key(client, chat_id, other_ids):
+    """Issues a chain-key epoch covering exactly other_ids, with placeholder
+    (not real RSA-OAEP) wrapped seeds -- server-side, IssueChainKeyView never
+    looks inside encrypted_seed, only that one is present per recipient."""
+    return client.post(
+        f"/chat/issue-chain-key/{chat_id}/",
+        {"wraps": [{"recipient_id": rid, "encrypted_seed": f"seed-for-{rid}"} for rid in other_ids]},
+        format="json",
+    )
+
+
 class ChatCreationTests(TestCase):
     """Coverage for the accountless entry points: no registration/login step
     exists anymore, CreateChatView/JoinChatView are the first calls a client
@@ -179,26 +190,36 @@ class MessageRoundTripTests(TestCase):
         self.bob_id = join.data["participant_id"]
         self.bob.credentials(HTTP_AUTHORIZATION=f"Token {self.bob_token}")
 
-    def _send(self, client, key_for_alice="key-a", key_for_bob="key-b", prev_hash=GENESIS_HASH):
+        # Alice issues epoch 0 of her sending chain, covering bob -- required
+        # before her first send now that message keys come from that chain
+        # rather than a per-recipient RSA wrap (see docs/FORWARD_SECRECY.md).
+        issued = _issue_chain_key(self.alice, self.chat_id, [self.bob_id])
+        self.alice_epoch = issued.data["epoch"]
+
+    def _send(self, client, key_for_self="key-a", prev_hash=GENESIS_HASH, sender_id=None, epoch=None):
+        sender_id = sender_id if sender_id is not None else self.alice_id
+        epoch = epoch if epoch is not None else self.alice_epoch
         return client.post(
             f"/chat/send-message/{self.chat_id}/",
             {
                 "encrypted_text": "ciphertext", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
                 "prev_hash": prev_hash,
-                "wrapped_keys": [
-                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": key_for_alice},
-                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": key_for_bob},
-                ],
+                "sender_chain_epoch": epoch,
+                "wrapped_keys": [{"recipient_id": sender_id, "encrypted_symmetric_key": key_for_self}],
             },
             format="json",
         )
 
-    def test_round_trip_creates_one_message_and_two_keys(self):
+    def test_round_trip_creates_one_message_and_self_wrap_only(self):
         send = self._send(self.alice)
         self.assertEqual(send.status_code, 201, send.data)
         self.assertEqual(Message.objects.count(), 1)
-        self.assertEqual(MessageKey.objects.count(), 2)
+        # Only the sender's own self-wrap is ever stored now -- other
+        # participants derive the key from their cached copy of alice's
+        # chain instead of unwrapping a per-message key.
+        self.assertEqual(MessageKey.objects.count(), 1)
         self.assertEqual(send.data["sender_id"], self.alice_id)
+        self.assertEqual(send.data["sender_chain_epoch"], self.alice_epoch)
 
         alice_view = self.alice.get(f"/chat/get-messages/{self.chat_id}/")
         self.assertEqual(alice_view.data["current_user_id"], self.alice_id)
@@ -206,10 +227,16 @@ class MessageRoundTripTests(TestCase):
 
         bob_view = self.bob.get(f"/chat/get-messages/{self.chat_id}/")
         self.assertEqual(bob_view.data["current_user_id"], self.bob_id)
-        self.assertEqual(bob_view.data["messages"][0]["my_encrypted_symmetric_key"], "key-b")
+        # Bob has no server-stored wrapped key for alice's message -- he'd
+        # derive it client-side from the chain seed she issued him.
+        self.assertIsNone(bob_view.data["messages"][0]["my_encrypted_symmetric_key"])
 
-    def test_send_rejects_missing_recipient_key(self):
-        response = self._send(self.alice, key_for_bob="")
+    def test_send_rejects_missing_self_wrap(self):
+        response = self._send(self.alice, key_for_self="")
+        self.assertEqual(response.status_code, 400)
+
+    def test_send_rejects_unknown_chain_epoch(self):
+        response = self._send(self.alice, epoch=99)
         self.assertEqual(response.status_code, 400)
 
     def test_leave_only_deletes_chat_once_it_fully_empties(self):
@@ -281,29 +308,59 @@ class GroupChatFeatureTests(TestCase):
         self.assertEqual(by_id[self.bob_id]["display_name"], "bob")
         self.assertTrue(by_id[self.bob_id]["public_key"])
 
-    def test_send_message_with_group_wrapped_keys_creates_one_key_per_participant(self):
+    def test_send_message_in_group_stores_only_senders_self_wrap(self):
+        issued = _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])
+        self.assertEqual(issued.status_code, 201, issued.data)
+
         send = self.alice.post(
             f"/chat/send-message/{self.chat_id}/",
             {
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
                 "prev_hash": GENESIS_HASH,
-                "wrapped_keys": [
-                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"},
-                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-b"},
-                    {"recipient_id": self.carol_id, "encrypted_symmetric_key": "key-c"},
-                ],
+                "sender_chain_epoch": issued.data["epoch"],
+                "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"}],
             },
             format="json",
         )
         self.assertEqual(send.status_code, 201, send.data)
         self.assertEqual(Message.objects.count(), 1)
-        self.assertEqual(MessageKey.objects.count(), 3)
+        self.assertEqual(MessageKey.objects.count(), 1)
 
-        for client, expected_key in (
-            (self.alice, "key-a"), (self.bob, "key-b"), (self.carol, "key-c"),
-        ):
+        alice_view = self.alice.get(f"/chat/get-messages/{self.chat_id}/")
+        self.assertEqual(alice_view.data["messages"][0]["my_encrypted_symmetric_key"], "key-a")
+        for client in (self.bob, self.carol):
             view = client.get(f"/chat/get-messages/{self.chat_id}/")
-            self.assertEqual(view.data["messages"][0]["my_encrypted_symmetric_key"], expected_key)
+            self.assertIsNone(view.data["messages"][0]["my_encrypted_symmetric_key"])
+
+    def test_issue_chain_key_must_cover_exactly_current_other_participants(self):
+        missing_carol = _issue_chain_key(self.alice, self.chat_id, [self.bob_id])
+        self.assertEqual(missing_carol.status_code, 400)
+
+        extra_outsider = _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id, 99999])
+        self.assertEqual(extra_outsider.status_code, 400)
+
+        exact = _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])
+        self.assertEqual(exact.status_code, 201, exact.data)
+        self.assertEqual(exact.data["epoch"], 0)
+
+    def test_chain_key_epoch_increments_and_get_chain_keys_returns_latest_only(self):
+        first = _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])
+        self.assertEqual(first.data["epoch"], 0)
+        second = _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])
+        self.assertEqual(second.data["epoch"], 1)
+
+        bob_view = self.bob.get(f"/chat/get-chain-keys/{self.chat_id}/")
+        self.assertEqual(bob_view.status_code, 200)
+        [entry] = [e for e in bob_view.data["chain_keys"] if e["sender_id"] == self.alice_id]
+        self.assertEqual(entry["epoch"], 1)
+        self.assertEqual(entry["encrypted_seed"], f"seed-for-{self.bob_id}")
+
+    def test_get_chain_keys_requires_active_membership(self):
+        outsider = _create_chat(APIClient(), display_name="mallory")
+        outsider_client = APIClient()
+        outsider_client.credentials(HTTP_AUTHORIZATION=f"Token {outsider.data['participant_token']}")
+        forbidden = outsider_client.get(f"/chat/get-chain-keys/{self.chat_id}/")
+        self.assertEqual(forbidden.status_code, 403)
 
     def test_get_messages_others_and_group_metadata(self):
         view = self.alice.get(f"/chat/get-messages/{self.chat_id}/")
@@ -343,16 +400,21 @@ class TranscriptChainTests(TestCase):
         self.bob_id = join.data["participant_id"]
         self.bob.credentials(HTTP_AUTHORIZATION=f"Token {join.data['participant_token']}")
 
-    def _send(self, client, prev_hash, text="ct"):
+        self.alice_epoch = _issue_chain_key(self.alice, self.chat_id, [self.bob_id]).data["epoch"]
+        self.bob_epoch = _issue_chain_key(self.bob, self.chat_id, [self.alice_id]).data["epoch"]
+
+    def _send(self, client, prev_hash, text="ct", sender_id=None, epoch=None):
+        sender_id = sender_id if sender_id is not None else self.alice_id
+        epoch = epoch if epoch is not None else (
+            self.alice_epoch if sender_id == self.alice_id else self.bob_epoch
+        )
         return client.post(
             f"/chat/send-message/{self.chat_id}/",
             {
                 "encrypted_text": text, "aes_nonce": "n", "aes_tag": "t", "signature": "s",
                 "prev_hash": prev_hash,
-                "wrapped_keys": [
-                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"},
-                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-b"},
-                ],
+                "sender_chain_epoch": epoch,
+                "wrapped_keys": [{"recipient_id": sender_id, "encrypted_symmetric_key": "key-self"}],
             },
             format="json",
         )
@@ -389,11 +451,11 @@ class TranscriptChainTests(TestCase):
 
         # Resending against the now-stale genesis hash is rejected, and the
         # server tells the client what the real current tip actually is.
-        stale = self._send(self.bob, prev_hash=GENESIS_HASH, text="stale")
+        stale = self._send(self.bob, prev_hash=GENESIS_HASH, text="stale", sender_id=self.bob_id)
         self.assertEqual(stale.status_code, 409)
         self.assertEqual(stale.data["expected_prev_hash"], real_tip_hash)
 
-        second = self._send(self.bob, prev_hash=real_tip_hash, text="second")
+        second = self._send(self.bob, prev_hash=real_tip_hash, text="second", sender_id=self.bob_id)
         self.assertEqual(second.status_code, 201, second.data)
         self.assertEqual(second.data["seq"], 1)
         self.assertEqual(second.data["prev_hash"], real_tip_hash)
@@ -405,7 +467,7 @@ class TranscriptChainTests(TestCase):
     def test_seq_is_unique_per_chat_even_across_senders(self):
         first = self._send(self.alice, prev_hash=GENESIS_HASH)
         tip_hash = compute_chain_hash(Message.objects.get(pk=first.data["id"]))
-        second = self._send(self.bob, prev_hash=tip_hash, text="from bob")
+        second = self._send(self.bob, prev_hash=tip_hash, text="from bob", sender_id=self.bob_id)
         self.assertEqual([first.data["seq"], second.data["seq"]], [0, 1])
         self.assertEqual(
             list(Message.objects.filter(chat__pin=self.chat_id).order_by("seq").values_list("seq", flat=True)),

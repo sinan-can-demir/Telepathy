@@ -8,7 +8,7 @@ from collections import defaultdict
 import re
 import random
 import time
-from .models import Chat, ChatParticipant
+from .models import Chat, ChatParticipant, ChainKey, ChainKeyWrap
 from django.db import transaction
 from django.utils import timezone
 from django.shortcuts import render, redirect, get_object_or_404
@@ -260,6 +260,16 @@ class SendMessageView(APIView):
     concurrent sends from landing on the same position and gives every
     later reader a verifiable chain -- see chatbox.html's verification walk
     for what actually catches a dropped/reordered/replayed message.
+
+    Forward secrecy (see docs/FORWARD_SECRECY.md): the AES key for this
+    message comes from the sender's own sending-chain ratchet, seeded via
+    IssueChainKeyView/ChainKey. wrapped_keys now only ever needs to contain
+    the sender's own self-wrapped copy (so they can redisplay their own sent
+    history) -- other participants derive the same key locally by advancing
+    their cached copy of the sender's chain, so no per-recipient wrap is
+    transmitted or stored for them anymore. sender_chain_epoch records which
+    epoch that derivation used, for recipients to know whether to keep
+    advancing their cached state or fetch a newer epoch's seed first.
     """
     authentication_classes = [ParticipantTokenAuthentication]
     permission_classes = [permissions.IsAuthenticated]
@@ -273,14 +283,19 @@ class SendMessageView(APIView):
         signature = request.data.get("signature")
         wrapped_keys = request.data.get("wrapped_keys")
         prev_hash = request.data.get("prev_hash")
+        sender_chain_epoch = request.data.get("sender_chain_epoch")
 
-        if not all([encrypted_text, aes_nonce, aes_tag, signature, prev_hash]) or not wrapped_keys:
+        if not all([encrypted_text, aes_nonce, aes_tag, signature, prev_hash]) or not wrapped_keys \
+                or sender_chain_epoch is None:
             return Response({"message": "Missing required encryption fields."}, status=400)
 
         with transaction.atomic():
             chat = get_object_or_404(Chat.objects.select_for_update(), pin=chat_id)
             if me.chat_id != chat.pk or me.left_at is not None:
                 return Response({"detail": "Forbidden"}, status=403)
+
+            if not ChainKey.objects.filter(sender=me, epoch=sender_chain_epoch).exists():
+                return Response({"message": "Unknown sender_chain_epoch; issue a chain key first."}, status=400)
 
             tip = chat.messages.order_by("-seq").first()
             expected_prev_hash = compute_chain_hash(tip) if tip else GENESIS_HASH
@@ -293,16 +308,13 @@ class SendMessageView(APIView):
                     status=409,
                 )
 
-            active_participant_ids = set(
-                chat.participants.filter(left_at__isnull=True).values_list("id", flat=True)
+            self_wrap = next(
+                (wk.get("encrypted_symmetric_key") for wk in wrapped_keys
+                 if wk.get("recipient_id") == me.pk and wk.get("encrypted_symmetric_key")),
+                None,
             )
-            submitted = {
-                wk.get("recipient_id"): wk.get("encrypted_symmetric_key")
-                for wk in wrapped_keys
-                if wk.get("recipient_id") is not None and wk.get("encrypted_symmetric_key")
-            }
-            if not active_participant_ids.issubset(submitted.keys()):
-                return Response({"message": "Missing wrapped key for a chat participant."}, status=400)
+            if not self_wrap:
+                return Response({"message": "Missing self-wrapped key."}, status=400)
 
             msg = Message.objects.create(
                 chat=chat,
@@ -313,14 +325,101 @@ class SendMessageView(APIView):
                 signature=signature,
                 seq=(tip.seq + 1) if tip else 0,
                 prev_hash=prev_hash,
+                sender_chain_epoch=sender_chain_epoch,
             )
-            MessageKey.objects.bulk_create([
-                MessageKey(message=msg, recipient_id=recipient_id, encrypted_symmetric_key=key)
-                for recipient_id, key in submitted.items()
-                if recipient_id in active_participant_ids
-            ])
+            MessageKey.objects.create(message=msg, recipient=me, encrypted_symmetric_key=self_wrap)
 
         return Response(MessageSerializer(msg, context={"request": request}).data, status=201)
+
+
+class IssueChainKeyView(APIView):
+    """
+    POST /chat/issue-chain-key/<chat_id>/
+    A participant issues a new epoch of their own sending-chain seed,
+    wrapped (RSA-OAEP) for every currently active *other* participant.
+    Called before a participant's first send in a chat, and again any time
+    the roster has changed since they last issued one. Expects:
+    { "wraps": [{"recipient_id": <id>, "encrypted_seed": "<b64>"}, ...] }
+    covering exactly the chat's current other active participants.
+    Returns: {"epoch": <int>}
+    """
+    authentication_classes = [ParticipantTokenAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id=None):
+        me = request.user
+        wraps = request.data.get("wraps")
+        if not wraps:
+            return Response({"message": "wraps is required."}, status=400)
+
+        with transaction.atomic():
+            chat = get_object_or_404(Chat.objects.select_for_update(), pin=chat_id)
+            participant = ChatParticipant.objects.select_for_update().get(pk=me.pk)
+            if participant.chat_id != chat.pk or participant.left_at is not None:
+                return Response({"detail": "Forbidden"}, status=403)
+
+            active_other_ids = set(
+                chat.participants.filter(left_at__isnull=True).exclude(pk=participant.pk)
+                .values_list("id", flat=True)
+            )
+            submitted = {
+                w.get("recipient_id"): w.get("encrypted_seed")
+                for w in wraps
+                if w.get("recipient_id") is not None and w.get("encrypted_seed")
+            }
+            if set(submitted.keys()) != active_other_ids:
+                return Response(
+                    {"message": "wraps must cover exactly the chat's current other active participants."},
+                    status=400,
+                )
+
+            last = ChainKey.objects.filter(sender=participant).order_by("-epoch").first()
+            next_epoch = (last.epoch + 1) if last else 0
+            chain_key = ChainKey.objects.create(chat=chat, sender=participant, epoch=next_epoch)
+            ChainKeyWrap.objects.bulk_create([
+                ChainKeyWrap(chain_key=chain_key, recipient_id=recipient_id, encrypted_seed=seed)
+                for recipient_id, seed in submitted.items()
+            ])
+
+        return Response({"epoch": next_epoch}, status=201)
+
+
+class GetChainKeysView(APIView):
+    """
+    GET /chat/get-chain-keys/<chat_id>/
+    Returns, for every sender who has issued at least one chain-key epoch
+    addressed to the caller, the LATEST such epoch's wrapped seed -- what a
+    recipient needs to (re-)seed their receiving-side ratchet for that
+    sender. Returns: {"chain_keys": [{"sender_id", "epoch", "encrypted_seed"}, ...]}
+    """
+    authentication_classes = [ParticipantTokenAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id):
+        chat = get_object_or_404(Chat, pin=chat_id)
+        me = request.user
+        if me.chat_id != chat.pk:
+            return Response({"detail": "Forbidden"}, status=403)
+
+        wraps = (
+            ChainKeyWrap.objects
+            .filter(recipient=me, chain_key__chat=chat)
+            .select_related("chain_key")
+            .order_by("chain_key__sender_id", "-chain_key__epoch")
+        )
+        seen_senders = set()
+        result = []
+        for w in wraps:
+            sender_id = w.chain_key.sender_id
+            if sender_id in seen_senders:
+                continue
+            seen_senders.add(sender_id)
+            result.append({
+                "sender_id": sender_id,
+                "epoch": w.chain_key.epoch,
+                "encrypted_seed": w.encrypted_seed,
+            })
+        return Response({"chain_keys": result}, status=200)
 
 
 class GetChatParticipantsView(APIView):
