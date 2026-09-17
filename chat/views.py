@@ -9,10 +9,12 @@ import re
 import random
 import time
 from .models import Chat, ChatParticipant
+from django.db import transaction
 from django.utils import timezone
 from django.shortcuts import render, redirect, get_object_or_404
 from rest_framework.response import Response
 from .auth import ParticipantTokenAuthentication, hash_token
+from .chain import GENESIS_HASH, compute_chain_hash
 
 
 # Track failed chat-join attempts per source IP, to slow brute-forcing the
@@ -245,48 +247,73 @@ class LeaveChatView(APIView):
 
 
 class SendMessageView(APIView):
+    """
+    Requires prev_hash: the client's claim about the chain hash (see
+    chat/chain.py) of the message immediately before this one, or
+    GENESIS_HASH if this is the chat's first message. Assigning seq under a
+    row lock and rejecting a stale prev_hash with 409 both prevents two
+    concurrent sends from landing on the same position and gives every
+    later reader a verifiable chain -- see chatbox.html's verification walk
+    for what actually catches a dropped/reordered/replayed message.
+    """
     authentication_classes = [ParticipantTokenAuthentication]
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, chat_id=None):
-        chat = get_object_or_404(Chat, pin=chat_id)
         me = request.user
-        if me.chat_id != chat.pk or me.left_at is not None:
-            return Response({"detail": "Forbidden"}, status=403)
 
         encrypted_text = request.data.get("encrypted_text")
         aes_nonce = request.data.get("aes_nonce")
         aes_tag = request.data.get("aes_tag")
         signature = request.data.get("signature")
         wrapped_keys = request.data.get("wrapped_keys")
+        prev_hash = request.data.get("prev_hash")
 
-        if not all([encrypted_text, aes_nonce, aes_tag, signature]) or not wrapped_keys:
+        if not all([encrypted_text, aes_nonce, aes_tag, signature, prev_hash]) or not wrapped_keys:
             return Response({"message": "Missing required encryption fields."}, status=400)
 
-        active_participant_ids = set(
-            chat.participants.filter(left_at__isnull=True).values_list("id", flat=True)
-        )
-        submitted = {
-            wk.get("recipient_id"): wk.get("encrypted_symmetric_key")
-            for wk in wrapped_keys
-            if wk.get("recipient_id") is not None and wk.get("encrypted_symmetric_key")
-        }
-        if not active_participant_ids.issubset(submitted.keys()):
-            return Response({"message": "Missing wrapped key for a chat participant."}, status=400)
+        with transaction.atomic():
+            chat = get_object_or_404(Chat.objects.select_for_update(), pin=chat_id)
+            if me.chat_id != chat.pk or me.left_at is not None:
+                return Response({"detail": "Forbidden"}, status=403)
 
-        msg = Message.objects.create(
-            chat=chat,
-            sender=me,
-            encrypted_text=encrypted_text,
-            aes_nonce=aes_nonce,
-            aes_tag=aes_tag,
-            signature=signature,
-        )
-        MessageKey.objects.bulk_create([
-            MessageKey(message=msg, recipient_id=recipient_id, encrypted_symmetric_key=key)
-            for recipient_id, key in submitted.items()
-            if recipient_id in active_participant_ids
-        ])
+            tip = chat.messages.order_by("-seq").first()
+            expected_prev_hash = compute_chain_hash(tip) if tip else GENESIS_HASH
+            if prev_hash != expected_prev_hash:
+                return Response(
+                    {
+                        "message": "Stale transcript; refresh and resend.",
+                        "expected_prev_hash": expected_prev_hash,
+                    },
+                    status=409,
+                )
+
+            active_participant_ids = set(
+                chat.participants.filter(left_at__isnull=True).values_list("id", flat=True)
+            )
+            submitted = {
+                wk.get("recipient_id"): wk.get("encrypted_symmetric_key")
+                for wk in wrapped_keys
+                if wk.get("recipient_id") is not None and wk.get("encrypted_symmetric_key")
+            }
+            if not active_participant_ids.issubset(submitted.keys()):
+                return Response({"message": "Missing wrapped key for a chat participant."}, status=400)
+
+            msg = Message.objects.create(
+                chat=chat,
+                sender=me,
+                encrypted_text=encrypted_text,
+                aes_nonce=aes_nonce,
+                aes_tag=aes_tag,
+                signature=signature,
+                seq=(tip.seq + 1) if tip else 0,
+                prev_hash=prev_hash,
+            )
+            MessageKey.objects.bulk_create([
+                MessageKey(message=msg, recipient_id=recipient_id, encrypted_symmetric_key=key)
+                for recipient_id, key in submitted.items()
+                if recipient_id in active_participant_ids
+            ])
 
         return Response(MessageSerializer(msg, context={"request": request}).data, status=201)
 
