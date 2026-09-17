@@ -20,8 +20,10 @@ class ChatParticipantInline(admin.TabularInline):
 
 @admin.register(Chat)
 class ChatAdmin(admin.ModelAdmin):
-    list_display = ('pin', 'is_group', 'max_participants', 'is_active', 'created_at')
-    list_filter = ('is_active', 'is_group')
+    # No is_active column -- a Chat row's existence is its active flag now;
+    # ended chats are hard-deleted (see LeaveChatView) to free their PIN.
+    list_display = ('pin', 'is_group', 'max_participants', 'created_at')
+    list_filter = ('is_group',)
     search_fields = ('pin', 'participants__display_name')
     inlines = [ChatParticipantInline]
 

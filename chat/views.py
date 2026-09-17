@@ -213,9 +213,16 @@ class CheckChatView(APIView):
 
 
 class LeaveChatView(APIView):
-    """Marks the calling participant as left, clearing history once the chat
-    fully empties. request.user IS the participant (via
-    ParticipantTokenAuthentication) -- no separate lookup needed."""
+    """Marks the calling participant as left, hard-deleting the chat once it
+    fully empties (cascades to its participants/messages/keys). request.user
+    IS the participant (via ParticipantTokenAuthentication) -- no separate
+    lookup needed.
+
+    Deleting rather than soft-flagging the chat is what actually frees its
+    4-digit PIN for reuse (see #35) -- a permanently-retired-but-flagged row
+    would still make CreateChatView's pin=... uniqueness check treat that PIN
+    as taken forever, which is a hard ceiling on lifetime chats given there
+    are only 10,000 possible PINs."""
     authentication_classes = [ParticipantTokenAuthentication]
     permission_classes = [permissions.IsAuthenticated]
 
@@ -236,10 +243,8 @@ class LeaveChatView(APIView):
 
         remaining = chat.participants.filter(left_at__isnull=True).count()
         if remaining == 0:
-            chat.is_active = False
-            chat.save(update_fields=["is_active"])
-            chat.messages.all().delete()
-            logger.info(f"[LEAVE-CHAT] Chat '{chat_id}' emptied; history cleared.")
+            chat.delete()
+            logger.info(f"[LEAVE-CHAT] Chat '{chat_id}' emptied; deleted, freeing its PIN.")
         else:
             logger.info(f"[LEAVE-CHAT] A participant left chat '{chat_id}'; {remaining} remain.")
 
