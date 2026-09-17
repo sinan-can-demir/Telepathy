@@ -31,6 +31,10 @@
             box-shadow:0 0 30px rgba(0,229,255,0.3)}
         .welcome-card h1{font-size:1.5rem;font-weight:700;margin-bottom:0.25rem}
         .welcome-card p{font-size:0.85rem;color:var(--text-dim)}
+        .name-input{margin-top:1rem;width:100%;padding:0.7rem 1rem;background:rgba(255,255,255,0.05);
+            border:1px solid var(--card-border);border-radius:10px;color:var(--text);font-family:'Inter',sans-serif;
+            font-size:0.9rem;text-align:center}
+        .name-input:focus{outline:none;border-color:var(--cyan)}
 
         .actions{display:flex;flex-direction:column;gap:0.75rem}
         .action-card{background:var(--card);border:1px solid var(--card-border);border-radius:16px;padding:1.25rem 1.5rem;
@@ -39,8 +43,6 @@
         .action-icon{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0}
         .action-icon.create{background:linear-gradient(135deg,var(--cyan),#06b6d4)}
         .action-icon.join{background:linear-gradient(135deg,var(--purple),var(--magenta))}
-        .action-icon.twofa{background:linear-gradient(135deg,var(--orange),var(--red))}
-        .action-icon.out{background:linear-gradient(135deg,#475569,#334155)}
         .action-info h3{font-size:0.95rem;font-weight:600;margin-bottom:0.15rem}
         .action-info p{font-size:0.78rem;color:var(--text-dim)}
 
@@ -59,28 +61,6 @@
         .btn-primary{background:linear-gradient(135deg,var(--purple),var(--magenta));color:#fff;width:100%;justify-content:center}
         .btn-primary:hover{transform:translateY(-1px);box-shadow:0 0 20px rgba(168,85,247,0.3)}
         .join-status{font-size:0.8rem;margin-top:0.5rem;text-align:center}
-
-        /* ── PIN Modal ── */
-        .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(8px);
-            display:none;align-items:center;justify-content:center;z-index:100;animation:fade-in .25s}
-        .modal-overlay.show{display:flex}
-        @keyframes fade-in{from{opacity:0}to{opacity:1}}
-        .modal-card{background:rgba(18,18,30,0.95);border:1px solid var(--card-border);border-radius:20px;
-            padding:2rem;text-align:center;max-width:360px;width:90%;box-shadow:0 0 60px rgba(0,229,255,0.2);
-            animation:pop-in .3s cubic-bezier(.16,1,.3,1)}
-        @keyframes pop-in{from{opacity:0;transform:scale(0.9)}to{opacity:1;transform:scale(1)}}
-        .modal-card h3{font-size:1.1rem;margin-bottom:0.5rem}
-        .modal-card p{font-size:0.82rem;color:var(--text-dim);margin-bottom:1rem}
-        .pin-display{font-family:'JetBrains Mono',monospace;font-size:2.5rem;font-weight:700;letter-spacing:0.4em;
-            color:var(--cyan);text-shadow:0 0 20px rgba(0,229,255,0.5);margin-bottom:1.5rem;
-            background:rgba(0,229,255,0.05);padding:0.75rem 1.5rem;border-radius:12px;border:1px solid rgba(0,229,255,0.15)}
-        .modal-btns{display:flex;gap:0.5rem}
-        .modal-btns .btn{flex:1;justify-content:center;padding:0.65rem}
-        .btn-cyan{background:linear-gradient(135deg,var(--cyan),#06b6d4);color:#000}
-        .btn-ghost{background:rgba(255,255,255,0.06);color:var(--text-dim);border:1px solid var(--card-border)}
-        .btn-ghost:hover{background:rgba(255,255,255,0.1)}
-        .copied-badge{font-size:0.75rem;color:var(--green);margin-top:0.5rem;display:none}
-        .copied-badge.show{display:block;animation:fade-in .3s}
     </style>
 </head>
 <body>
@@ -91,8 +71,9 @@
         <!-- Welcome -->
         <div class="welcome-card">
             <div class="avatar">👤</div>
-            <h1 id="welcome-name">Welcome</h1>
-            <p>Your keys are stored locally in this browser.</p>
+            <h1>Start a chat</h1>
+            <p>No account, no login. Pick a display name for this chat only — it's not saved anywhere else.</p>
+            <input type="text" class="name-input" id="display-name-input" maxlength="32" placeholder="Display name (optional)" />
         </div>
 
         <!-- Actions -->
@@ -121,131 +102,37 @@
                 <button class="btn btn-primary" onclick="joinChatByPin()">Join Chat Room</button>
                 <p class="join-status" id="join-status"></p>
             </div>
-
-            <div class="action-card" onclick="window.location.href='{% url 'setup_2fa' %}'">
-                <div class="action-icon twofa">🛡️</div>
-                <div class="action-info">
-                    <h3>Enable 2FA</h3>
-                    <p>Add TOTP two-factor authentication to your account</p>
-                </div>
-            </div>
-
-            <div class="action-card" onclick="logout()">
-                <div class="action-icon out">⏻</div>
-                <div class="action-info">
-                    <h3>Logout</h3>
-                    <p>Sign out and invalidate your session token</p>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- PIN Modal -->
-    <div class="modal-overlay" id="pin-modal">
-        <div class="modal-card">
-            <h3>Chat Room Created</h3>
-            <p>Share this PIN with the person you want to chat with</p>
-            <div class="pin-display" id="pin-display">----</div>
-            <div class="copied-badge" id="copied-badge">✓ Copied to clipboard</div>
-            <div class="modal-btns">
-                <button class="btn btn-ghost" onclick="copyChatId()">📋 Copy</button>
-                <button class="btn btn-cyan" onclick="joinCreatedChat()">Join Chat →</button>
-            </div>
         </div>
     </div>
 
 <script>
-    // Guard — must be logged in
-    if (!localStorage.getItem('token')) window.location.href = '/';
-
-    // Display username
-    const un = localStorage.getItem('current_username') || 'User';
-    document.getElementById('welcome-name').textContent = 'Welcome, ' + un;
-
-    let createdChatId = null;
-
     function toggleJoin() {
         document.getElementById('join-section').classList.toggle('show');
         const inp = document.getElementById('pin-input');
         if (inp) setTimeout(() => inp.focus(), 100);
     }
 
-    async function createChat() {
-        const token = localStorage.getItem('token');
-        const res = await fetch('/chat/create-chat/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Token ' + token }
-        });
-        const data = await res.json();
-        if (res.ok) {
-            createdChatId = data.chat_id;
-            document.getElementById('pin-display').textContent = createdChatId;
-            document.getElementById('pin-modal').classList.add('show');
-        } else {
-            alert(data.message || 'Failed to create chat.');
-        }
+    function getDisplayName() {
+        return document.getElementById('display-name-input').value.trim();
     }
 
-    function copyChatId() {
-        navigator.clipboard.writeText(createdChatId).then(() => {
-            const badge = document.getElementById('copied-badge');
-            badge.classList.add('show');
-            setTimeout(() => badge.classList.remove('show'), 2000);
-        });
+    // Key generation and the actual create-chat/join-chat API call both
+    // happen in chatbox.html -- this page only collects what's needed
+    // (display name, and a PIN for joining) and hands off via query params,
+    // so there's one single place that generates a chat's keys instead of
+    // duplicating that logic here too.
+    function createChat() {
+        const name = encodeURIComponent(getDisplayName());
+        window.location.href = `/chat/chatbox/?action=create&display_name=${name}`;
     }
 
-    function closeModal() { document.getElementById('pin-modal').classList.remove('show'); }
-
-    async function joinCreatedChat() {
-        const token = localStorage.getItem('token');
-        const res = await fetch('/chat/join-chat/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Token ' + token },
-            body: JSON.stringify({ chat_id: createdChatId })
-        });
-        const data = await res.json();
-        if (res.ok) {
-            localStorage.setItem('chat_id', createdChatId);
-            closeModal();
-            window.location.href = '/chat/chatbox/';
-        } else {
-            alert(data.message || 'Failed to join.');
-        }
-    }
-
-    async function joinChatByPin() {
+    function joinChatByPin() {
         const pin = document.getElementById('pin-input').value.trim();
-        const token = localStorage.getItem('token');
         const st = document.getElementById('join-status');
         if (!/^\d{4}$/.test(pin)) { st.style.color = 'var(--red)'; st.textContent = 'Enter a valid 4-digit PIN.'; return; }
-        const res = await fetch('/chat/join-chat/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Token ' + token },
-            body: JSON.stringify({ chat_id: pin })
-        });
-        const data = await res.json();
-        if (res.ok) {
-            localStorage.setItem('chat_id', pin);
-            st.style.color = 'var(--green)'; st.textContent = 'Joined! Redirecting…';
-            setTimeout(() => { window.location.href = '/chat/chatbox/'; }, 600);
-        } else {
-            st.style.color = 'var(--red)'; st.textContent = data.message || 'Failed to join.';
-        }
+        const name = encodeURIComponent(getDisplayName());
+        window.location.href = `/chat/chatbox/?action=join&chat_id=${pin}&display_name=${name}`;
     }
-
-    async function logout() {
-        const token = localStorage.getItem('token');
-        try {
-            if (token) await fetch('/chat/logout/', { method: 'POST', headers: { 'Authorization': 'Token ' + token } });
-        } catch (e) {}
-        localStorage.clear();
-        window.location.href = '/';
-    }
-
-    // Close modal on backdrop click
-    document.getElementById('pin-modal').addEventListener('click', function(e) {
-        if (e.target === this) closeModal();
-    });
 </script>
 </body>
 </html>

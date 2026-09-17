@@ -24,11 +24,9 @@ Consequences:
 
 **Direction**: decouple the PIN from chat identity. A `Chat` should have its own permanent surrogate key (already does, via Django's auto `id`); the 4-digit PIN becomes a separate, short-TTL, reusable pairing code that's deleted once both parties join or after expiry. Ended chats get hard-deleted or archived instead of just flagged, freeing the code space.
 
-### 3. `active_chats` in-process dict is dead code today, a landmine tomorrow
+### 3. ~~`active_chats` in-process dict is dead code today, a landmine tomorrow~~ — Resolved
 
-Written to in `CreateChatView`, `JoinChatView`, and `LeaveChatView`, but never read anywhere (confirmed by full-project grep). Harmless right now, but under multiple worker processes or pods, each process has its own empty dict — the moment someone wires a read to it (e.g. for a "who's online" feature), it silently breaks in production while working fine in single-process dev.
-
-**Direction**: delete it outright. If presence/online-status is wanted later, it belongs in Postgres (there's already `Chat.is_active`) or Redis, not a per-process dict.
+Removed entirely as part of the Phase 1 group-chat schema migration (`ChatParticipant`/`MessageKey`, see `docs/GROUP_CHATS_PLAN.md`). If presence/online-status is wanted later, it belongs in Postgres (`Chat.is_active`, `ChatParticipant.left_at`) or Redis, not a per-process dict.
 
 ### 4. Polling transport is a reasonable MVP choice, but `channels` is a half-installed illusion
 
@@ -44,7 +42,7 @@ The server stores `chat_id` in the Django session (used by the page-rendering `c
 
 ### 6. Fat views, no service layer
 
-Chat-pairing logic (slot assignment, in-memory mirroring, message cleanup on leave) lives directly inside `APIView.post`/`get` methods in `chat/views.py`, mixing HTTP status-code decisions with domain rules. There's no `chat/services.py` or model-level methods (e.g. `Chat.add_participant(user)`) to unit-test independent of DRF request/response plumbing — every test of pairing/leave/visibility logic currently has to go through a full `APIClient` HTTP round trip.
+Chat-pairing logic (slot assignment, message cleanup on leave) lives directly inside `APIView.post`/`get` methods in `chat/views.py`, mixing HTTP status-code decisions with domain rules. There's no `chat/services.py` or model-level methods (e.g. `Chat.add_participant(user)`) to unit-test independent of DRF request/response plumbing — every test of pairing/leave/visibility logic currently has to go through a full `APIClient` HTTP round trip.
 
 **Direction**: extract pairing/leave/messaging rules into plain functions or model methods that views call into. Lets core chat rules be tested in milliseconds without spinning up the request/response cycle, and makes it easier to compose new behavior (e.g. "notify partner on join") without re-editing the view.
 
@@ -56,6 +54,12 @@ Chat-pairing logic (slot assignment, in-memory mirroring, message cleanup on lea
 - **UUID primary key on `Message`** avoids sequential-ID enumeration and is a reasonable choice if message data is ever synced or sharded.
 - The split between page-rendering views and JSON API views is at least consistently named, even though their state overlaps awkwardly (see #5 above).
 - The inline-script frontend approach isn't a crisis at the current scope — no framework is needed for a single-page polling chat — but it's already showing strain and will need extraction into modules before another screen's worth of UI logic is added.
+
+## Identity model: accounts removed in favor of per-chat participants
+
+Every chat participant used to be a persistent Django `User` (username/password/optional TOTP), reused across every chat that account ever joined. Because `ChatParticipant.user` and `Message.sender` both pointed at that one durable row, the database could already correlate "this account was in chat A, B, and C" even though message *content* stayed encrypted — a cross-chat linkability vector at odds with the app's own anonymous/ephemeral positioning.
+
+Accounts, passwords, and 2FA have been removed entirely. `ChatParticipant` is now a free-standing identity scoped to exactly one chat — its own display name, its own freshly generated encryption/signing keys (never reused across chats), and a bearer token hashed at rest that stops working the moment that participant leaves. `django.contrib.auth`'s `User` model still exists, but solely for Django's own admin/staff login — no end-user chat functionality touches it. See **[docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md)** for the full rationale, the red-team pass, and the honest tradeoffs (in particular: PIN/join brute-force throttling can no longer be keyed on an account, and is weaker as a result — especially without a Tor deployment's connection-level defenses in front of it).
 
 ## Relationship to feature planning
 

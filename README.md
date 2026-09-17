@@ -17,15 +17,14 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 
 | Feature | Description |
 |---|---|
-| 🔑 **Client-Side Key Generation** | Two RSA-2048 key pairs (encryption + signing) are generated in the browser at registration; private keys never leave the client |
-| 🔒 **Hybrid Encryption** | AES-256-GCM encrypts the message body; RSA-OAEP wraps the AES key for both sender and receiver |
+| 🔑 **Per-Chat "Burner" Keys** | A fresh RSA-2048 key pair (encryption + signing) is generated in the browser for every chat created or joined; private keys never leave the client and are deleted the moment the chat is left |
+| 🔒 **Hybrid Encryption** | AES-256-GCM encrypts the message body; RSA-OAEP wraps the AES key for every participant |
 | ✍️ **Digital Signatures** | Every message is signed with RSA-PSS — the receiver sees a clickable ✓ Verified badge with full crypto details |
-| 📊 **Send Progress Modal** | A 6-step animated progress bar shows each encryption operation in real-time when sending a message |
+| 📊 **Send Progress Modal** | An animated progress bar shows each encryption operation in real-time when sending a message |
 | 💾 **Encrypted-at-Rest** | Only ciphertext is stored in the database — decryption happens exclusively in the browser |
-| 📌 **PIN-Based Chat Rooms** | No email required; create or join a room using a 4-digit PIN |
-| 🛡️ **Two-Factor Authentication** | Optional TOTP 2FA via QR code and authenticator app (e.g. Google Authenticator) |
-| 🚫 **Ephemeral History** | Message history is automatically deleted when a user leaves the chat |
-| 🔐 **Token + Session Auth** | DRF Token authentication for API calls; Django sessions for page access; server-side logout invalidates tokens |
+| 🚫 **No Accounts** | No registration, no password, no persistent identity — a bearer token scoped to one chat is the only credential. See [docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md) for why |
+| 📌 **PIN-Based Chat Rooms** | Create or join a room using a 4-digit PIN — nothing else required |
+| 🚫 **Ephemeral History** | Message history is automatically deleted once every participant has left a chat |
 | 🎨 **Premium UI** | Dark glassmorphism theme with animated gradients, floating particles, and smooth transitions |
 
 ---
@@ -35,18 +34,16 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 ```
 Telepathy/
 ├── chat/                       # Main Django application
-│   ├── models.py               # User, Chat, Message models
-│   ├── views.py                # REST API views (register, login, send/get messages, etc.)
-│   ├── serializers.py          # DRF serializers for User and Message
+│   ├── models.py               # User (admin-only), Chat, ChatParticipant, Message, MessageKey
+│   ├── views.py                # REST API views (create/join chat, send/get messages, etc.)
+│   ├── auth.py                 # ParticipantTokenAuthentication -- see docs/ACCOUNTLESS_IDENTITY.md
+│   ├── serializers.py          # DRF serializer for Message
 │   ├── admin.py                # Django admin registrations
 │   ├── urls.py                 # URL routing for the chat app
 │   └── templates/
 │       ├── index.html          # Landing page (glassmorphism hero + particles)
-│       ├── auth.html           # Register + Login (crypto log panel)
-│       ├── usermenu.html       # Dashboard (create/join chat, PIN modal)
-│       ├── chatbox.html        # Chat interface (send modal, verification badges)
-│       └── chat/
-│           └── 2fa_setup.html  # TOTP two-factor authentication setup
+│       ├── usermenu.html       # Dashboard (create/join chat, no login step)
+│       └── chatbox.html        # Chat interface (send modal, verification badges)
 ├── pc/                         # Django project configuration
 │   ├── settings.py             # App settings (env-driven secrets, DB, security)
 │   ├── urls.py                 # Root URL configuration
@@ -85,7 +82,6 @@ SENDER (Browser A)                          SERVER                    RECEIVER (
 | **Database** | PostgreSQL (UUID-indexed messages) |
 | **Client Crypto** | Web Crypto API (RSA-OAEP, RSA-PSS, AES-256-GCM) |
 | **Server Crypto** | `cryptography` library (PEM key validation) |
-| **2FA** | `pyotp` (TOTP) + `qrcode` |
 | **Frontend** | Vanilla HTML/CSS/JS with glassmorphism design system |
 
 ---
@@ -167,14 +163,14 @@ Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your browser.
 
 ## 🧪 Testing the E2E Encryption
 
-> ⚠️ **Important:** You MUST use **two different browsers** (e.g. Chrome + Firefox, or two separate incognito/private windows). Each browser needs its own `localStorage` to store separate user keys and tokens.
+> ⚠️ **Important:** You MUST use **two different browsers** (e.g. Chrome + Firefox, or two separate incognito/private windows). Each browser needs its own `localStorage` to store its own per-chat keys and token.
 
 ### Step-by-step
 
-1. **Browser A** → `http://127.0.0.1:8000/chat/` → Register as `alice` → Login → **Create Chat** → note the 4-digit PIN
-2. **Browser B** → `http://127.0.0.1:8000/chat/` → Register as `bob` → Login → **Join Chat** → enter Alice's PIN
+1. **Browser A** → `http://127.0.0.1:8000/chat/` → **Create Chat** (optionally enter a display name) → note the 4-digit PIN. No registration or login step — keys are generated and the chat is created in one action.
+2. **Browser B** → `http://127.0.0.1:8000/chat/` → **Join Chat** → enter the PIN (and optionally a display name)
 3. Both browsers show "Waiting for partner…" briefly, then the chat opens
-4. **Send a message** — a progress modal appears showing all 6 encryption steps in real-time:
+4. **Send a message** — a progress modal appears showing each encryption step in real-time:
    - Generating AES-256 session key
    - Encrypting message (AES-256-GCM)
    - Wrapping key for partner (RSA-OAEP)
@@ -182,57 +178,68 @@ Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your browser.
    - Signing message (RSA-PSS)
    - Sending encrypted payload
 5. **Receiver** sees the message with a **✓ Verified** badge — click it to see the individual crypto verification steps (key unwrap, decrypt, signature verify)
+6. **Leave** the chat from either side to end it. If both sides leave, message history is deleted; either browser's per-chat keys are deleted from that browser's `localStorage` on leave, regardless.
 
 ---
 
 ## 🌐 API Endpoints
 
+All "Participant Token" endpoints authenticate via `Authorization: Token <participant_token>` — a bearer token scoped to one `ChatParticipant`, issued by create-chat/join-chat. See [docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md).
+
 | Method | Endpoint | Description | Auth |
 |--------|----------|-------------|------|
-| `POST` | `/chat/register/` | Create account + upload both public keys | None |
-| `POST` | `/chat/login/` | Authenticate and receive a DRF token | None |
-| `POST` | `/chat/logout/` | Invalidate token and clear server session | Token |
-| `GET` | `/chat/usermenu/` | User dashboard | Session |
-| `POST` | `/chat/create-chat/` | Generate a new 4-digit chat PIN | Token |
-| `POST` | `/chat/join-chat/` | Join an existing chat by PIN | Token |
-| `GET` | `/chat/check-chat/<chat_id>/` | Verify chat room exists and participants | Token |
-| `POST` | `/chat/send-message/<chat_id>/` | Send an encrypted message | Token |
-| `GET` | `/chat/get-messages/<chat_id>/` | Retrieve encrypted messages | Token |
-| `GET` | `/chat/get-public-key/<user_id>/` | Fetch user's encryption + signing public keys | Token |
-| `POST` | `/chat/upload-public-key/` | Upload/update caller's public keys | Token |
-| `POST` | `/chat/leave-chat/` | Leave chat (deletes message history) | Token |
-| `GET/POST` | `/chat/2fa/setup/` | Set up TOTP two-factor authentication | Session |
+| `GET` | `/chat/usermenu/` | Dashboard (create/join chat) | None |
+| `POST` | `/chat/create-chat/` | Create a chat; generates keys client-side first. Returns a 4-digit PIN + participant token | None |
+| `POST` | `/chat/join-chat/` | Join an existing chat by PIN; returns a participant token | None |
+| `GET` | `/chat/check-chat/<chat_id>/` | Verify chat room exists and list participants | None |
+| `POST` | `/chat/send-message/<chat_id>/` | Send an encrypted message | Participant Token |
+| `GET` | `/chat/get-messages/<chat_id>/` | Retrieve encrypted messages (includes partner's public keys) | Participant Token |
+| `POST` | `/chat/leave-chat/` | Leave chat (deletes message history once fully empty) | Participant Token |
 
 ---
 
 ## 🗄️ Data Models
 
 ### `User` (extends `AbstractUser`)
-| Field | Type | Description |
-|-------|------|-------------|
-| `totp_secret` | `CharField` | TOTP secret for 2FA (never exposed via API) |
-| `is_2fa_enabled` | `BooleanField` | Whether 2FA is active |
-| `public_key` | `TextField` | RSA-OAEP public key for encryption (PEM) |
-| `signing_public_key` | `TextField` | RSA-PSS public key for signature verification (PEM) |
+Exists solely for Django's own admin/staff login. No end-user chat functionality uses this model anymore — see [docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md).
 
 ### `Chat`
 | Field | Type | Description |
 |-------|------|-------------|
-| `pin` | `CharField(4)` | Unique 4-digit room code |
-| `user1` | `FK(User)` | Chat creator |
-| `user2` | `FK(User)` | Chat joiner |
+| `pin` | `CharField(4)` | Unique 4-digit room code (single-use; never recycled) |
+| `is_group` | `BooleanField` | Whether this chat allows more than 2 participants |
+| `max_participants` | `IntegerField` | Capacity (2–8) |
 | `is_active` | `BooleanField` | Whether the room is active |
+
+### `ChatParticipant`
+A participant's entire identity for exactly one chat — see [docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md) for why this replaced per-account identity.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `chat` | `FK(Chat)` | The chat this participation belongs to |
+| `display_name` | `CharField` | Self-chosen, chat-scoped only (not globally unique) |
+| `public_key` / `signing_public_key` | `TextField` | This chat's freshly generated RSA-OAEP/RSA-PSS public keys (PEM) |
+| `auth_token_hash` | `CharField` | SHA-256 hash of the bearer token issued at join time; the raw token is never stored |
+| `joined_at` / `left_at` | `DateTimeField` | Presence window; a token stops authenticating once `left_at` is set |
 
 ### `Message`
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | `UUIDField` | UUID primary key |
-| `sender` / `receiver` | `FK(User)` | Message parties |
+| `chat` | `FK(Chat)` | Which chat this message belongs to |
+| `sender` | `FK(ChatParticipant)` | Who sent it |
 | `encrypted_text` | `TextField` | AES-GCM ciphertext (Base64) |
-| `encrypted_symmetric_key` | `TextField` | AES key wrapped with receiver's RSA public key |
-| `sender_encrypted_symmetric_key` | `TextField` | AES key wrapped with sender's own RSA public key |
 | `aes_nonce` / `aes_tag` | `TextField` | AES-GCM IV and authentication tag |
 | `signature` | `TextField` | RSA-PSS digital signature (Base64) |
+
+### `MessageKey`
+One row per participant who can read a given message (its AES key wrapped with that participant's public key) — this is what lets a message be readable by every active chat participant instead of exactly two hardcoded parties.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `message` | `FK(Message)` | The message this key unlocks |
+| `recipient` | `FK(ChatParticipant)` | Who this wrapped key is for |
+| `encrypted_symmetric_key` | `TextField` | The message's AES key, wrapped with `recipient`'s RSA-OAEP public key |
 
 ---
 

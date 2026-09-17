@@ -5,10 +5,12 @@ from django.conf import settings
 
 
 class User(AbstractUser):
-    totp_secret = models.CharField(max_length=32, blank=True, null=True)
-    is_2fa_enabled = models.BooleanField(default=False)
-    public_key = models.TextField(null=True, blank=True)
-    signing_public_key = models.TextField(null=True, blank=True)
+    """Exists solely so Django's own admin/staff login keeps working. No
+    end-user chat functionality authenticates against this model anymore --
+    see ChatParticipant, which is a free-standing, per-chat identity with its
+    own keys and bearer token, precisely so one person's participation in
+    different chats can never be correlated through a shared account row."""
+    pass
 
 
 class Chat(models.Model):
@@ -23,20 +25,27 @@ class Chat(models.Model):
 
 
 class ChatParticipant(models.Model):
+    """A participant's entire identity for exactly one chat: a self-chosen
+    display name, this-chat-only encryption/signing keys, and a hashed
+    bearer token issued at creation/join time. Nothing here links back to
+    any other chat the same person may have joined."""
+    # DRF's IsAuthenticated permission checks request.user.is_authenticated;
+    # that attribute only exists on django.contrib.auth's User/AnonymousUser
+    # by convention, not on plain models, so it's shimmed here as a constant.
+    is_authenticated = True
+
     chat = models.ForeignKey(Chat, related_name="participants", on_delete=models.CASCADE)
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        related_name="chat_memberships",
-        on_delete=models.CASCADE,
-    )
+    display_name = models.CharField(max_length=32)
+    public_key = models.TextField()
+    signing_public_key = models.TextField(null=True, blank=True)
+    # SHA-256 hex digest of the bearer token; the raw token is returned to the
+    # client exactly once (at creation/join time) and never stored or logged.
+    auth_token_hash = models.CharField(max_length=64, unique=True, db_index=True)
     joined_at = models.DateTimeField(auto_now_add=True)
     left_at = models.DateTimeField(null=True, blank=True)
 
-    class Meta:
-        unique_together = [("chat", "user")]
-
     def __str__(self):
-        return f"{self.user} in {self.chat}"
+        return f"{self.display_name} in {self.chat}"
 
 
 class Message(models.Model):
@@ -52,7 +61,7 @@ class Message(models.Model):
         db_index=True,
     )
     sender = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
+        ChatParticipant,
         on_delete=models.CASCADE,
         related_name="sent_messages",
         db_index=True,
@@ -82,7 +91,7 @@ class Message(models.Model):
 class MessageKey(models.Model):
     message = models.ForeignKey(Message, related_name="wrapped_keys", on_delete=models.CASCADE)
     recipient = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
+        ChatParticipant,
         related_name="message_keys",
         on_delete=models.CASCADE,
     )

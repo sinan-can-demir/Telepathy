@@ -128,7 +128,7 @@
         <h2>Waiting for partner…</h2>
         <p>Share the PIN below. Your partner needs to join from a <strong>different browser</strong>.</p>
         <div class="waiting-pin" id="waiting-pin"></div>
-        <p style="font-size:0.75rem;color:var(--text-muted);margin-top:0.5rem">Keys loaded. Connection will start automatically.</p>
+        <p style="font-size:0.75rem;color:var(--text-muted);margin-top:0.5rem">Keys generated. Connection will start automatically.</p>
     </div>
 </div>
 
@@ -168,9 +168,13 @@
 
 <script>
 (async function() {
-    // ── Storage keys ────────────────────────────────────────────────────────
-    const STORAGE_PRIV = "private_key_pem", STORAGE_PUB = "public_key_pem";
-    const STORAGE_SIGN_PRIV = "signing_private_key_pem", STORAGE_SIGN_PUB = "signing_public_key_pem";
+    // ── Per-chat ("burner") key storage ─────────────────────────────────────
+    // Keys are generated fresh for every chat a browser creates/joins, never
+    // reused across chats, and deleted from localStorage the moment the chat
+    // is left -- there is no persistent account-level identity anymore.
+    const privKeyName = cid => `priv_${cid}`, pubKeyName = cid => `pub_${cid}`;
+    const signPrivKeyName = cid => `sign_priv_${cid}`, signPubKeyName = cid => `sign_pub_${cid}`;
+    const tokenName = cid => `participant_token_${cid}`, participantIdName = cid => `participant_id_${cid}`;
 
     // ── Crypto helpers ──────────────────────────────────────────────────────
     function derToPem(buf, label) {
@@ -209,12 +213,11 @@
 
     // ── State ───────────────────────────────────────────────────────────────
     let myEncKeys, mySignKeys, partnerPubKey=null, partnerSignKey=null;
-    const chatId=localStorage.getItem('chat_id'), token=localStorage.getItem('token');
-    let partnerUsername=localStorage.getItem('partner')||'…';
+    let chatId = localStorage.getItem('chat_id');
+    let token, myParticipantId;
+    let partnerUsername = '…', partnerId = null;
     let pollInterval=null;
     const renderedIds = new Set(); // track rendered message IDs to avoid duplicates
-
-    document.getElementById('waiting-pin').textContent = chatId||'';
 
     // DOM
     const messagesDiv=document.getElementById('messages');
@@ -228,6 +231,7 @@
     const leaveBtn=document.getElementById('leave-chat');
 
     function showError(msg){ const d=document.createElement('div');d.className='error-message';d.textContent=msg;messagesDiv.appendChild(d);messagesDiv.scrollTop=messagesDiv.scrollHeight; }
+    function showFatalError(msg){ alert(msg); window.location.href='/chat/usermenu/'; }
 
     // ── Send Modal helpers ──────────────────────────────────────────────────
     const SEND_STEPS = [
@@ -257,10 +261,9 @@
         sendModal.classList.add('show');
     }
 
-    function advanceSendStep(idx, ok=true) {
+    function advanceSendStep(idx) {
         const el=document.getElementById('ss-'+idx);
         if(!el) return;
-        // mark previous as done
         for(let i=0;i<idx;i++){
             const prev=document.getElementById('ss-'+i);
             if(prev&&prev.classList.contains('active')){prev.className='send-step done';prev.querySelector('.ss-icon').textContent='✓';}
@@ -288,67 +291,133 @@
         }
     }
 
-    // ── Load keys ───────────────────────────────────────────────────────────
-    async function loadKeys(){
-        let p=localStorage.getItem(STORAGE_PRIV),u=localStorage.getItem(STORAGE_PUB);
-        let sp=localStorage.getItem(STORAGE_SIGN_PRIV),su=localStorage.getItem(STORAGE_SIGN_PUB);
-        if(!p||!u||!sp||!su){
-            const enc=await crypto.subtle.generateKey({name:'RSA-OAEP',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['encrypt','decrypt']);
-            const sign=await crypto.subtle.generateKey({name:'RSA-PSS',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']);
-            p=derToPem(await crypto.subtle.exportKey('pkcs8',enc.privateKey),'PRIVATE KEY');
-            u=derToPem(await crypto.subtle.exportKey('spki',enc.publicKey),'PUBLIC KEY');
-            sp=derToPem(await crypto.subtle.exportKey('pkcs8',sign.privateKey),'PRIVATE KEY');
-            su=derToPem(await crypto.subtle.exportKey('spki',sign.publicKey),'PUBLIC KEY');
-            localStorage.setItem(STORAGE_PRIV,p);localStorage.setItem(STORAGE_PUB,u);
-            localStorage.setItem(STORAGE_SIGN_PRIV,sp);localStorage.setItem(STORAGE_SIGN_PUB,su);
-            myEncKeys={privateKey:enc.privateKey,publicKey:enc.publicKey};
-            mySignKeys={privateKey:sign.privateKey,publicKey:sign.publicKey};
-            if(token) await fetch('/chat/upload-public-key/',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Token '+token},body:JSON.stringify({public_key:u,signing_public_key:su})});
-        } else {
-            myEncKeys={privateKey:await importPrivDec(p),publicKey:await importPubEnc(u)};
-            mySignKeys={privateKey:await importPrivSign(sp),publicKey:await importPubVer(su)};
-        }
+    // ── Key generation / restoration ────────────────────────────────────────
+    async function generateFreshKeys(){
+        const enc=await crypto.subtle.generateKey({name:'RSA-OAEP',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['encrypt','decrypt']);
+        const sign=await crypto.subtle.generateKey({name:'RSA-PSS',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']);
+        myEncKeys={privateKey:enc.privateKey,publicKey:enc.publicKey};
+        mySignKeys={privateKey:sign.privateKey,publicKey:sign.publicKey};
+        return {
+            privPem: derToPem(await crypto.subtle.exportKey('pkcs8',enc.privateKey),'PRIVATE KEY'),
+            pubPem: derToPem(await crypto.subtle.exportKey('spki',enc.publicKey),'PUBLIC KEY'),
+            signPrivPem: derToPem(await crypto.subtle.exportKey('pkcs8',sign.privateKey),'PRIVATE KEY'),
+            signPubPem: derToPem(await crypto.subtle.exportKey('spki',sign.publicKey),'PUBLIC KEY'),
+        };
     }
 
-    async function loadPartnerKey(){
-        const pid=localStorage.getItem('partner_id');
-        if(!pid) throw new Error('No partner_id');
-        const resp=await fetch(`/chat/get-public-key/${pid}/`,{headers:{'Authorization':'Token '+token}});
-        if(!resp.ok) throw new Error('Failed to fetch partner key');
-        const {public_key:pk,signing_public_key:sk}=await resp.json();
-        partnerPubKey=await importPubEnc(pk);
-        if(sk) partnerSignKey=await importPubVer(sk);
+    function persistKeys(cid, keys){
+        localStorage.setItem(privKeyName(cid), keys.privPem);
+        localStorage.setItem(pubKeyName(cid), keys.pubPem);
+        localStorage.setItem(signPrivKeyName(cid), keys.signPrivPem);
+        localStorage.setItem(signPubKeyName(cid), keys.signPubPem);
     }
+
+    async function restoreKeys(cid){
+        const p=localStorage.getItem(privKeyName(cid)), u=localStorage.getItem(pubKeyName(cid));
+        const sp=localStorage.getItem(signPrivKeyName(cid)), su=localStorage.getItem(signPubKeyName(cid));
+        if(!p||!u||!sp||!su) return false;
+        myEncKeys={privateKey:await importPrivDec(p),publicKey:await importPubEnc(u)};
+        mySignKeys={privateKey:await importPrivSign(sp),publicKey:await importPubVer(su)};
+        return true;
+    }
+
+    function destroyKeys(cid){
+        localStorage.removeItem(privKeyName(cid));
+        localStorage.removeItem(pubKeyName(cid));
+        localStorage.removeItem(signPrivKeyName(cid));
+        localStorage.removeItem(signPubKeyName(cid));
+        localStorage.removeItem(tokenName(cid));
+        localStorage.removeItem(participantIdName(cid));
+    }
+
+    // ── Establish participation: either resume an existing chat (page
+    // reload) or create/join a brand-new one via the query-string action
+    // usermenu.html handed off ────────────────────────────────────────────
+    async function ensureParticipation(){
+        const params = new URLSearchParams(window.location.search);
+        const action = params.get('action');
+        const displayName = params.get('display_name') || '';
+
+        if(chatId){
+            token = localStorage.getItem(tokenName(chatId));
+            myParticipantId = localStorage.getItem(participantIdName(chatId));
+            if(token && await restoreKeys(chatId)) return true;
+        }
+
+        if(action !== 'create' && action !== 'join'){
+            window.location.href = '/chat/usermenu/';
+            return false;
+        }
+
+        const keys = await generateFreshKeys();
+        const body = { display_name: displayName || undefined, public_key: keys.pubPem, signing_public_key: keys.signPubPem };
+        let resp;
+        try{
+            if(action === 'create'){
+                resp = await fetch('/chat/create-chat/', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+            } else {
+                body.chat_id = params.get('chat_id');
+                resp = await fetch('/chat/join-chat/', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+            }
+        }catch(e){ showFatalError('Network error.'); return false; }
+
+        if(!resp.ok){
+            const err = await resp.json().catch(()=>({}));
+            showFatalError(err.message || 'Failed to start chat.');
+            return false;
+        }
+        const data = await resp.json();
+        chatId = data.chat_id || body.chat_id;
+        token = data.participant_token;
+        myParticipantId = String(data.participant_id);
+
+        localStorage.setItem('chat_id', chatId);
+        localStorage.setItem(tokenName(chatId), token);
+        localStorage.setItem(participantIdName(chatId), myParticipantId);
+        persistKeys(chatId, keys);
+        window.history.replaceState({}, '', '/chat/chatbox/');
+        return true;
+    }
+
+    document.getElementById('waiting-pin').textContent = chatId||'';
 
     // ── Chat logic ──────────────────────────────────────────────────────────
     async function startChat(){
-        if(!chatId||!token){window.location.href='/';return;}
-        try{await loadKeys();}catch(e){console.error(e);showError('Key setup failed.');return;}
-        try{
-            const jr=await fetch('/chat/join-chat/',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Token '+token},body:JSON.stringify({chat_id:chatId})});
-            if(!jr.ok){alert('Failed to join chat.');window.location.href='/';return;}
-        }catch(e){alert('Network error.');window.location.href='/';return;}
+        const ok = await ensureParticipation();
+        if(!ok) return;
+        document.getElementById('waiting-pin').textContent = chatId||'';
         pollInterval=setInterval(checkChatReady,2000);
         await checkChatReady();
     }
 
+    function authHeaders(extra){
+        return Object.assign({'Authorization':'Token '+token}, extra||{});
+    }
+
+    async function loadPartnerKeysFromResponse(data){
+        if(data.partner_id && String(data.partner_id) !== String(partnerId)){
+            partnerId = data.partner_id;
+            partnerPubKey = data.partner_public_key ? await importPubEnc(data.partner_public_key) : null;
+            partnerSignKey = data.partner_signing_public_key ? await importPubVer(data.partner_signing_public_key) : null;
+        }
+    }
+
     async function checkChatReady(){
         try{
-            const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:{'Authorization':'Token '+token}});
+            const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:authHeaders()});
             if(r.status===204)return;
-            if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/';return;}
+            if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/chat/usermenu/';return;}
             if(!r.ok)return;
             const data=await r.json();
-            if(data.current_user_id){localStorage.setItem('my_user_id',data.current_user_id);}
             if(data.both_joined){
                 waitingOverlay.style.display='none';
                 chatHeader.style.display='flex';
                 chatMain.style.display='flex';
-                if(data.partner_id){localStorage.setItem('partner_id',data.partner_id);await loadPartnerKey();}
+                await loadPartnerKeysFromResponse(data);
                 if(data.partner&&data.partner!==partnerUsername){
-                    partnerUsername=data.partner;partnerNameEl.textContent=partnerUsername;localStorage.setItem('partner',partnerUsername);
+                    partnerUsername=data.partner;partnerNameEl.textContent=partnerUsername;
                 }
-                await appendNewMessages(data.messages, data.current_user);
+                await appendNewMessages(data.messages);
                 clearInterval(pollInterval);
                 pollInterval=setInterval(fetchNewMessages,2000);
             }
@@ -357,29 +426,29 @@
 
     async function fetchNewMessages(){
         try{
-            const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:{'Authorization':'Token '+token}});
-            if(!r.ok){if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/';}return;}
+            const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:authHeaders()});
+            if(!r.ok){if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/chat/usermenu/';}return;}
             const data=await r.json();
-            if(data.current_user_id){localStorage.setItem('my_user_id',data.current_user_id);}
-            if(data.partner&&data.partner!==partnerUsername){partnerUsername=data.partner;partnerNameEl.textContent=partnerUsername;await loadPartnerKey();}
-            await appendNewMessages(data.messages, data.current_user);
+            await loadPartnerKeysFromResponse(data);
+            if(data.partner&&data.partner!==partnerUsername){partnerUsername=data.partner;partnerNameEl.textContent=partnerUsername;}
+            await appendNewMessages(data.messages);
         }catch(e){console.error('fetchNewMessages:',e);}
     }
 
     // ── Only render NEW messages (by ID) ────────────────────────────────────
-    async function appendNewMessages(msgs, currentUser){
+    async function appendNewMessages(msgs){
         let added = false;
         for(const msg of msgs){
             if(renderedIds.has(msg.id)) continue;
             renderedIds.add(msg.id);
-            await renderMsg(msg, currentUser);
+            await renderMsg(msg);
             added = true;
         }
         if(added) messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
 
-    async function renderMsg(msg, currentUser){
-        const isMine = msg.sender_username === currentUser;
+    async function renderMsg(msg){
+        const isMine = String(msg.sender_id) === String(myParticipantId);
         const group = document.createElement('div');
         group.className = 'msg-group '+(isMine?'sent':'received');
 
@@ -459,7 +528,6 @@
 
         badge.addEventListener('click',(e)=>{
             e.stopPropagation();
-            // Close all other open popovers
             document.querySelectorAll('.crypto-details.show').forEach(d=>{if(d!==details)d.classList.remove('show');});
             details.classList.toggle('show');
         });
@@ -469,7 +537,6 @@
         messagesDiv.appendChild(group);
     }
 
-    // Close popovers on click outside
     document.addEventListener('click',()=>{document.querySelectorAll('.crypto-details.show').forEach(d=>d.classList.remove('show'));});
 
     // ── Send message ────────────────────────────────────────────────────────
@@ -505,10 +572,10 @@
 
             advanceSendStep(5);
             const resp=await fetch(`/chat/send-message/${chatId}/`,{
-                method:'POST',headers:{'Content-Type':'application/json','Authorization':'Token '+token},
+                method:'POST',headers:authHeaders({'Content-Type':'application/json'}),
                 body:JSON.stringify({encrypted_text:aesEnc.ciphertext,wrapped_keys:[
-                    {recipient_id:Number(localStorage.getItem('my_user_id')),encrypted_symmetric_key:ab2b64(wSelf)},
-                    {recipient_id:Number(localStorage.getItem('partner_id')),encrypted_symmetric_key:ab2b64(wPartner)},
+                    {recipient_id:Number(myParticipantId),encrypted_symmetric_key:ab2b64(wSelf)},
+                    {recipient_id:Number(partnerId),encrypted_symmetric_key:ab2b64(wPartner)},
                 ],aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,signature:ab2b64(sig)})
             });
             completeSendStep(5,resp.ok);
@@ -530,16 +597,25 @@
     });
 
     // ── Leave chat ──────────────────────────────────────────────────────────
+    async function leaveChat(){
+        try{await fetch('/chat/leave-chat/',{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body:JSON.stringify({chat_id:chatId})});}catch(e){}
+        destroyKeys(chatId);
+        localStorage.removeItem('chat_id');
+        clearInterval(pollInterval);
+    }
+
     leaveBtn.addEventListener('click',async function(){
-        if(!confirm('Leave this chat? Messages will be lost.'))return;
-        try{await fetch('/chat/leave-chat/',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Token '+token},body:JSON.stringify({chat_id:chatId})});}catch(e){}
-        localStorage.removeItem('chat_id');localStorage.removeItem('partner');localStorage.removeItem('partner_id');
-        clearInterval(pollInterval);window.location.href='/chat/usermenu/';
+        if(!confirm('Leave this chat?'))return;
+        await leaveChat();
+        window.location.href='/chat/usermenu/';
     });
 
     window.addEventListener('beforeunload',function(){
         if(pollInterval)clearInterval(pollInterval);
         if(chatId&&token) navigator.sendBeacon('/chat/leave-chat/',new Blob([JSON.stringify({chat_id:chatId})],{type:'application/json'}));
+        // Note: sendBeacon can't carry our custom Authorization header, so a
+        // tab close leaves the participant token valid until the chat is
+        // explicitly left from the UI or the tab reconnects and leaves properly.
     });
 
     startChat();
