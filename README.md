@@ -173,12 +173,15 @@ Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your browser.
 4. **Send a message** — a progress modal appears showing each encryption step in real-time:
    - Generating AES-256 session key
    - Encrypting message (AES-256-GCM)
-   - Wrapping key for partner (RSA-OAEP)
-   - Wrapping key for self (RSA-OAEP)
+   - Wrapping key for each participant (RSA-OAEP)
    - Signing message (RSA-PSS)
    - Sending encrypted payload
 5. **Receiver** sees the message with a **✓ Verified** badge — click it to see the individual crypto verification steps (key unwrap, decrypt, signature verify)
-6. **Leave** the chat from either side to end it. If both sides leave, message history is deleted; either browser's per-chat keys are deleted from that browser's `localStorage` on leave, regardless.
+6. **Leave** the chat from either side to end it. If everyone leaves, message history is deleted; each browser's per-chat keys are deleted from that browser's `localStorage` on leave, regardless.
+
+### Group chats (3–8 people)
+
+Instead of **Create Chat**, use **Create Group** on the same landing page: pick a participant limit (2–8) and share the resulting PIN with everyone who should join. Every additional browser/device joins the same way as a 1:1 chat — **Join Chat** with the PIN. Each message is individually key-wrapped (RSA-OAEP) for every current participant, so a new joiner can't decrypt messages sent before they joined, and a participant who leaves can no longer decrypt anything sent afterward.
 
 ---
 
