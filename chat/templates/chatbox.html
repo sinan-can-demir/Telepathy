@@ -411,6 +411,7 @@
     let token, myParticipantId;
     let partnerUsername = '…';
     let pollInterval=null;
+    let ws=null, wsReconnectTimer=null, wsReconnectDelay=1000, wsClosedByUs=false;
     const renderedIds = new Set(); // track rendered message IDs to avoid duplicates
     const signVerifyKeyCache = new Map(); // PEM string -> imported RSA-PSS verify CryptoKey
 
@@ -769,6 +770,35 @@
         if(countEl) countEl.textContent = `${1+others.length}/${max} joined`;
     }
 
+    // Server-push notification channel (see chat/consumers.py) -- carries no
+    // message content, just a signal telling us to immediately re-run
+    // fetchNewMessages() instead of waiting for the fallback poll below. A
+    // dead/unreachable socket just degrades to that fallback's cadence, so
+    // reconnect failures are never fatal to the chat working.
+    function connectRealtime(){
+        wsClosedByUs = false;
+        const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${scheme}//${location.host}/ws/chat/${chatId}/?token=${encodeURIComponent(token)}`);
+        ws.onmessage = (evt) => {
+            let data; try{ data = JSON.parse(evt.data); }catch(e){ return; }
+            if(data.type === 'new_message' || data.type === 'roster_changed') fetchNewMessages();
+        };
+        ws.onopen = () => { wsReconnectDelay = 1000; };
+        ws.onclose = () => {
+            if(wsClosedByUs) return;
+            wsReconnectTimer = setTimeout(connectRealtime, wsReconnectDelay);
+            wsReconnectDelay = Math.min(wsReconnectDelay * 2, 15000);
+        };
+        ws.onerror = () => { ws.close(); };
+    }
+
+    function closeRealtime(){
+        wsClosedByUs = true;
+        clearTimeout(wsReconnectTimer);
+        if(ws) ws.close();
+        ws = null;
+    }
+
     async function checkChatReady(){
         try{
             const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:authHeaders()});
@@ -785,7 +815,11 @@
                 await updateChainState(data.messages);
                 await appendNewMessages(data.messages);
                 clearInterval(pollInterval);
-                pollInterval=setInterval(fetchNewMessages,2000);
+                // The websocket (see connectRealtime) is now the primary way
+                // new messages/roster changes get noticed; this poll is just
+                // a slow safety net for reconnect gaps or a dead socket.
+                pollInterval=setInterval(fetchNewMessages,15000);
+                connectRealtime();
             } else {
                 updateWaitingOverlay(data);
             }
@@ -1028,6 +1062,7 @@
         destroyKeys(chatId);
         localStorage.removeItem('chat_id');
         clearInterval(pollInterval);
+        closeRealtime();
     }
 
     leaveBtn.addEventListener('click',async function(){
@@ -1038,6 +1073,7 @@
 
     window.addEventListener('beforeunload',function(){
         if(pollInterval)clearInterval(pollInterval);
+        closeRealtime();
         if(chatId&&token) navigator.sendBeacon('/chat/leave-chat/',new Blob([JSON.stringify({chat_id:chatId})],{type:'application/json'}));
         // Note: sendBeacon can't carry our custom Authorization header, so a
         // tab close leaves the participant token valid until the chat is

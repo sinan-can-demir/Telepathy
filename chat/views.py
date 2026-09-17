@@ -15,6 +15,7 @@ from django.shortcuts import render, redirect, get_object_or_404
 from rest_framework.response import Response
 from .auth import ParticipantTokenAuthentication, hash_token
 from .chain import GENESIS_HASH, compute_chain_hash
+from .realtime import notify_chat
 
 
 # Track failed chat-join attempts per source IP, to slow brute-forcing the
@@ -185,6 +186,7 @@ class JoinChatView(APIView):
             chat, display_name, public_key, request.data.get("signing_public_key")
         )
         logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat_id}'.")
+        notify_chat(chat_id, "roster_changed")
         return Response(
             {"participant_token": raw_token, "participant_id": participant.pk},
             status=200,
@@ -245,6 +247,7 @@ class LeaveChatView(APIView):
             logger.info(f"[LEAVE-CHAT] Chat '{chat_id}' emptied; deleted, freeing its PIN.")
         else:
             logger.info(f"[LEAVE-CHAT] A participant left chat '{chat_id}'; {remaining} remain.")
+            notify_chat(chat_id, "roster_changed")
 
         return Response({"message": "Left chat."}, status=status.HTTP_200_OK)
 
@@ -327,6 +330,7 @@ class SendMessageView(APIView):
             )
             MessageKey.objects.create(message=msg, recipient=me, encrypted_symmetric_key=self_wrap)
 
+        notify_chat(chat_id, "new_message")
         return Response(MessageSerializer(msg, context={"request": request}).data, status=201)
 
 

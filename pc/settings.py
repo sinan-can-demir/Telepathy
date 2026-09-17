@@ -91,6 +91,13 @@ LOGGING = {
 
 # Application definition
 INSTALLED_APPS = [
+    # 'daphne' must be listed first, before django.contrib.staticfiles --
+    # that's what makes `manage.py runserver` ASGI-aware (websockets and
+    # all) in local dev instead of falling back to plain WSGI HTTP-only
+    # serving, where a websocket upgrade request just 404s against the
+    # regular urlconf. Production doesn't rely on this -- it runs daphne
+    # directly (see Containerfile) -- but dev needs it too.
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -135,6 +142,15 @@ TEMPLATES = [
 
 
 ASGI_APPLICATION = 'pc.asgi.application'
+
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            'hosts': [(os.environ.get('REDIS_HOST', 'localhost'), int(os.environ.get('REDIS_PORT', 6379)))],
+        },
+    },
+}
 
 
 DATABASES = {

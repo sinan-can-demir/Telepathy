@@ -16,12 +16,19 @@ services:
       - pg_data:/var/lib/postgresql/data
     restart: unless-stopped
 
+  redis:
+    image: docker.io/library/redis:7-alpine
+    # No volume -- the channels channel layer is ephemeral pub/sub, nothing
+    # here needs to survive a restart.
+    restart: unless-stopped
+
   app:
     build:
       context: .
       dockerfile: Containerfile
     depends_on:
       - db
+      - redis
     environment:
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
       DJANGO_DEBUG: "false"
@@ -31,6 +38,8 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
       DB_HOST: db
       DB_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
       ONION_HOSTNAME: ${ONION_HOSTNAME:-}
     # No `ports:` entry on purpose -- not reachable except via the tor container.
     restart: unless-stopped

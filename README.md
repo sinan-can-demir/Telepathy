@@ -21,6 +21,7 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 | 🔒 **Hybrid Encryption** | AES-256-GCM encrypts the message body; the AES key comes from a forward-secret sending-chain ratchet, not a static wrap — see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md) |
 | ⏩ **Forward Secrecy** | Each sender's messages are keyed from a one-way HMAC-SHA256 chain (Signal "Sender Key"-style); stealing current key material can't unlock messages sent before that point |
 | 🔑 **Key Verification (TOFU)** | Each participant's keys are pinned in the browser the first time they're seen per chat; a later mismatch blocks sending and badges their messages ⚠, and a fingerprint is shown for out-of-band comparison — see [docs/KEY_VERIFICATION.md](docs/KEY_VERIFICATION.md) |
+| ⚡ **Real-Time via WebSockets** | New messages and roster changes push instantly over a websocket (Django Channels + Redis), with HTTP polling kept as a slow fallback for reconnect gaps |
 | ✍️ **Digital Signatures** | Every message is signed with RSA-PSS (binding its position in the transcript chain too) — the receiver sees a clickable ✓ Verified badge with full crypto details |
 | 🔗 **Transcript Tamper-Evidence** | Messages are hash-chained; a dropped, reordered, or replayed message breaks a verifiable link instead of being silently trusted |
 | 📊 **Send Progress Modal** | An animated progress bar shows each encryption operation in real-time when sending a message |
@@ -300,7 +301,7 @@ This runs the whole stack — app, Postgres, and a Tor hidden service in front o
 ### Steps
 
 1. Copy `.env.example` to `.env` and fill in `DJANGO_SECRET_KEY`/`DB_PASSWORD` (leave `ONION_HOSTNAME` blank for now).
-2. `podman-compose up --build` — starts `db`, `app` (migrates + collects static + gunicorn on `127.0.0.1:8000`, not published), and `tor` (which shares `app`'s network namespace and proxies port 80 on the hidden service to it).
+2. `podman-compose up --build` — starts `db`, `redis` (Channels' websocket layer), `app` (migrates + collects static + daphne on `127.0.0.1:8000`, not published), and `tor` (which shares `app`'s network namespace and proxies port 80 on the hidden service to it).
 3. Wait for the `tor` container's logs to show `Bootstrapped 100%`, then read the generated address:
    ```
    podman exec <tor-container-name> cat /var/lib/tor/telepathy_hidden_service/hostname
