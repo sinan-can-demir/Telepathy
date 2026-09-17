@@ -4,7 +4,7 @@ This document captures the results of an architecture review of the current code
 
 ## Verdict
 
-The crypto/API layer is solid: end-to-end encryption, transcript tamper-evidence (hash-chained messages), forward secrecy (a per-sender HMAC ratchet), and TOFU key verification are all in place — see `docs/ACCOUNTLESS_IDENTITY.md`, `docs/FORWARD_SECRECY.md`, and `docs/KEY_VERIFICATION.md`. The structural data-model problems that used to block group chat and long-term PIN availability are both resolved, and the transport layer now pushes new messages/roster changes over a websocket instead of relying solely on polling. What's left is mostly about *how the code is organized* rather than what it's missing: no service layer (domain logic still lives in view methods).
+The crypto/API layer is solid: end-to-end encryption, transcript tamper-evidence (hash-chained messages), forward secrecy (a per-sender HMAC ratchet), TOFU key verification, and hardened client-side key storage (non-extractable `CryptoKey`s in IndexedDB) are all in place — see `docs/ACCOUNTLESS_IDENTITY.md`, `docs/FORWARD_SECRECY.md`, `docs/KEY_VERIFICATION.md`, and `docs/CLIENT_KEY_STORAGE.md`. The structural data-model problems that used to block group chat and long-term PIN availability are both resolved, and the transport layer now pushes new messages/roster changes over a websocket instead of relying solely on polling. What's left is mostly about *how the code is organized* rather than what it's missing: no service layer (domain logic still lives in view methods).
 
 ## Known limitations, ranked by how much they block future work
 
@@ -53,10 +53,10 @@ Accounts, passwords, and 2FA have been removed entirely. `ChatParticipant` is no
 
 ## What's left for future work
 
-Both structural blockers (#1, #2 above) are resolved, the crypto layer now covers forward secrecy, transcript tamper-evidence, and TOFU key verification in addition to E2E encryption, and messages/roster changes now push over a websocket instead of relying solely on polling. What remains open:
+Both structural blockers (#1, #2 above) are resolved, the crypto layer now covers forward secrecy, transcript tamper-evidence, TOFU key verification, and hardened client-side key storage in addition to E2E encryption, and messages/roster changes now push over a websocket instead of relying solely on polling. What remains open:
 
 - **Service layer** (#6 above, issue #39): domain logic is still embedded in view methods.
-- **Client key storage hardening** (issue #21/#42): private keys sit unwrapped in `localStorage`; passphrase-wrapping or non-extractable `CryptoKey` + IndexedDB are the two candidate fixes, not yet scoped as a single decision.
+- **Forward-secrecy ratchet/message keys still sit in plaintext `localStorage`** (found scoping #21/#42, tracked as issue #55): `docs/CLIENT_KEY_STORAGE.md` fixed the RSA private keys and bearer token specifically, but `chain_my_key_*`/`chain_recv_key_*`/`msgkey_*` have the same XSS-readable exposure and weren't in either issue's original scope.
 
 ## Network-layer anonymity (Tor) and its rate-limiting tradeoffs
 
