@@ -121,7 +121,6 @@ class CreateChatView(APIView):
         )
         logger.info(f"[CREATE-CHAT] Created chat {chat}, PIN: {chat.pin}")
 
-        request.session["chat_id"] = chat.pin
         return Response(
             {"chat_id": pin, "participant_token": raw_token, "participant_id": participant.pk},
             status=201,
@@ -185,7 +184,6 @@ class JoinChatView(APIView):
         participant, raw_token = _issue_participant(
             chat, display_name, public_key, request.data.get("signing_public_key")
         )
-        request.session["chat_id"] = chat.pin
         logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat_id}'.")
         return Response(
             {"participant_token": raw_token, "participant_id": participant.pk},
@@ -459,8 +457,9 @@ class GetMessagesView(APIView):
         """
         GET /chat/get-messages/<chat_id>/
         Returns the encrypted messages visible to the requesting participant,
-        plus the other participant's public keys inline (for a 1:1 chat) so
-        the frontend needs no separate "get public key" call.
+        plus roster/status metadata. Public keys are fetched separately via
+        GetChatParticipantsView (needed fresh right before every send anyway,
+        to include last-second joiners) rather than duplicated here.
         """
         chat = get_object_or_404(Chat, pin=chat_id)
         me = request.user
@@ -482,8 +481,6 @@ class GetMessagesView(APIView):
             "others":                      [{"id": p.pk, "display_name": p.display_name} for p in others],
             "partner":                     partner.display_name if partner else None,
             "partner_id":                  partner.pk if partner else None,
-            "partner_public_key":          partner.public_key if partner else None,
-            "partner_signing_public_key":  partner.signing_public_key if partner else None,
             "current_user":                me.display_name,
             "current_user_id":             me.pk,
             "both_joined":                 len(active_participants) >= 2,

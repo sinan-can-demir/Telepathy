@@ -14,5 +14,4 @@ pycparser==2.22
 requests==2.32.3
 sqlparse==0.5.3
 urllib3==2.3.0
-channels>=4.0
 channels_redis>=4.0

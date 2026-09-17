@@ -202,21 +202,14 @@ STATIC_ROOT = BASE_DIR / "staticfiles"  # For collectstatic in production
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-###
-# Use our User model instead of the default one
+# Use our User model instead of the default one (operator/admin login only
+# -- see chat.User's docstring; end-user chat identity is ChatParticipant).
 AUTH_USER_MODEL = "chat.User"
 
-# fix registration error
 AUTHENTICATION_BACKENDS = [
     'django.contrib.auth.backends.ModelBackend',
 ]
 
-# NO UI ENDPOINT IN PRODUCTION
-#REST_FRAMEWORK = {
-#    'DEFAULT_AUTHENTICATION_CLASSES': [
-#        'rest_framework.authentication.TokenAuthentication',
-#    ]
-#}
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',

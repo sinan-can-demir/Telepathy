@@ -4,7 +4,6 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from django.test import TestCase
 from rest_framework.test import APIClient
-from rest_framework import status
 
 from chat.views import failed_join_attempts
 from chat.models import Chat, ChatParticipant, Message, MessageKey

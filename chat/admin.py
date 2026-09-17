@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Chat, ChatParticipant, Message, MessageKey
+from .models import User, Chat, ChatParticipant, Message, MessageKey, ChainKey, ChainKeyWrap
 
 
 @admin.register(User)
@@ -40,3 +40,18 @@ class MessageAdmin(admin.ModelAdmin):
 class MessageKeyAdmin(admin.ModelAdmin):
     list_display = ('message', 'recipient')
     search_fields = ('recipient__display_name', 'message__id')
+
+
+class ChainKeyWrapInline(admin.TabularInline):
+    model = ChainKeyWrap
+    extra = 0
+    readonly_fields = ('recipient',)
+    fields = ('recipient',)
+
+
+@admin.register(ChainKey)
+class ChainKeyAdmin(admin.ModelAdmin):
+    list_display = ('sender', 'epoch', 'chat', 'created_at')
+    list_filter = ('epoch',)
+    search_fields = ('sender__display_name', 'chat__pin')
+    inlines = [ChainKeyWrapInline]

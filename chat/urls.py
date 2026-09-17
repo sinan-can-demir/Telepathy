@@ -6,9 +6,6 @@ from . import views
 from .views import (
     CheckChatView,
     LeaveChatView,
-    auth_page,
-    SendMessageView,
-    GetMessagesView,
     user_menu,
     CreateChatView,
     JoinChatView,
