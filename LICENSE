@@ -19,13 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Telepathy was built and is maintained as an educational project for learning
-and demonstrating applied cryptography and secure system design. It has not
-undergone a professional, independent security audit. Use it responsibly:
-do not rely on it to protect communications where real safety, legal, or
-financial consequences depend on its correctness, and do not use it for any
-unlawful purpose. The authors and copyright holders accept no liability for
-misuse or for harm resulting from reliance on this software.
