@@ -270,7 +270,7 @@ This runs the whole stack — app, Postgres, and a Tor hidden service in front o
    ```
    podman exec <tor-container-name> cat /var/lib/tor/telepathy_hidden_service/hostname
    ```
-4. Set `ONION_HOSTNAME` in `.env` to that value and recreate the `app` service (`podman-compose up -d --build app`) so it's accepted by `ALLOWED_HOSTS`.
+4. Set `ONION_HOSTNAME` in `.env` to that value and restart the stack (`podman-compose up -d`) so it's accepted by `ALLOWED_HOSTS`. This needs the whole stack, not just `app` — `tor` shares `app`'s network namespace, so Podman won't recreate one without the other.
 5. Connect to the printed `.onion` address using Tor Browser.
 
 The hidden service's private key lives in the `tor_data` named volume — **that's the one piece of state in this stack that must persist**; deleting it changes the `.onion` address. Everything else (`app`, `db`'s actual rows) can be recreated freely.

@@ -4,6 +4,12 @@ SocksPort 0
 RunAsDaemon 0
 Log notice stdout
 User debian-tor
+# Without this, Tor defaults to ~/.tor for whatever user invokes it (/root/.tor,
+# since the container's entrypoint runs as root before Tor drops to
+# debian-tor) -- a directory that user then can't read. The Debian package
+# already creates /var/lib/tor owned by debian-tor, so use that instead of
+# relying on the implicit default.
+DataDirectory /var/lib/tor
 
 HiddenServiceDir /var/lib/tor/telepathy_hidden_service/
 HiddenServicePort 80 127.0.0.1:8000
