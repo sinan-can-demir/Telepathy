@@ -304,6 +304,35 @@ class SendMessageView(APIView):
         return Response(MessageSerializer(msg, context={"request": request}).data, status=201)
 
 
+class GetChatParticipantsView(APIView):
+    """
+    GET /chat/get-chat-participants/<chat_id>/
+    Returns every active participant's id/display_name/public keys, so the
+    sender can wrap the per-message AES key for each of them. Requires the
+    caller to be an active participant themselves.
+    """
+    authentication_classes = [ParticipantTokenAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, chat_id):
+        chat = get_object_or_404(Chat, pin=chat_id)
+        me = request.user
+        active = list(chat.participants.filter(left_at__isnull=True))
+        if not any(p.pk == me.pk for p in active):
+            return Response({"detail": "Forbidden"}, status=403)
+        return Response({
+            "participants": [
+                {
+                    "id": p.pk,
+                    "display_name": p.display_name,
+                    "public_key": p.public_key,
+                    "signing_public_key": p.signing_public_key,
+                }
+                for p in active
+            ]
+        }, status=200)
+
+
 class GetMessagesView(APIView):
     authentication_classes = [ParticipantTokenAuthentication]
     permission_classes = [permissions.IsAuthenticated]
@@ -332,6 +361,7 @@ class GetMessagesView(APIView):
 
         return Response({
             "messages":                    serializer_data,
+            "others":                      [{"id": p.pk, "display_name": p.display_name} for p in others],
             "partner":                     partner.display_name if partner else None,
             "partner_id":                  partner.pk if partner else None,
             "partner_public_key":          partner.public_key if partner else None,
@@ -339,4 +369,6 @@ class GetMessagesView(APIView):
             "current_user":                me.display_name,
             "current_user_id":             me.pk,
             "both_joined":                 len(active_participants) >= 2,
+            "is_group":                    chat.is_group,
+            "max_participants":            chat.max_participants,
         }, status=status.HTTP_200_OK)
