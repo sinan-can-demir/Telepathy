@@ -209,10 +209,9 @@ Exists solely for Django's own admin/staff login. No end-user chat functionality
 ### `Chat`
 | Field | Type | Description |
 |-------|------|-------------|
-| `pin` | `CharField(4)` | Unique 4-digit room code (single-use; never recycled) |
+| `pin` | `CharField(4)` | Unique 4-digit room code, freed for reuse once every participant leaves (the `Chat` row is hard-deleted, not soft-flagged) |
 | `is_group` | `BooleanField` | Whether this chat allows more than 2 participants |
 | `max_participants` | `IntegerField` | Capacity (2–8) |
-| `is_active` | `BooleanField` | Whether the room is active |
 
 ### `ChatParticipant`
 A participant's entire identity for exactly one chat — see [docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md) for why this replaced per-account identity.

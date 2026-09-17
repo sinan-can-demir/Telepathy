@@ -14,11 +14,15 @@ class User(AbstractUser):
 
 
 class Chat(models.Model):
+    # A Chat row's existence *is* its "active" flag now (see #35):
+    # LeaveChatView hard-deletes the row once every participant has left,
+    # which is what actually frees the PIN for reuse -- a soft is_active=False
+    # flag would leave the PIN permanently retired against the unique
+    # constraint below, and there are only 10,000 possible 4-digit PINs.
     pin = models.CharField(max_length=4, unique=True, db_index=True)
     is_group = models.BooleanField(default=False)
     max_participants = models.IntegerField(default=2)
     created_at = models.DateTimeField(auto_now_add=True)
-    is_active = models.BooleanField(default=True)
 
     def __str__(self):
         return f"Chat {self.pin}"

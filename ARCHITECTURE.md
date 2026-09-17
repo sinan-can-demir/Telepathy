@@ -18,15 +18,13 @@ Consequences:
 
 **Direction**: add `Message.chat = ForeignKey(Chat, related_name="messages")`, backfill by matching existing `(sender, receiver)` pairs to their `Chat`, then switch queries to `chat.messages.filter(...)`. This is also a prerequisite for group chat, which additionally needs a `ChatParticipant` join model replacing the fixed `user1`/`user2` slots.
 
-### 2. The 4-digit PIN space (10,000 values) is never recycled
+### 2. ~~The 4-digit PIN space (10,000 values) is never recycled~~ — Resolved
 
-`CreateChatView` generates PINs via `random.randint(0, 9999)` and rejects on collision, but `Chat.pin` is `unique=True` forever — `LeaveChatView` only sets `is_active=False`, it never deletes the row. Every chat ever created permanently retires one of only 10,000 possible PINs. This is a hard ceiling on **total lifetime chats**, not concurrent ones — once the space fills up, PIN generation degrades to scanning an increasingly full space and eventually fails outright.
-
-**Direction**: decouple the PIN from chat identity. A `Chat` should have its own permanent surrogate key (already does, via Django's auto `id`); the 4-digit PIN becomes a separate, short-TTL, reusable pairing code that's deleted once both parties join or after expiry. Ended chats get hard-deleted or archived instead of just flagged, freeing the code space.
+`LeaveChatView` now hard-deletes the `Chat` row once every participant has left (cascading to its `ChatParticipant`/`Message`/`MessageKey` rows), instead of soft-flagging it with `is_active=False` forever. `Chat.pin`'s uniqueness constraint only applies to chats that still exist, so an ended chat's PIN is immediately available for a new chat to reuse (#35). The permanent surrogate key was already Django's auto `id` — nothing referenced `pin` as a foreign key target, so no schema redesign was needed beyond this.
 
 ### 3. ~~`active_chats` in-process dict is dead code today, a landmine tomorrow~~ — Resolved
 
-Removed entirely as part of the Phase 1 group-chat schema migration (`ChatParticipant`/`MessageKey`, see `docs/GROUP_CHATS_PLAN.md`). If presence/online-status is wanted later, it belongs in Postgres (`Chat.is_active`, `ChatParticipant.left_at`) or Redis, not a per-process dict.
+Removed entirely as part of the Phase 1 group-chat schema migration (`ChatParticipant`/`MessageKey`, see `docs/GROUP_CHATS_PLAN.md`). If presence/online-status is wanted later, it belongs in Postgres (`ChatParticipant.left_at`, or the fact that a `Chat` row exists at all now that ended chats are hard-deleted) or Redis, not a per-process dict.
 
 ### 4. Polling transport is a reasonable MVP choice, but `channels` is a half-installed illusion
 

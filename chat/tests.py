@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from django.test import TestCase
@@ -210,21 +212,35 @@ class MessageRoundTripTests(TestCase):
         response = self._send(self.alice, key_for_bob="")
         self.assertEqual(response.status_code, 400)
 
-    def test_leave_only_clears_history_once_chat_fully_empties(self):
+    def test_leave_only_deletes_chat_once_it_fully_empties(self):
         self._send(self.alice)
         self.assertEqual(Message.objects.count(), 1)
 
-        # Alice leaves; Bob remains -- history must survive.
+        # Alice leaves; Bob remains -- history and the chat itself must survive.
         leave = self.alice.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
         self.assertEqual(leave.status_code, 200)
         self.assertEqual(Message.objects.count(), 1)
-        self.assertTrue(Chat.objects.get(pin=self.chat_id).is_active)
+        self.assertTrue(Chat.objects.filter(pin=self.chat_id).exists())
 
-        # Bob leaves too; chat is now fully empty -- history is cleared.
+        # Bob leaves too; chat is now fully empty -- it (and its messages,
+        # via cascade) is hard-deleted, freeing its PIN for reuse (#35).
         leave2 = self.bob.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
         self.assertEqual(leave2.status_code, 200)
         self.assertEqual(Message.objects.count(), 0)
-        self.assertFalse(Chat.objects.get(pin=self.chat_id).is_active)
+        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+
+    def test_emptied_chats_pin_becomes_reusable(self):
+        leave = self.alice.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
+        self.assertEqual(leave.status_code, 200)
+        leave2 = self.bob.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
+        self.assertEqual(leave2.status_code, 200)
+        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+
+        # A brand-new chat can now legitimately reuse that same PIN.
+        with patch("random.randint", return_value=int(self.chat_id)):
+            recreated = _create_chat(APIClient(), display_name="new-owner")
+        self.assertEqual(recreated.status_code, 201, recreated.data)
+        self.assertEqual(recreated.data["chat_id"], self.chat_id)
 
 
 class GroupChatFeatureTests(TestCase):
