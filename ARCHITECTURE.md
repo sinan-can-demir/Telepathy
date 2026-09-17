@@ -4,7 +4,7 @@ This document captures the results of an architecture review of the current code
 
 ## Verdict
 
-The crypto/API layer is solid: end-to-end encryption, transcript tamper-evidence (hash-chained messages), and forward secrecy (a per-sender HMAC ratchet) are all in place — see `docs/ACCOUNTLESS_IDENTITY.md` and `docs/FORWARD_SECRECY.md`. The structural data-model problems that used to block group chat and long-term PIN availability are both resolved. What's left is mostly about *how the code is organized* rather than what it's missing: no service layer (domain logic still lives in view methods), and a polling transport that works today but won't scale to real-time features like typing indicators or presence.
+The crypto/API layer is solid: end-to-end encryption, transcript tamper-evidence (hash-chained messages), forward secrecy (a per-sender HMAC ratchet), and TOFU key verification are all in place — see `docs/ACCOUNTLESS_IDENTITY.md`, `docs/FORWARD_SECRECY.md`, and `docs/KEY_VERIFICATION.md`. The structural data-model problems that used to block group chat and long-term PIN availability are both resolved, and the transport layer now pushes new messages/roster changes over a websocket instead of relying solely on polling. What's left is mostly about *how the code is organized* rather than what it's missing: no service layer (domain logic still lives in view methods).
 
 ## Known limitations, ranked by how much they block future work
 
@@ -20,13 +20,11 @@ The crypto/API layer is solid: end-to-end encryption, transcript tamper-evidence
 
 Removed entirely as part of the Phase 1 group-chat schema migration. If presence/online-status is wanted later, it belongs in Postgres (`ChatParticipant.left_at`, or the fact that a `Chat` row exists at all now that ended chats are hard-deleted) or Redis, not a per-process dict.
 
-### 4. Polling transport is a reasonable MVP choice, but `channels` is a half-installed illusion
+### 4. ~~Polling transport is a reasonable MVP choice, but `channels` is a half-installed illusion~~ — Resolved
 
-The frontend polls `GetMessagesView` every ~2 seconds. `channels==4.2.0` is a listed dependency with `ASGI_APPLICATION` set in `pc/settings.py`, but `pc/asgi.py` only calls `get_asgi_application()` — no `ProtocolTypeRouter`, and no `consumers.py`/`routing.py` exist anywhere in the repo. The dependency implies infrastructure that was never built, which is worse than not listing it at all (tracked as issue #37).
+`pc/asgi.py` now routes through a real `ProtocolTypeRouter`, `chat/consumers.py` and `chat/routing.py` exist, and `CHANNEL_LAYERS` uses a Redis backend (`channels_redis`). `SendMessageView`/`JoinChatView`/`LeaveChatView` push a lightweight signal (`chat/realtime.py`'s `notify_chat`) over the chat's websocket group on every new message or roster change, and the client (`chatbox.html`) immediately re-runs its existing HTTP fetch on receiving one instead of waiting for the next poll tick — HTTP polling is kept, just slowed to a 15s fallback for reconnect gaps, per issue #37's own "additive, don't remove the REST endpoints" direction. Production now runs `daphne` (an ASGI server) instead of `gunicorn` (WSGI-only, can't serve websocket upgrades at all), and `compose.yaml` gained a `redis` service.
 
-This doesn't block shipping today, but it's a foundational blocker for anything that needs to feel real-time: typing indicators, read receipts, presence. Server load also scales linearly with active chats × polling frequency regardless of actual message volume, and there's a hard ~2s latency floor.
-
-**Direction**: since `channels` and `channels_redis` are already dependencies, stand up a real `consumers.py` + `routing.py` with a Redis channel layer. Keep HTTP polling as the initial-load/fallback path; move only "new message" push and future presence/typing signals onto the websocket. This is additive — it doesn't require removing the REST endpoints.
+One dependency note worth keeping in mind going forward: `channels_redis==4.2.1` has no upper bound on its own `redis` dependency, so a plain `pip install` pulls `redis>=8`, which has real async timeout/connection-pool incompatibilities with it (reproduced locally — the channel layer's background listener crashed with a spurious `redis.exceptions.TimeoutError` under load). `requirements.txt` pins `redis==5.0.8` explicitly to avoid this; don't let that pin drift without re-testing against whatever `channels_redis` version is current at the time.
 
 ### 5. ~~Chat identity is tracked in two places that can disagree~~ — Resolved
 
@@ -55,10 +53,8 @@ Accounts, passwords, and 2FA have been removed entirely. `ChatParticipant` is no
 
 ## What's left for future work
 
-Both structural blockers (#1, #2 above) are resolved, and the crypto layer now covers forward secrecy and transcript tamper-evidence in addition to E2E encryption. What remains open:
+Both structural blockers (#1, #2 above) are resolved, the crypto layer now covers forward secrecy, transcript tamper-evidence, and TOFU key verification in addition to E2E encryption, and messages/roster changes now push over a websocket instead of relying solely on polling. What remains open:
 
-- **Key verification / TOFU** (issue #19): nothing lets two participants confirm the public key they each received is authentic rather than server-substituted.
-- **Real-time transport** (#4 above, issue #37): the polling architecture works but doesn't scale to typing indicators/presence.
 - **Service layer** (#6 above, issue #39): domain logic is still embedded in view methods.
 - **Client key storage hardening** (issue #21/#42): private keys sit unwrapped in `localStorage`; passphrase-wrapping or non-extractable `CryptoKey` + IndexedDB are the two candidate fixes, not yet scoped as a single decision.
 

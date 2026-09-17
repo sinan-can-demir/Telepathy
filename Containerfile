@@ -23,4 +23,4 @@ ENV DJANGO_SETTINGS_MODULE=pc.settings
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "python manage.py migrate --noinput && python manage.py collectstatic --noinput && gunicorn pc.wsgi:application --bind 127.0.0.1:8000 --workers 3"]
+CMD ["sh", "-c", "python manage.py migrate --noinput && python manage.py collectstatic --noinput && daphne -b 127.0.0.1 -p 8000 pc.asgi:application"]
