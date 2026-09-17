@@ -1,0 +1,21 @@
+# Deliberately built from the official Debian package rather than a
+# prebuilt third-party "tor hidden service" image -- for a component whose
+# whole job is anonymity, trusting an unaudited image's supply chain is the
+# wrong tradeoff. This is the same official `tor` binary Debian ships.
+FROM debian:stable-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tor \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/torrc /etc/tor/torrc
+
+# Stays root at the container level so it can fix ownership+permissions on
+# the mounted tor_data volume on first boot -- a freshly created volume is
+# root-owned with default (too-permissive) mode bits, and (contrary to what
+# you might expect) Tor does not fix either itself: it checks
+# HiddenServiceDir's owner and mode (must be exactly 0700) *before* doing
+# anything, and refuses to start at all if either is wrong, rather than
+# correcting them. So this explicitly fixes both first, then hands off to
+# Tor, which drops root via its own `User debian-tor` directive once running.
+CMD ["sh", "-c", "chown -R debian-tor:debian-tor /var/lib/tor/telepathy_hidden_service && chmod 700 /var/lib/tor/telepathy_hidden_service && exec tor -f /etc/tor/torrc"]

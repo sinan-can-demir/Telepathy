@@ -3,11 +3,13 @@ certifi==2025.1.31
 cffi==1.17.1
 channels==4.2.0
 charset-normalizer==3.4.1
+colorlog==6.9.0
 cryptography==44.0.0
 Django==5.1.5
 djangorestframework==3.15.2
 gunicorn==23.0.0
 idna==3.10
+psycopg2-binary==2.9.10
 pycparser==2.22
 pyotp==2.9.0
 qrcode==7.4.2

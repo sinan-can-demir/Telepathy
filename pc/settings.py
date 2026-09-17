@@ -37,6 +37,13 @@ ALLOWED_HOSTS = [
     'project2-2-telepathy.work',
 ]
 
+# Set once a Tor hidden-service address exists (see README's Tor deployment
+# section) -- the .onion hostname isn't known until the hidden service's
+# first boot generates it, so it can't be hardcoded above.
+_onion_hostname = os.environ.get('ONION_HOSTNAME')
+if _onion_hostname:
+    ALLOWED_HOSTS.append(_onion_hostname)
+
 
 
 LOGGING = {
