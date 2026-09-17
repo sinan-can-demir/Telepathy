@@ -32,4 +32,4 @@ That's deliberately out of scope here: hand-rolling a correct, secure multi-part
 
 ## What this is not
 
-Same caveat as `docs/ACCOUNTLESS_IDENTITY.md`: this narrows a real gap, it doesn't make Telepathy ready for a high-stakes use case like source protection on its own. Key verification (TOFU/safety numbers — see issue #19) and metadata minimization remain open. See `ARCHITECTURE.md` for the full limitations list.
+Same caveat as `docs/ACCOUNTLESS_IDENTITY.md`: this narrows a real gap, it doesn't make Telepathy ready for a high-stakes use case like source protection on its own. Key verification (TOFU/safety numbers) is now in place — see `docs/KEY_VERIFICATION.md`. Metadata minimization remains open. See `ARCHITECTURE.md` for the full limitations list.

@@ -20,6 +20,7 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 | 🔑 **Per-Chat "Burner" Keys** | A fresh RSA-2048 key pair (encryption + signing) is generated in the browser for every chat created or joined; private keys never leave the client and are deleted the moment the chat is left |
 | 🔒 **Hybrid Encryption** | AES-256-GCM encrypts the message body; the AES key comes from a forward-secret sending-chain ratchet, not a static wrap — see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md) |
 | ⏩ **Forward Secrecy** | Each sender's messages are keyed from a one-way HMAC-SHA256 chain (Signal "Sender Key"-style); stealing current key material can't unlock messages sent before that point |
+| 🔑 **Key Verification (TOFU)** | Each participant's keys are pinned in the browser the first time they're seen per chat; a later mismatch blocks sending and badges their messages ⚠, and a fingerprint is shown for out-of-band comparison — see [docs/KEY_VERIFICATION.md](docs/KEY_VERIFICATION.md) |
 | ✍️ **Digital Signatures** | Every message is signed with RSA-PSS (binding its position in the transcript chain too) — the receiver sees a clickable ✓ Verified badge with full crypto details |
 | 🔗 **Transcript Tamper-Evidence** | Messages are hash-chained; a dropped, reordered, or replayed message breaks a verifiable link instead of being silently trusted |
 | 📊 **Send Progress Modal** | An animated progress bar shows each encryption operation in real-time when sending a message |
