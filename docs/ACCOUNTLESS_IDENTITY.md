@@ -31,4 +31,4 @@ Concretely:
 
 ## What this is not
 
-This makes the software more honest about its own "anonymous, ephemeral" claim. It does **not**, by itself, make Telepathy ready for a high-stakes use case like source protection — that also needs forward secrecy / per-message key ratcheting (Signal-style), key verification (safety numbers / TOFU), and metadata minimization beyond what a single schema change provides. Those remain open, larger pieces of work. See `ARCHITECTURE.md` for the full limitations list.
+This makes the software more honest about its own "anonymous, ephemeral" claim. It does **not**, by itself, make Telepathy ready for a high-stakes use case like source protection — that also needed forward secrecy / per-message key ratcheting (Signal-style, see `docs/FORWARD_SECRECY.md`) and key verification (TOFU/safety numbers, see `docs/KEY_VERIFICATION.md`), both now in place, plus metadata minimization beyond what a single schema change provides, which remains open. See `ARCHITECTURE.md` for the full limitations list.

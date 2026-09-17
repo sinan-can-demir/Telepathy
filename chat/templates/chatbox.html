@@ -122,6 +122,18 @@
             color:var(--orange);padding:0.5rem 1.25rem;font-size:0.78rem;text-align:center;flex-shrink:0}
         .transcript-warning.show{display:block}
 
+        /* ── TOFU key verification ── */
+        .key-fingerprint{font-family:'JetBrains Mono',monospace;font-size:0.68rem;color:var(--text-muted);cursor:help}
+        .key-warning{display:none;background:rgba(239,68,68,0.1);border-bottom:1px solid rgba(239,68,68,0.3);
+            color:var(--red);padding:0.6rem 1.25rem;font-size:0.78rem;flex-shrink:0}
+        .key-warning.show{display:block}
+        .key-warning-row{display:flex;align-items:center;justify-content:center;gap:0.6rem;flex-wrap:wrap;padding:0.15rem 0}
+        .key-warning-trust{font-size:0.72rem;padding:0.2rem 0.55rem;border-radius:6px;border:1px solid rgba(239,68,68,0.4);
+            background:rgba(239,68,68,0.1);color:var(--red);cursor:pointer;font-family:'Inter',sans-serif}
+        .key-warning-trust:hover{background:rgba(239,68,68,0.2)}
+        .verify-badge.key-mismatch{color:var(--red);background:rgba(239,68,68,0.15);font-weight:600}
+        .verify-badge.key-mismatch:hover{background:rgba(239,68,68,0.25)}
+
         @media(max-width:500px){.msg-bubble{max-width:85%}}
     </style>
 </head>
@@ -148,6 +160,9 @@
             <p><span class="status-dot"></span> E2E Encrypted &nbsp;·&nbsp;
                 <span class="transcript-fingerprint" id="transcript-fingerprint"
                     title="Hash of the last message in this chat's transcript. Compare it out loud with the other participant(s) to catch a server showing you two different histories.">fingerprint: ----</span>
+                &nbsp;·&nbsp;
+                <span class="key-fingerprint" id="key-fingerprint"
+                    title="Fingerprint of the other participant(s)' public keys, pinned the first time this browser saw them. Compare it out loud (or in person) with them to catch a server substituting a key."></span>
             </p>
         </div>
     </div>
@@ -158,6 +173,7 @@
 </header>
 
 <div class="transcript-warning" id="transcriptWarning">⚠ This chat's history may be incomplete or tampered with — a message link in the transcript chain doesn't match.</div>
+<div class="key-warning" id="keyMismatchWarning"></div>
 
 <!-- Chat -->
 <div class="chat-main" id="chatMain" style="display:none">
@@ -188,6 +204,14 @@
     const signPrivKeyName = cid => `sign_priv_${cid}`, signPubKeyName = cid => `sign_pub_${cid}`;
     const tokenName = cid => `participant_token_${cid}`, participantIdName = cid => `participant_id_${cid}`;
 
+    // ── TOFU key pinning ─────────────────────────────────────────────────────
+    // Pins the raw PEM of every other participant's keys the first time this
+    // browser sees them for this chat, so later fetches/messages can be
+    // checked against what was actually trusted before -- independent of
+    // whatever the server hands back next. See docs/KEY_VERIFICATION.md.
+    const pinnedEncKeyName = (cid, pid) => `pinned_enc_${cid}_${pid}`;
+    const pinnedSignKeyName = (cid, pid) => `pinned_sign_${cid}_${pid}`;
+
     // ── Crypto helpers ──────────────────────────────────────────────────────
     function derToPem(buf, label) {
         const b = new Uint8Array(buf); let s = '';
@@ -207,6 +231,17 @@
     async function sha256Hex(str) {
         const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
         return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // Short, human-comparable fingerprint of a participant's key pair, e.g.
+    // "A1B2-C3D4-E5F6-0789" -- meant to be read aloud/compared out-of-band,
+    // Signal-safety-number style. Always computed over whichever PEMs are
+    // passed in; callers pass the *pinned* (trusted) PEMs, not fresh ones
+    // straight off the wire, so the displayed value only changes when the
+    // user explicitly re-trusts a new key.
+    async function computeKeyFingerprint(pubEncPem, pubSignPem) {
+        const hex = await sha256Hex((pubEncPem || '') + '|' + (pubSignPem || ''));
+        return hex.slice(0, 16).toUpperCase().match(/.{1,4}/g).join('-');
     }
 
     function computeChainHash(msg) {
@@ -386,6 +421,13 @@
     let chainTipHash = GENESIS_HASH, chainTipSeq = -1, chainBroken = false;
     const transcriptWarningEl = document.getElementById('transcriptWarning');
     const transcriptFingerprintEl = document.getElementById('transcript-fingerprint');
+    const keyFingerprintEl = document.getElementById('key-fingerprint');
+    const keyMismatchWarningEl = document.getElementById('keyMismatchWarning');
+
+    // TOFU key mismatches currently unresolved, keyed by participant id.
+    // Populated/cleared by verifyAndPinKey(); drives the warning banner,
+    // the send-blocking check, and the per-message "key changed" badge.
+    const keyMismatches = new Map();
 
     async function updateChainState(msgs){
         const sorted = [...(msgs||[])].sort((a,b)=>a.seq-b.seq);
@@ -414,15 +456,105 @@
         return signVerifyKeyCache.get(pem);
     }
 
+    // Pins a participant's keys on first sight for this chat, or checks a
+    // later sighting against what was pinned before. A mismatch is left
+    // unresolved in keyMismatches (rather than auto-trusted) until the user
+    // explicitly calls trustNewKey -- that's the "block by default" half of
+    // TOFU here; computeKeyFingerprint of the *pinned* value is what the UI
+    // shows, so it never reflects an unresolved/untrusted key.
+    async function verifyAndPinKey(participant){
+        const encName = pinnedEncKeyName(chatId, participant.id);
+        const signName = pinnedSignKeyName(chatId, participant.id);
+        const pinnedEnc = localStorage.getItem(encName);
+        const pinnedSign = localStorage.getItem(signName);
+        const seenSign = participant.signing_public_key || '';
+
+        if(pinnedEnc === null && pinnedSign === null){
+            localStorage.setItem(encName, participant.public_key);
+            localStorage.setItem(signName, seenSign);
+            keyMismatches.delete(participant.id);
+            return {trusted:true, fp: await computeKeyFingerprint(participant.public_key, seenSign)};
+        }
+        const matches = pinnedEnc === participant.public_key && pinnedSign === seenSign;
+        if(matches){
+            keyMismatches.delete(participant.id);
+        } else {
+            keyMismatches.set(participant.id, {
+                displayName: participant.display_name,
+                encPem: participant.public_key,
+                signPem: seenSign,
+                pinnedFp: await computeKeyFingerprint(pinnedEnc, pinnedSign),
+                seenFp: await computeKeyFingerprint(participant.public_key, seenSign),
+            });
+        }
+        return {trusted: matches, fp: await computeKeyFingerprint(pinnedEnc, pinnedSign)};
+    }
+
+    // Explicit user override after a reviewed key change -- re-pins to the
+    // new value and clears the mismatch.
+    function trustNewKey(participantId){
+        const entry = keyMismatches.get(participantId);
+        if(!entry) return;
+        localStorage.setItem(pinnedEncKeyName(chatId, participantId), entry.encPem);
+        localStorage.setItem(pinnedSignKeyName(chatId, participantId), entry.signPem);
+        keyMismatches.delete(participantId);
+        renderKeyMismatchWarning();
+    }
+
+    function renderKeyMismatchWarning(){
+        if(keyMismatches.size === 0){
+            keyMismatchWarningEl.classList.remove('show');
+            keyMismatchWarningEl.innerHTML = '';
+            return;
+        }
+        keyMismatchWarningEl.innerHTML = '';
+        for(const [pid, entry] of keyMismatches){
+            const row = document.createElement('div');
+            row.className = 'key-warning-row';
+            const text = document.createElement('span');
+            text.textContent = `⚠ ${entry.displayName}'s key changed (was ${entry.pinnedFp}, now ${entry.seenFp}) — could be a server-side key swap.`;
+            const btn = document.createElement('button');
+            btn.className = 'key-warning-trust';
+            btn.type = 'button';
+            btn.textContent = 'Trust new key';
+            btn.addEventListener('click', () => trustNewKey(pid));
+            row.append(text, btn);
+            keyMismatchWarningEl.appendChild(row);
+        }
+        keyMismatchWarningEl.classList.add('show');
+    }
+
     // Fetches every other active participant's id/display_name/encryption
-    // public key, used only right before sending so the AES key gets wrapped
-    // for whoever is currently in the chat (fetched fresh each time to
-    // include last-second joiners).
+    // public key, used both right before sending (so the AES key gets
+    // wrapped for whoever is currently in the chat) and by
+    // refreshParticipantTrust below. Every returned participant has already
+    // been checked against/pinned into TOFU state before this resolves.
     async function fetchRecipientKeys(){
         const r = await fetch(`/chat/get-chat-participants/${chatId}/`,{headers:authHeaders()});
         if(!r.ok) throw new Error('Failed to fetch chat participants');
         const {participants} = await r.json();
-        return participants.filter(p => String(p.id) !== String(myParticipantId));
+        const others = participants.filter(p => String(p.id) !== String(myParticipantId));
+        for(const p of others) await verifyAndPinKey(p);
+        return others;
+    }
+
+    // Re-checks TOFU trust for the current roster and refreshes the
+    // fingerprint chip + mismatch banner. Called once the chat becomes
+    // ready and again on every poll tick, so a swap is caught even for a
+    // participant who never sends a message.
+    async function refreshParticipantTrust(){
+        try{
+            const others = await fetchRecipientKeys();
+            if(others.length === 1){
+                const {fp} = await verifyAndPinKey(others[0]);
+                keyFingerprintEl.textContent = '🔑 ' + fp;
+            } else if(others.length > 1){
+                keyFingerprintEl.textContent = '🔑 ' + others.length + ' participants';
+            } else {
+                keyFingerprintEl.textContent = '';
+            }
+            renderKeyMismatchWarning();
+        }catch(e){ console.error('refreshParticipantTrust:', e); }
     }
 
     // DOM
@@ -534,6 +666,20 @@
         localStorage.removeItem(tokenName(cid));
         localStorage.removeItem(participantIdName(cid));
         destroyChainState(cid);
+        destroyPinnedKeys(cid);
+    }
+
+    // TOFU pins are chat-scoped burner state too -- they should die with the
+    // rest of this chat's identity rather than outliving it.
+    function destroyPinnedKeys(cid){
+        const prefixes = [`pinned_enc_${cid}_`, `pinned_sign_${cid}_`];
+        const toRemove = [];
+        for(let i = 0; i < localStorage.length; i++){
+            const key = localStorage.key(i);
+            if(key && prefixes.some(p => key.startsWith(p))) toRemove.push(key);
+        }
+        toRemove.forEach(k => localStorage.removeItem(k));
+        keyMismatches.clear();
     }
 
     // ── Establish participation: either resume an existing chat (page
@@ -635,6 +781,7 @@
                 chatHeader.style.display='flex';
                 chatMain.style.display='flex';
                 updateHeader(data);
+                await refreshParticipantTrust();
                 await updateChainState(data.messages);
                 await appendNewMessages(data.messages);
                 clearInterval(pollInterval);
@@ -651,6 +798,7 @@
             if(!r.ok){if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/chat/usermenu/';}return;}
             const data=await r.json();
             updateHeader(data);
+            await refreshParticipantTrust();
             await updateChainState(data.messages);
             await appendNewMessages(data.messages);
         }catch(e){console.error('fetchNewMessages:',e);}
@@ -726,6 +874,20 @@
             return; // skip broken messages
         }
 
+        // TOFU: an attacker holding the *current* signing key can produce a
+        // validly-signed message under it, so signature success alone can't
+        // catch a server-side key swap -- only comparing against what was
+        // actually pinned before can. Checked independently of cryptoSteps
+        // above so it overrides the badge even if the signature "passes".
+        let keyMismatch = false;
+        if(!isMine){
+            const pinnedSign = localStorage.getItem(pinnedSignKeyName(chatId, msg.sender_id));
+            if(pinnedSign !== null && msg.sender_signing_public_key){
+                keyMismatch = msg.sender_signing_public_key !== pinnedSign;
+                cryptoSteps.push({label:'Sender key matches pinned (TOFU)', ok: !keyMismatch});
+            }
+        }
+
         const allOk = cryptoSteps.every(s=>s.ok===true);
         const anyFail = cryptoSteps.some(s=>s.ok===false);
 
@@ -746,6 +908,9 @@
         if(isMine){
             badge.className='verify-badge own';
             badge.textContent='🔒 Encrypted';
+        } else if(keyMismatch){
+            badge.className='verify-badge key-mismatch';
+            badge.textContent='⚠ Key changed';
         } else if(allOk){
             badge.className='verify-badge verified';
             badge.textContent='✓ Verified';
@@ -793,6 +958,11 @@
         try{
             advanceSendStep(0);
             const recipients=await fetchRecipientKeys();
+            renderKeyMismatchWarning();
+            if(recipients.some(r => keyMismatches.has(r.id))){
+                closeSendModal(false, 'A participant\'s key changed unexpectedly -- review the warning above and trust the new key before sending.');
+                return;
+            }
             await ensureMyChainKey(recipients);
             const currentChainBytes = new Uint8Array(b642ab(localStorage.getItem(myChainKeyName(chatId))));
             const { messageKey, nextChainKey } = await ratchetStep(currentChainBytes);
