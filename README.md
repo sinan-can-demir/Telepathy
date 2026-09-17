@@ -378,4 +378,6 @@ For bugs, questions, or setup issues, reach out via GitHub:
 
 ## 📄 License
 
-This project is for academic use. Please contact the author before using it in production or redistributing.
+This project is licensed under the [MIT License](./LICENSE).
+
+**Please use it responsibly.** Telepathy is an educational project for learning and demonstrating applied cryptography and secure system design — it has not undergone a professional, independent security audit. Do not rely on it to protect communications where real safety, legal, or financial consequences depend on its correctness, and do not use it for any unlawful purpose.
