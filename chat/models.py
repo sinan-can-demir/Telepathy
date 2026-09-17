@@ -71,6 +71,16 @@ class Message(models.Model):
     aes_tag = models.TextField(null=True, blank=True)
     signature = models.TextField(null=True, blank=True)
 
+    # Transcript tamper-evidence: seq is assigned atomically per chat
+    # (SendMessageView, under a row lock) so gaps/duplicates are impossible
+    # at the DB level, and prev_hash is the client's claim about the hash of
+    # the message immediately before this one (see chat/chain.py). Neither
+    # field is trusted on its own -- it's the client-side verification walk
+    # in chatbox.html, recomputing the chain from what's stored, that
+    # actually catches a dropped/reordered/replayed message.
+    seq = models.PositiveIntegerField(default=0)
+    prev_hash = models.CharField(max_length=64, default="0" * 64)
+
     timestamp = models.DateTimeField(
         auto_now_add=True,
         db_index=True,
@@ -83,6 +93,7 @@ class Message(models.Model):
                 name='msg_chat_time_idx'
             ),
         ]
+        unique_together = [("chat", "seq")]
 
     def __str__(self):
         return f"From {self.sender} at {self.timestamp}"

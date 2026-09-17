@@ -116,6 +116,12 @@
 
         .error-message{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);color:var(--red);padding:0.6rem 0.9rem;border-radius:10px;margin:0.5rem;text-align:center;font-size:0.82rem}
 
+        /* ── Transcript tamper-evidence ── */
+        .transcript-fingerprint{font-family:'JetBrains Mono',monospace;font-size:0.68rem;color:var(--text-muted);cursor:help}
+        .transcript-warning{display:none;background:rgba(249,115,22,0.1);border-bottom:1px solid rgba(249,115,22,0.25);
+            color:var(--orange);padding:0.5rem 1.25rem;font-size:0.78rem;text-align:center;flex-shrink:0}
+        .transcript-warning.show{display:block}
+
         @media(max-width:500px){.msg-bubble{max-width:85%}}
     </style>
 </head>
@@ -139,7 +145,10 @@
         <div class="header-avatar">💬</div>
         <div class="header-info">
             <h2 id="partner-name">…</h2>
-            <p><span class="status-dot"></span> E2E Encrypted</p>
+            <p><span class="status-dot"></span> E2E Encrypted &nbsp;·&nbsp;
+                <span class="transcript-fingerprint" id="transcript-fingerprint"
+                    title="Hash of the last message in this chat's transcript. Compare it out loud with the other participant(s) to catch a server showing you two different histories.">fingerprint: ----</span>
+            </p>
         </div>
     </div>
     <div class="header-actions">
@@ -147,6 +156,8 @@
         <button class="header-btn danger" id="leave-chat">Leave</button>
     </div>
 </header>
+
+<div class="transcript-warning" id="transcriptWarning">⚠ This chat's history may be incomplete or tampered with — a message link in the transcript chain doesn't match.</div>
 
 <!-- Chat -->
 <div class="chat-main" id="chatMain" style="display:none">
@@ -187,6 +198,31 @@
     function b642ab(b64) { const bin=atob(b64); const a=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) a[i]=bin.charCodeAt(i); return a.buffer; }
     function generateAESKey() { return crypto.getRandomValues(new Uint8Array(32)); }
 
+    // ── Transcript chain (tamper-evidence) ──────────────────────────────────
+    // Mirrors chat/chain.py's compute_chain_hash exactly -- every message is
+    // bound to the one before it, so a server that drops, reorders, or
+    // replays a message breaks a link any client can independently check,
+    // without needing to trust the server's word for the transcript.
+    const GENESIS_HASH = '0'.repeat(64);
+
+    async function sha256Hex(str) {
+        const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function computeChainHash(msg) {
+        const parts = [msg.prev_hash, String(msg.seq), String(msg.sender_id),
+            msg.encrypted_text, msg.aes_nonce || '', msg.aes_tag || '', msg.signature || ''];
+        return sha256Hex(parts.join('|'));
+    }
+
+    // What actually gets RSA-PSS signed/verified: binding seq+prev_hash+chat_id
+    // into the signature means a message can't be replayed at a different
+    // position in the chain -- its signature simply won't match there anymore.
+    function signedPayloadBytes(seq, prevHash, cid, plaintext) {
+        return new TextEncoder().encode(`${seq}|${prevHash}|${cid}|${plaintext}`);
+    }
+
     async function encryptWithAES(key, plaintext) {
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const ck = await crypto.subtle.importKey('raw',key,{name:'AES-GCM'},false,['encrypt']);
@@ -220,6 +256,35 @@
     let pollInterval=null;
     const renderedIds = new Set(); // track rendered message IDs to avoid duplicates
     const signVerifyKeyCache = new Map(); // PEM string -> imported RSA-PSS verify CryptoKey
+
+    // Chain tip state, recomputed from scratch on every fetch (chats here
+    // are small/short-lived, so re-verifying the whole chain each time is
+    // simpler than caching trust across page reloads). chainTipHash/Seq are
+    // what the next send is built against; chainBroken drives the banner.
+    let chainTipHash = GENESIS_HASH, chainTipSeq = -1, chainBroken = false;
+    const transcriptWarningEl = document.getElementById('transcriptWarning');
+    const transcriptFingerprintEl = document.getElementById('transcript-fingerprint');
+
+    async function updateChainState(msgs){
+        const sorted = [...(msgs||[])].sort((a,b)=>a.seq-b.seq);
+        let expectedSeq = 0, expectedPrev = GENESIS_HASH, broken = false;
+        for(const m of sorted){
+            if(m.seq !== expectedSeq || m.prev_hash !== expectedPrev){ broken = true; break; }
+            expectedPrev = await computeChainHash(m);
+            expectedSeq += 1;
+        }
+        // Whether or not the full chain verified from the start, always trust
+        // the tail of what was actually served as the basis for the next
+        // send -- the server's own prev_hash check on /send-message/ is what
+        // ultimately catches a genuinely wrong tip (409), and re-fetching
+        // there recovers the true state.
+        const last = sorted[sorted.length-1];
+        chainTipHash = last ? await computeChainHash(last) : GENESIS_HASH;
+        chainTipSeq = last ? last.seq : -1;
+        chainBroken = broken;
+        transcriptWarningEl.classList.toggle('show', chainBroken);
+        transcriptFingerprintEl.textContent = 'fingerprint: ' + chainTipHash.slice(0,4)+'-'+chainTipHash.slice(4,8);
+    }
 
     async function getVerifyKey(pem){
         if(!pem) return null;
@@ -447,6 +512,7 @@
                 chatHeader.style.display='flex';
                 chatMain.style.display='flex';
                 updateHeader(data);
+                await updateChainState(data.messages);
                 await appendNewMessages(data.messages);
                 clearInterval(pollInterval);
                 pollInterval=setInterval(fetchNewMessages,2000);
@@ -462,6 +528,7 @@
             if(!r.ok){if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/chat/usermenu/';}return;}
             const data=await r.json();
             updateHeader(data);
+            await updateChainState(data.messages);
             await appendNewMessages(data.messages);
         }catch(e){console.error('fetchNewMessages:',e);}
     }
@@ -506,7 +573,10 @@
                 cryptoSteps.push({label:'RSA-PSS signature verify', ok:null});
                 try{
                     const senderSignKey = await getVerifyKey(msg.sender_signing_public_key);
-                    const v = await crypto.subtle.verify({name:'RSA-PSS',saltLength:32},senderSignKey,b642ab(msg.signature),new TextEncoder().encode(text));
+                    const v = await crypto.subtle.verify(
+                        {name:'RSA-PSS',saltLength:32}, senderSignKey, b642ab(msg.signature),
+                        signedPayloadBytes(msg.seq, msg.prev_hash, chatId, text)
+                    );
                     cryptoSteps[2].ok = v;
                 }catch(e){cryptoSteps[2].ok=false;}
             } else if(isMine){
@@ -602,13 +672,18 @@
             completeSendStep(2);
 
             advanceSendStep(3);
-            const sig=await crypto.subtle.sign({name:'RSA-PSS',saltLength:32},mySignKeys.privateKey,new TextEncoder().encode(plaintext));
+            const predictedSeq = chainTipSeq + 1;
+            const prevHash = chainTipHash;
+            const sig=await crypto.subtle.sign(
+                {name:'RSA-PSS',saltLength:32}, mySignKeys.privateKey,
+                signedPayloadBytes(predictedSeq, prevHash, chatId, plaintext)
+            );
             completeSendStep(3);
 
             advanceSendStep(4);
             const resp=await fetch(`/chat/send-message/${chatId}/`,{
                 method:'POST',headers:authHeaders({'Content-Type':'application/json'}),
-                body:JSON.stringify({encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,signature:ab2b64(sig)})
+                body:JSON.stringify({encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,signature:ab2b64(sig),prev_hash:prevHash})
             });
             completeSendStep(4,resp.ok);
 
@@ -616,6 +691,12 @@
                 messageInput.value='';
                 closeSendModal(true);
                 await fetchNewMessages();
+            } else if(resp.status===409){
+                // Someone else's message landed first -- refresh our view of
+                // the chain tip and ask the user to resend against it,
+                // rather than silently resigning/resubmitting on their behalf.
+                await fetchNewMessages();
+                closeSendModal(false,'Chat updated by someone else -- press Send again.');
             } else {
                 const err=await resp.json().catch(()=>({}));
                 closeSendModal(false,'Send failed: '+(err.message||resp.statusText));

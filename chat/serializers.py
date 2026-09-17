@@ -22,6 +22,8 @@ class MessageSerializer(serializers.ModelSerializer):
             "aes_nonce",
             "aes_tag",
             "signature",
+            "seq",
+            "prev_hash",
             "timestamp",
             "sender_id",
             "sender_public_key",

@@ -7,6 +7,7 @@ from rest_framework import status
 from chat.views import failed_join_attempts
 from chat.models import Chat, ChatParticipant, Message, MessageKey
 from chat.auth import hash_token
+from chat.chain import GENESIS_HASH, compute_chain_hash
 
 
 def _fake_public_key_pem():
@@ -176,11 +177,12 @@ class MessageRoundTripTests(TestCase):
         self.bob_id = join.data["participant_id"]
         self.bob.credentials(HTTP_AUTHORIZATION=f"Token {self.bob_token}")
 
-    def _send(self, client, key_for_alice="key-a", key_for_bob="key-b"):
+    def _send(self, client, key_for_alice="key-a", key_for_bob="key-b", prev_hash=GENESIS_HASH):
         return client.post(
             f"/chat/send-message/{self.chat_id}/",
             {
                 "encrypted_text": "ciphertext", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "prev_hash": prev_hash,
                 "wrapped_keys": [
                     {"recipient_id": self.alice_id, "encrypted_symmetric_key": key_for_alice},
                     {"recipient_id": self.bob_id, "encrypted_symmetric_key": key_for_bob},
@@ -268,6 +270,7 @@ class GroupChatFeatureTests(TestCase):
             f"/chat/send-message/{self.chat_id}/",
             {
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "prev_hash": GENESIS_HASH,
                 "wrapped_keys": [
                     {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"},
                     {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-b"},
@@ -303,3 +306,92 @@ class GroupChatFeatureTests(TestCase):
         pair_view = pair_client.get(f"/chat/get-messages/{pair.data['chat_id']}/")
         self.assertFalse(pair_view.data["is_group"])
         self.assertEqual([o["display_name"] for o in pair_view.data["others"]], ["erin"])
+
+
+class TranscriptChainTests(TestCase):
+    """Coverage for the transcript-tamper-evidence chain: seq/prev_hash are
+    assigned atomically per chat and every send must reference the real
+    current tip, so a client can independently detect a dropped, reordered,
+    or replayed message rather than trusting GetMessagesView at face value."""
+
+    def setUp(self):
+        failed_join_attempts.clear()
+        self.alice = APIClient()
+        self.bob = APIClient()
+        create = _create_chat(self.alice, display_name="alice")
+        self.chat_id = create.data["chat_id"]
+        self.alice_id = create.data["participant_id"]
+        self.alice.credentials(HTTP_AUTHORIZATION=f"Token {create.data['participant_token']}")
+
+        join = _join_chat(self.bob, self.chat_id, display_name="bob")
+        self.bob_id = join.data["participant_id"]
+        self.bob.credentials(HTTP_AUTHORIZATION=f"Token {join.data['participant_token']}")
+
+    def _send(self, client, prev_hash, text="ct"):
+        return client.post(
+            f"/chat/send-message/{self.chat_id}/",
+            {
+                "encrypted_text": text, "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "prev_hash": prev_hash,
+                "wrapped_keys": [
+                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"},
+                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-b"},
+                ],
+            },
+            format="json",
+        )
+
+    def test_first_message_requires_genesis_hash(self):
+        wrong = self._send(self.alice, prev_hash="not-the-genesis-hash")
+        self.assertEqual(wrong.status_code, 409)
+        self.assertEqual(wrong.data["expected_prev_hash"], GENESIS_HASH)
+
+        ok = self._send(self.alice, prev_hash=GENESIS_HASH)
+        self.assertEqual(ok.status_code, 201, ok.data)
+        self.assertEqual(ok.data["seq"], 0)
+        self.assertEqual(ok.data["prev_hash"], GENESIS_HASH)
+
+    def test_send_missing_prev_hash_is_rejected(self):
+        response = self.alice.post(
+            f"/chat/send-message/{self.chat_id}/",
+            {
+                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "wrapped_keys": [
+                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"},
+                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-b"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_chain_advances_and_stale_prev_hash_is_rejected(self):
+        first = self._send(self.alice, prev_hash=GENESIS_HASH)
+        self.assertEqual(first.status_code, 201, first.data)
+        first_msg = Message.objects.get(pk=first.data["id"])
+        real_tip_hash = compute_chain_hash(first_msg)
+
+        # Resending against the now-stale genesis hash is rejected, and the
+        # server tells the client what the real current tip actually is.
+        stale = self._send(self.bob, prev_hash=GENESIS_HASH, text="stale")
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.data["expected_prev_hash"], real_tip_hash)
+
+        second = self._send(self.bob, prev_hash=real_tip_hash, text="second")
+        self.assertEqual(second.status_code, 201, second.data)
+        self.assertEqual(second.data["seq"], 1)
+        self.assertEqual(second.data["prev_hash"], real_tip_hash)
+
+        # The chain is independently verifiable end to end from what's stored.
+        second_msg = Message.objects.get(pk=second.data["id"])
+        self.assertEqual(second_msg.prev_hash, compute_chain_hash(first_msg))
+
+    def test_seq_is_unique_per_chat_even_across_senders(self):
+        first = self._send(self.alice, prev_hash=GENESIS_HASH)
+        tip_hash = compute_chain_hash(Message.objects.get(pk=first.data["id"]))
+        second = self._send(self.bob, prev_hash=tip_hash, text="from bob")
+        self.assertEqual([first.data["seq"], second.data["seq"]], [0, 1])
+        self.assertEqual(
+            list(Message.objects.filter(chat__pin=self.chat_id).order_by("seq").values_list("seq", flat=True)),
+            [0, 1],
+        )
