@@ -69,23 +69,10 @@ def user_menu(request):
 
 # Chatbox Page View - renders chatbox.html
 def chatbox(request):
-    chat_id = request.session.get("chat_id")
-
-    try:
-        chat = Chat.objects.get(pin=chat_id)
-    except Chat.DoesNotExist:
-        return redirect("/chat/usermenu/")
-    participants = list(
-        chat.participants.filter(left_at__isnull=True)
-        .order_by("joined_at")
-        .values_list("display_name", flat=True)
-    )
-
-    context = {
-        "chat_id": chat_id,
-        "participants": participants,
-    }
-    return render(request, "chatbox.html", context)
+    # No server-side session state here -- chatbox.html drives everything
+    # itself client-side (create/join via ?action= query params, chat_id
+    # and the bearer token kept in localStorage). Just render the shell.
+    return render(request, "chatbox.html")
 
 
 class CreateChatView(APIView):

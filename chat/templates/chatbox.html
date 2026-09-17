@@ -302,10 +302,10 @@
     function closeSendModal(success, msg) {
         if(success){
             sendResult.className='send-result success'; sendResult.textContent=msg||'Message sent securely!';
-            setTimeout(()=>sendModal.classList.remove('show'),5000);
+            setTimeout(()=>sendModal.classList.remove('show'),1500);
         } else {
             sendResult.className='send-result error'; sendResult.textContent=msg||'Failed to send.';
-            setTimeout(()=>sendModal.classList.remove('show'),5000);
+            setTimeout(()=>sendModal.classList.remove('show'),1500);
         }
     }
 
