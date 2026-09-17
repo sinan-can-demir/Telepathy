@@ -198,11 +198,58 @@
 (async function() {
     // ── Per-chat ("burner") key storage ─────────────────────────────────────
     // Keys are generated fresh for every chat a browser creates/joins, never
-    // reused across chats, and deleted from localStorage the moment the chat
-    // is left -- there is no persistent account-level identity anymore.
+    // reused across chats, and deleted the moment the chat is left -- there
+    // is no persistent account-level identity anymore.
     const privKeyName = cid => `priv_${cid}`, pubKeyName = cid => `pub_${cid}`;
     const signPrivKeyName = cid => `sign_priv_${cid}`, signPubKeyName = cid => `sign_pub_${cid}`;
     const tokenName = cid => `participant_token_${cid}`, participantIdName = cid => `participant_id_${cid}`;
+
+    // ── Private-key/token storage (IndexedDB) ───────────────────────────────
+    // Private keys are generated non-extractable (see generateFreshKeys) and
+    // stored here as live CryptoKey objects, never as exportable PEM strings
+    // -- IndexedDB natively supports structured-clone storage of CryptoKey,
+    // and a non-extractable key's raw bytes can never be read out via
+    // exportKey(), by any JS on the page, including an XSS payload. The
+    // bearer token lives here too -- not because it gets the same
+    // non-extractable guarantee (it's just a string), but to keep it off
+    // the more commonly/opportunistically scraped localStorage. See
+    // docs/CLIENT_KEY_STORAGE.md.
+    const KEYSTORE_DB = 'telepathy_keystore', KEYSTORE_STORE = 'keys';
+
+    function openKeystore(){
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(KEYSTORE_DB, 1);
+            req.onupgradeneeded = () => { req.result.createObjectStore(KEYSTORE_STORE); };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+    async function idbSet(key, value){
+        const db = await openKeystore();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(KEYSTORE_STORE, 'readwrite');
+            tx.objectStore(KEYSTORE_STORE).put(value, key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+    }
+    async function idbGet(key){
+        const db = await openKeystore();
+        return new Promise((resolve, reject) => {
+            const req = db.transaction(KEYSTORE_STORE, 'readonly').objectStore(KEYSTORE_STORE).get(key);
+            req.onsuccess = () => resolve(req.result ?? null);
+            req.onerror = () => reject(req.error);
+        });
+    }
+    async function idbDelete(key){
+        const db = await openKeystore();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(KEYSTORE_STORE, 'readwrite');
+            tx.objectStore(KEYSTORE_STORE).delete(key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+    }
 
     // ── TOFU key pinning ─────────────────────────────────────────────────────
     // Pins the raw PEM of every other participant's keys the first time this
@@ -401,8 +448,6 @@
         return crypto.subtle.importKey(format,der,{name:algo,hash:'SHA-256'},true,usages);
     }
     const importPubEnc=p=>importKey(p,'spki','RSA-OAEP',['encrypt']);
-    const importPrivDec=p=>importKey(p,'pkcs8','RSA-OAEP',['decrypt']);
-    const importPrivSign=p=>importKey(p,'pkcs8','RSA-PSS',['sign']);
     const importPubVer=p=>importKey(p,'spki','RSA-PSS',['verify']);
 
     // ── State ───────────────────────────────────────────────────────────────
@@ -630,42 +675,48 @@
     }
 
     // ── Key generation / restoration ────────────────────────────────────────
+    // Both keypairs are generated non-extractable (the `false` 2nd arg) --
+    // per the WebCrypto spec, this only applies to the private half; the
+    // public half stays extractable regardless, since it isn't secret. So
+    // exportKey('spki', ...publicKey) below keeps working unchanged, while
+    // the private keys become CryptoKey objects whose raw bytes can never
+    // be exported by any JS, ever. See docs/CLIENT_KEY_STORAGE.md.
     async function generateFreshKeys(){
-        const enc=await crypto.subtle.generateKey({name:'RSA-OAEP',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['encrypt','decrypt']);
-        const sign=await crypto.subtle.generateKey({name:'RSA-PSS',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},true,['sign','verify']);
+        const enc=await crypto.subtle.generateKey({name:'RSA-OAEP',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},false,['encrypt','decrypt']);
+        const sign=await crypto.subtle.generateKey({name:'RSA-PSS',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},false,['sign','verify']);
         myEncKeys={privateKey:enc.privateKey,publicKey:enc.publicKey};
         mySignKeys={privateKey:sign.privateKey,publicKey:sign.publicKey};
         return {
-            privPem: derToPem(await crypto.subtle.exportKey('pkcs8',enc.privateKey),'PRIVATE KEY'),
+            privKey: enc.privateKey,
             pubPem: derToPem(await crypto.subtle.exportKey('spki',enc.publicKey),'PUBLIC KEY'),
-            signPrivPem: derToPem(await crypto.subtle.exportKey('pkcs8',sign.privateKey),'PRIVATE KEY'),
+            signPrivKey: sign.privateKey,
             signPubPem: derToPem(await crypto.subtle.exportKey('spki',sign.publicKey),'PUBLIC KEY'),
         };
     }
 
-    function persistKeys(cid, keys){
-        localStorage.setItem(privKeyName(cid), keys.privPem);
+    async function persistKeys(cid, keys){
         localStorage.setItem(pubKeyName(cid), keys.pubPem);
-        localStorage.setItem(signPrivKeyName(cid), keys.signPrivPem);
         localStorage.setItem(signPubKeyName(cid), keys.signPubPem);
+        await idbSet(privKeyName(cid), keys.privKey);
+        await idbSet(signPrivKeyName(cid), keys.signPrivKey);
     }
 
     async function restoreKeys(cid){
-        const p=localStorage.getItem(privKeyName(cid)), u=localStorage.getItem(pubKeyName(cid));
-        const sp=localStorage.getItem(signPrivKeyName(cid)), su=localStorage.getItem(signPubKeyName(cid));
-        if(!p||!u||!sp||!su) return false;
-        myEncKeys={privateKey:await importPrivDec(p),publicKey:await importPubEnc(u)};
-        mySignKeys={privateKey:await importPrivSign(sp),publicKey:await importPubVer(su)};
+        const u=localStorage.getItem(pubKeyName(cid)), su=localStorage.getItem(signPubKeyName(cid));
+        const privKey=await idbGet(privKeyName(cid)), signPrivKey=await idbGet(signPrivKeyName(cid));
+        if(!u||!su||!privKey||!signPrivKey) return false;
+        myEncKeys={privateKey:privKey,publicKey:await importPubEnc(u)};
+        mySignKeys={privateKey:signPrivKey,publicKey:await importPubVer(su)};
         return true;
     }
 
-    function destroyKeys(cid){
-        localStorage.removeItem(privKeyName(cid));
+    async function destroyKeys(cid){
         localStorage.removeItem(pubKeyName(cid));
-        localStorage.removeItem(signPrivKeyName(cid));
         localStorage.removeItem(signPubKeyName(cid));
-        localStorage.removeItem(tokenName(cid));
         localStorage.removeItem(participantIdName(cid));
+        await idbDelete(privKeyName(cid));
+        await idbDelete(signPrivKeyName(cid));
+        await idbDelete(tokenName(cid));
         destroyChainState(cid);
         destroyPinnedKeys(cid);
     }
@@ -692,7 +743,7 @@
         const displayName = params.get('display_name') || '';
 
         if(chatId){
-            token = localStorage.getItem(tokenName(chatId));
+            token = await idbGet(tokenName(chatId));
             myParticipantId = localStorage.getItem(participantIdName(chatId));
             if(token && await restoreKeys(chatId)) return true;
         }
@@ -727,9 +778,9 @@
         myParticipantId = String(data.participant_id);
 
         localStorage.setItem('chat_id', chatId);
-        localStorage.setItem(tokenName(chatId), token);
         localStorage.setItem(participantIdName(chatId), myParticipantId);
-        persistKeys(chatId, keys);
+        await idbSet(tokenName(chatId), token);
+        await persistKeys(chatId, keys);
         window.history.replaceState({}, '', '/chat/chatbox/');
         return true;
     }
@@ -1059,7 +1110,7 @@
     // ── Leave chat ──────────────────────────────────────────────────────────
     async function leaveChat(){
         try{await fetch('/chat/leave-chat/',{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body:JSON.stringify({chat_id:chatId})});}catch(e){}
-        destroyKeys(chatId);
+        await destroyKeys(chatId);
         localStorage.removeItem('chat_id');
         clearInterval(pollInterval);
         closeRealtime();
