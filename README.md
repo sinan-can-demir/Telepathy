@@ -18,12 +18,14 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 | Feature | Description |
 |---|---|
 | 🔑 **Per-Chat "Burner" Keys** | A fresh RSA-2048 key pair (encryption + signing) is generated in the browser for every chat created or joined; private keys never leave the client and are deleted the moment the chat is left |
-| 🔒 **Hybrid Encryption** | AES-256-GCM encrypts the message body; RSA-OAEP wraps the AES key for every participant |
-| ✍️ **Digital Signatures** | Every message is signed with RSA-PSS — the receiver sees a clickable ✓ Verified badge with full crypto details |
+| 🔒 **Hybrid Encryption** | AES-256-GCM encrypts the message body; the AES key comes from a forward-secret sending-chain ratchet, not a static wrap — see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md) |
+| ⏩ **Forward Secrecy** | Each sender's messages are keyed from a one-way HMAC-SHA256 chain (Signal "Sender Key"-style); stealing current key material can't unlock messages sent before that point |
+| ✍️ **Digital Signatures** | Every message is signed with RSA-PSS (binding its position in the transcript chain too) — the receiver sees a clickable ✓ Verified badge with full crypto details |
+| 🔗 **Transcript Tamper-Evidence** | Messages are hash-chained; a dropped, reordered, or replayed message breaks a verifiable link instead of being silently trusted |
 | 📊 **Send Progress Modal** | An animated progress bar shows each encryption operation in real-time when sending a message |
 | 💾 **Encrypted-at-Rest** | Only ciphertext is stored in the database — decryption happens exclusively in the browser |
 | 🚫 **No Accounts** | No registration, no password, no persistent identity — a bearer token scoped to one chat is the only credential. See [docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md) for why |
-| 📌 **PIN-Based Chat Rooms** | Create or join a room using a 4-digit PIN — nothing else required |
+| 📌 **PIN-Based Chat Rooms** | Create or join a room using a 4-digit PIN, freed for reuse once the chat ends |
 | 🚫 **Ephemeral History** | Message history is automatically deleted once every participant has left a chat |
 | 🎨 **Premium UI** | Dark glassmorphism theme with animated gradients, floating particles, and smooth transitions |
 
@@ -34,7 +36,8 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 ```
 Telepathy/
 ├── chat/                       # Main Django application
-│   ├── models.py               # User (admin-only), Chat, ChatParticipant, Message, MessageKey
+│   ├── models.py               # User (admin-only), Chat, ChatParticipant, Message, MessageKey, ChainKey, ChainKeyWrap
+│   ├── chain.py                 # Transcript hash-chain helper (compute_chain_hash)
 │   ├── views.py                # REST API views (create/join chat, send/get messages, etc.)
 │   ├── auth.py                 # ParticipantTokenAuthentication -- see docs/ACCOUNTLESS_IDENTITY.md
 │   ├── serializers.py          # DRF serializer for Message
@@ -57,20 +60,26 @@ Telepathy/
 ```
 SENDER (Browser A)                          SERVER                    RECEIVER (Browser B)
 ──────────────────                          ──────                    ────────────────────
-1. Generate random AES-256 key
+1. Advance own sending-chain ratchet
+   (HMAC-SHA256) to get this
+   message's forward-secret key
 2. Encrypt message with AES-GCM
-3. Wrap AES key with Receiver's            Stores ONLY:
-   RSA-OAEP public key              ───►   • AES-GCM ciphertext
-4. Wrap AES key with own                    • Wrapped keys (2x)
-   RSA-OAEP public key                     • Nonce, tag, signature
-5. Sign plaintext with RSA-PSS
-6. POST all fields to API
-                                                                     7. GET encrypted messages
-                                                                     8. Unwrap AES key (RSA-OAEP)
-                                                                     9. Decrypt message (AES-GCM)
-                                                                    10. Verify signature (RSA-PSS)
-                                                                    11. Display ✓ Verified badge
+3. Wrap that key with own                  Stores ONLY:
+   RSA-OAEP public key (self-copy)  ───►   • AES-GCM ciphertext
+4. Sign seq|prev_hash|chat_id|plaintext     • Self-wrapped key, seq, prev_hash
+   with RSA-PSS                            • Nonce, tag, signature
+5. POST all fields to API
+                                                                     6. GET encrypted messages
+                                                                     7. Derive same key by advancing
+                                                                        own cached copy of sender's
+                                                                        chain (seeded once via
+                                                                        /issue-chain-key/, RSA-OAEP)
+                                                                     8. Decrypt message (AES-GCM)
+                                                                     9. Verify signature (RSA-PSS)
+                                                                    10. Display ✓ Verified badge
 ```
+
+See [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md) for why the AES key comes from a ratchet instead of a fresh random key wrapped per recipient.
 
 ---
 
@@ -80,7 +89,7 @@ SENDER (Browser A)                          SERVER                    RECEIVER (
 |-------|------------|
 | **Backend** | Django 5.1, Django REST Framework |
 | **Database** | PostgreSQL (UUID-indexed messages) |
-| **Client Crypto** | Web Crypto API (RSA-OAEP, RSA-PSS, AES-256-GCM) |
+| **Client Crypto** | Web Crypto API (RSA-OAEP, RSA-PSS, AES-256-GCM, HMAC-SHA256 sending-chain ratchet) |
 | **Server Crypto** | `cryptography` library (PEM key validation) |
 | **Frontend** | Vanilla HTML/CSS/JS with glassmorphism design system |
 
@@ -171,17 +180,17 @@ Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your browser.
 2. **Browser B** → `http://127.0.0.1:8000/chat/` → **Join Chat** → enter the PIN (and optionally a display name)
 3. Both browsers show "Waiting for partner…" briefly, then the chat opens
 4. **Send a message** — a progress modal appears showing each encryption step in real-time:
-   - Generating AES-256 session key
+   - Deriving forward-secret session key (ratchet)
    - Encrypting message (AES-256-GCM)
-   - Wrapping key for each participant (RSA-OAEP)
+   - Wrapping key for yourself (RSA-OAEP)
    - Signing message (RSA-PSS)
    - Sending encrypted payload
-5. **Receiver** sees the message with a **✓ Verified** badge — click it to see the individual crypto verification steps (key unwrap, decrypt, signature verify)
+5. **Receiver** sees the message with a **✓ Verified** badge — click it to see the individual crypto verification steps (chain ratchet, decrypt, signature verify)
 6. **Leave** the chat from either side to end it. If everyone leaves, message history is deleted; each browser's per-chat keys are deleted from that browser's `localStorage` on leave, regardless.
 
 ### Group chats (3–8 people)
 
-Instead of **Create Chat**, use **Create Group** on the same landing page: pick a participant limit (2–8) and share the resulting PIN with everyone who should join. Every additional browser/device joins the same way as a 1:1 chat — **Join Chat** with the PIN. Each message is individually key-wrapped (RSA-OAEP) for every current participant, so a new joiner can't decrypt messages sent before they joined, and a participant who leaves can no longer decrypt anything sent afterward.
+Instead of **Create Chat**, use **Create Group** on the same landing page: pick a participant limit (2–8) and share the resulting PIN with everyone who should join. Every additional browser/device joins the same way as a 1:1 chat — **Join Chat** with the PIN. Each sender's messages are keyed from their own forward-secret ratchet (see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md)), seeded fresh and re-fanned-out to the current roster on every membership change, so a new joiner can't decrypt messages sent before they joined, and a participant who leaves can no longer decrypt anything sent afterward.
 
 ---
 
@@ -195,9 +204,12 @@ All "Participant Token" endpoints authenticate via `Authorization: Token <partic
 | `POST` | `/chat/create-chat/` | Create a chat; generates keys client-side first. Returns a 4-digit PIN + participant token | None |
 | `POST` | `/chat/join-chat/` | Join an existing chat by PIN; returns a participant token | None |
 | `GET` | `/chat/check-chat/<chat_id>/` | Verify chat room exists and list participants | None |
+| `GET` | `/chat/get-chat-participants/<chat_id>/` | List active participants' ids/display names/public keys | Participant Token |
+| `POST` | `/chat/issue-chain-key/<chat_id>/` | Issue a new forward-secrecy chain epoch, wrapped per current other participant | Participant Token |
+| `GET` | `/chat/get-chain-keys/<chat_id>/` | Fetch the latest chain-key epoch issued to you by each sender | Participant Token |
 | `POST` | `/chat/send-message/<chat_id>/` | Send an encrypted message | Participant Token |
-| `GET` | `/chat/get-messages/<chat_id>/` | Retrieve encrypted messages (includes partner's public keys) | Participant Token |
-| `POST` | `/chat/leave-chat/` | Leave chat (deletes message history once fully empty) | Participant Token |
+| `GET` | `/chat/get-messages/<chat_id>/` | Retrieve encrypted messages | Participant Token |
+| `POST` | `/chat/leave-chat/` | Leave chat (deletes chat + history once fully empty, freeing its PIN) | Participant Token |
 
 ---
 
@@ -232,16 +244,29 @@ A participant's entire identity for exactly one chat — see [docs/ACCOUNTLESS_I
 | `sender` | `FK(ChatParticipant)` | Who sent it |
 | `encrypted_text` | `TextField` | AES-GCM ciphertext (Base64) |
 | `aes_nonce` / `aes_tag` | `TextField` | AES-GCM IV and authentication tag |
-| `signature` | `TextField` | RSA-PSS digital signature (Base64) |
+| `signature` | `TextField` | RSA-PSS digital signature (Base64), covering `seq\|prev_hash\|chat_id\|plaintext` |
+| `seq` / `prev_hash` | `PositiveIntegerField` / `CharField` | Position in the chat's tamper-evident hash chain (see `chat/chain.py`) |
+| `sender_chain_epoch` | `PositiveIntegerField` | Which epoch of the sender's forward-secret ratchet this message's key came from (see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md)) |
 
 ### `MessageKey`
-One row per participant who can read a given message (its AES key wrapped with that participant's public key) — this is what lets a message be readable by every active chat participant instead of exactly two hardcoded parties.
+As of forward secrecy, only ever holds the **sender's own** self-wrapped copy of a message's AES key (so they can always redisplay their own sent history). Other participants derive the key locally from their cached copy of the sender's chain instead of unwrapping a per-message key — see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `message` | `FK(Message)` | The message this key unlocks |
-| `recipient` | `FK(ChatParticipant)` | Who this wrapped key is for |
-| `encrypted_symmetric_key` | `TextField` | The message's AES key, wrapped with `recipient`'s RSA-OAEP public key |
+| `recipient` | `FK(ChatParticipant)` | The sender themself |
+| `encrypted_symmetric_key` | `TextField` | The message's AES key, wrapped with the sender's own RSA-OAEP public key |
+
+### `ChainKey` / `ChainKeyWrap`
+One epoch of a participant's own sending-chain seed (`ChainKey`), fanned out RSA-OAEP-wrapped per other active participant (`ChainKeyWrap`). A participant issues a new epoch before their first send in a chat, and again whenever the roster has changed since they last did — see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ChainKey.sender` | `FK(ChatParticipant)` | Whose sending chain this epoch belongs to |
+| `ChainKey.epoch` | `PositiveIntegerField` | Increments each time this sender re-keys |
+| `ChainKeyWrap.chain_key` | `FK(ChainKey)` | Which epoch this wrap is for |
+| `ChainKeyWrap.recipient` | `FK(ChatParticipant)` | Who this wrapped seed is for |
+| `ChainKeyWrap.encrypted_seed` | `TextField` | The 32-byte chain seed, RSA-OAEP-wrapped (Base64) |
 
 ---
 
