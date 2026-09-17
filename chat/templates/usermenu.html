@@ -86,6 +86,30 @@
                 </div>
             </div>
 
+            <div class="action-card" id="group-toggle" onclick="toggleGroup()">
+                <div class="action-icon join" style="background:linear-gradient(135deg,var(--green),#16a34a)">👥</div>
+                <div class="action-info">
+                    <h3>Create Group</h3>
+                    <p>Create a room for more than two people</p>
+                </div>
+            </div>
+
+            <!-- Expandable group-size section -->
+            <div class="join-section" id="group-section">
+                <div class="pin-input-row">
+                    <label for="group-size" style="align-self:center;font-size:0.85rem;color:var(--text-dim)">Participants:</label>
+                    <select class="pin-input" id="group-size" style="font-size:1rem;letter-spacing:normal">
+                        <option value="3">3</option>
+                        <option value="4" selected>4</option>
+                        <option value="5">5</option>
+                        <option value="6">6</option>
+                        <option value="7">7</option>
+                        <option value="8">8</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" onclick="createGroupChat()">Create Group Chat</button>
+            </div>
+
             <div class="action-card" id="join-toggle" onclick="toggleJoin()">
                 <div class="action-icon join">🔗</div>
                 <div class="action-info">
@@ -124,6 +148,16 @@
     function createChat() {
         const name = encodeURIComponent(getDisplayName());
         window.location.href = `/chat/chatbox/?action=create&display_name=${name}`;
+    }
+
+    function toggleGroup() {
+        document.getElementById('group-section').classList.toggle('show');
+    }
+
+    function createGroupChat() {
+        const maxParticipants = document.getElementById('group-size').value;
+        const name = encodeURIComponent(getDisplayName());
+        window.location.href = `/chat/chatbox/?action=create&display_name=${name}&max_participants=${maxParticipants}`;
     }
 
     function joinChatByPin() {

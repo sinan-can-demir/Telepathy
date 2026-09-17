@@ -223,3 +223,83 @@ class MessageRoundTripTests(TestCase):
         self.assertEqual(leave2.status_code, 200)
         self.assertEqual(Message.objects.count(), 0)
         self.assertFalse(Chat.objects.get(pin=self.chat_id).is_active)
+
+
+class GroupChatFeatureTests(TestCase):
+    """Coverage for the group-chat generalization: the participants-roster
+    endpoint used to wrap a message's AES key for everyone, and the N-way
+    send/read round trip and response metadata for a >2-person chat."""
+
+    def setUp(self):
+        failed_join_attempts.clear()
+        self.alice = APIClient()
+        create = _create_chat(self.alice, display_name="alice", max_participants=3)
+        self.chat_id = create.data["chat_id"]
+        self.alice_id = create.data["participant_id"]
+        self.alice.credentials(HTTP_AUTHORIZATION=f"Token {create.data['participant_token']}")
+
+        self.bob = APIClient()
+        join_bob = _join_chat(self.bob, self.chat_id, display_name="bob")
+        self.bob_id = join_bob.data["participant_id"]
+        self.bob.credentials(HTTP_AUTHORIZATION=f"Token {join_bob.data['participant_token']}")
+
+        self.carol = APIClient()
+        join_carol = _join_chat(self.carol, self.chat_id, display_name="carol")
+        self.carol_id = join_carol.data["participant_id"]
+        self.carol.credentials(HTTP_AUTHORIZATION=f"Token {join_carol.data['participant_token']}")
+
+    def test_get_chat_participants_requires_active_membership(self):
+        outsider = _create_chat(APIClient(), display_name="mallory")
+        outsider_client = APIClient()
+        outsider_client.credentials(HTTP_AUTHORIZATION=f"Token {outsider.data['participant_token']}")
+        forbidden = outsider_client.get(f"/chat/get-chat-participants/{self.chat_id}/")
+        self.assertEqual(forbidden.status_code, 403)
+
+        ok = self.alice.get(f"/chat/get-chat-participants/{self.chat_id}/")
+        self.assertEqual(ok.status_code, 200)
+        ids = {p["id"] for p in ok.data["participants"]}
+        self.assertEqual(ids, {self.alice_id, self.bob_id, self.carol_id})
+        by_id = {p["id"]: p for p in ok.data["participants"]}
+        self.assertEqual(by_id[self.bob_id]["display_name"], "bob")
+        self.assertTrue(by_id[self.bob_id]["public_key"])
+
+    def test_send_message_with_group_wrapped_keys_creates_one_key_per_participant(self):
+        send = self.alice.post(
+            f"/chat/send-message/{self.chat_id}/",
+            {
+                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "wrapped_keys": [
+                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"},
+                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-b"},
+                    {"recipient_id": self.carol_id, "encrypted_symmetric_key": "key-c"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(send.status_code, 201, send.data)
+        self.assertEqual(Message.objects.count(), 1)
+        self.assertEqual(MessageKey.objects.count(), 3)
+
+        for client, expected_key in (
+            (self.alice, "key-a"), (self.bob, "key-b"), (self.carol, "key-c"),
+        ):
+            view = client.get(f"/chat/get-messages/{self.chat_id}/")
+            self.assertEqual(view.data["messages"][0]["my_encrypted_symmetric_key"], expected_key)
+
+    def test_get_messages_others_and_group_metadata(self):
+        view = self.alice.get(f"/chat/get-messages/{self.chat_id}/")
+        self.assertTrue(view.data["is_group"])
+        self.assertEqual(view.data["max_participants"], 3)
+        self.assertTrue(view.data["both_joined"])
+        self.assertEqual(
+            sorted(o["display_name"] for o in view.data["others"]), ["bob", "carol"]
+        )
+
+        # 1:1 chats stay is_group=False, with a single-entry others list.
+        pair = _create_chat(APIClient(), display_name="dave")
+        pair_client = APIClient()
+        pair_client.credentials(HTTP_AUTHORIZATION=f"Token {pair.data['participant_token']}")
+        _join_chat(APIClient(), pair.data["chat_id"], display_name="erin")
+        pair_view = pair_client.get(f"/chat/get-messages/{pair.data['chat_id']}/")
+        self.assertFalse(pair_view.data["is_group"])
+        self.assertEqual([o["display_name"] for o in pair_view.data["others"]], ["erin"])
