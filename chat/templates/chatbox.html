@@ -829,7 +829,11 @@
     function connectRealtime(){
         wsClosedByUs = false;
         const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${scheme}//${location.host}/ws/chat/${chatId}/?token=${encodeURIComponent(token)}`);
+        // The token travels as a Sec-WebSocket-Protocol value (the second
+        // arg here), not a URL query param -- see chat/consumers.py and
+        // issue #57. A URL ends up in access logs, proxy logs, and browser
+        // history; a request header field doesn't.
+        ws = new WebSocket(`${scheme}//${location.host}/ws/chat/${chatId}/`, [token]);
         ws.onmessage = (evt) => {
             let data; try{ data = JSON.parse(evt.data); }catch(e){ return; }
             if(data.type === 'new_message' || data.type === 'roster_changed') fetchNewMessages();
