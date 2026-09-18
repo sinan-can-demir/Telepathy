@@ -873,11 +873,27 @@
         return run;
     }
 
+    // The server telling us this participant/chat is gone (explicit leave,
+    // the chat emptying out and being deleted, or now idle-expiry, see
+    // issue #71) is the one place it's actually safe to wipe local ratchet/
+    // key/pin state -- unlike beforeunload, there's no ambiguity here about
+    // whether the user meant to end the session; the server already ended
+    // it. Previously this only redirected away and left all of that
+    // plaintext state sitting in localStorage/IndexedDB indefinitely.
+    async function handleSessionEnded(){
+        alert('Chat ended.');
+        clearInterval(pollInterval);
+        closeRealtime();
+        await destroyKeys(chatId);
+        localStorage.removeItem('chat_id');
+        window.location.href='/chat/usermenu/';
+    }
+
     async function checkChatReady(){
         try{
             const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:authHeaders()});
             if(r.status===204)return;
-            if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/chat/usermenu/';return;}
+            if(r.status===404||r.status===403){await handleSessionEnded();return;}
             if(!r.ok)return;
             const data=await r.json();
             if(data.both_joined){
@@ -902,7 +918,7 @@
     async function fetchNewMessages(){
         try{
             const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:authHeaders()});
-            if(!r.ok){if(r.status===404||r.status===403){alert('Chat ended.');clearInterval(pollInterval);window.location.href='/chat/usermenu/';}return;}
+            if(!r.ok){if(r.status===404||r.status===403){await handleSessionEnded();}return;}
             const data=await r.json();
             updateHeader(data);
             await refreshParticipantTrust();
@@ -1064,6 +1080,19 @@
         showSendModal();
 
         try{
+            // A broken transcript chain (dropped/reordered/replayed message)
+            // used to only flip the banner while sending happily continued
+            // on top of the server's own unverified reported tip -- the
+            // detection had no consequence (see issue #70). Block here too,
+            // same as the key-mismatch check below: refresh re-verifies the
+            // chain from scratch, so a transient/self-resolved case clears
+            // on its own, and a real break forces the user to notice before
+            // extending a transcript that already failed verification.
+            if(chainBroken){
+                closeSendModal(false, 'This chat\'s transcript failed verification -- refresh and review the warning above before sending.');
+                return;
+            }
+
             advanceSendStep(0);
             const recipients=await fetchRecipientKeys();
             renderKeyMismatchWarning();
@@ -1155,13 +1184,22 @@
         window.location.href='/chat/usermenu/';
     });
 
+    // There used to be a best-effort sendBeacon('/chat/leave-chat/') call
+    // here. It was removed (issue #71): sendBeacon can't carry the
+    // Authorization header the endpoint requires, so it was silently
+    // rejected by the server on every tab close -- not a working leave,
+    // just dead code that looked like one. It also couldn't safely be
+    // "fixed" by sending the token some other way, because beforeunload
+    // fires identically on a plain page refresh, which this app
+    // deliberately supports resuming from (see ensureParticipation) --
+    // making the call succeed would end the user's own session on every
+    // reload. The actual fix is server-side idle expiry (see
+    // chat.auth.authenticate_participant/IDLE_TIMEOUT): a closed tab stops
+    // re-authenticating entirely, so its token is reclaimed on its own
+    // without needing to guess intent from an unload event.
     window.addEventListener('beforeunload',function(){
         if(pollInterval)clearInterval(pollInterval);
         closeRealtime();
-        if(chatId&&token) navigator.sendBeacon('/chat/leave-chat/',new Blob([JSON.stringify({chat_id:chatId})],{type:'application/json'}));
-        // Note: sendBeacon can't carry our custom Authorization header, so a
-        // tab close leaves the participant token valid until the chat is
-        // explicitly left from the UI or the tab reconnects and leaves properly.
     });
 
     startChat();

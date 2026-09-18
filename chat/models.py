@@ -1,5 +1,6 @@
 from django.contrib.auth.models import AbstractUser
 from django.db import models
+from django.utils import timezone
 import uuid
 
 
@@ -46,6 +47,14 @@ class ChatParticipant(models.Model):
     auth_token_hash = models.CharField(max_length=64, unique=True, db_index=True)
     joined_at = models.DateTimeField(auto_now_add=True)
     left_at = models.DateTimeField(null=True, blank=True)
+    # Touched on every successful authentication (see auth.authenticate_participant).
+    # A tab that's actually closed stops re-authenticating entirely -- no
+    # beforeunload/sendBeacon hook can reliably tell a real close apart from
+    # a page refresh (which this app deliberately supports resuming from,
+    # see ensureParticipation in chatbox.html), so idle time is what lets a
+    # closed tab's token/key material eventually get reclaimed instead of
+    # staying valid forever. See issue #71.
+    last_seen = models.DateTimeField(default=timezone.now)
 
     def __str__(self):
         return f"{self.display_name} in {self.chat}"
