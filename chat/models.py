@@ -30,9 +30,14 @@ class Chat(models.Model):
 
 class ChatParticipant(models.Model):
     """A participant's entire identity for exactly one chat: a self-chosen
-    display name, this-chat-only encryption/signing keys, and a hashed
-    bearer token issued at creation/join time. Nothing here links back to
-    any other chat the same person may have joined."""
+    display name, a this-chat-only encryption key, and a hashed bearer token
+    issued at creation/join time. Nothing here links back to any other chat
+    the same person may have joined.
+
+    No signing key: per-message authentication is a MAC derived from the
+    forward-secrecy ratchet (see ChainKey, docs/FORWARD_SECRECY.md), not an
+    RSA-PSS signature -- deliberately deniable rather than provable to a
+    third party. See docs/DENIABLE_AUTH.md (issue #61)."""
     # DRF's IsAuthenticated permission checks request.user.is_authenticated;
     # that attribute only exists on django.contrib.auth's User/AnonymousUser
     # by convention, not on plain models, so it's shimmed here as a constant.
@@ -41,7 +46,6 @@ class ChatParticipant(models.Model):
     chat = models.ForeignKey(Chat, related_name="participants", on_delete=models.CASCADE)
     display_name = models.CharField(max_length=32)
     public_key = models.TextField()
-    signing_public_key = models.TextField(null=True, blank=True)
     # SHA-256 hex digest of the bearer token; the raw token is returned to the
     # client exactly once (at creation/join time) and never stored or logged.
     auth_token_hash = models.CharField(max_length=64, unique=True, db_index=True)
@@ -81,7 +85,12 @@ class Message(models.Model):
     encrypted_text = models.TextField()
     aes_nonce = models.TextField(null=True, blank=True)
     aes_tag = models.TextField(null=True, blank=True)
-    signature = models.TextField(null=True, blank=True)
+    # HMAC-SHA256 tag (Base64) over seq|prev_hash|chat_id|plaintext, keyed by
+    # a value derived from the sender's own ratchet -- verifiable by anyone
+    # who independently derives that same chain (i.e. the chat's other
+    # participants), but not provable to a third party the way an RSA-PSS
+    # signature would be. See docs/DENIABLE_AUTH.md (issue #61).
+    mac = models.TextField(null=True, blank=True)
 
     # Transcript tamper-evidence: seq is assigned atomically per chat
     # (SendMessageView, under a row lock) so gaps/duplicates are impossible

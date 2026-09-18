@@ -10,10 +10,10 @@ That's a real, unintended cost. Because `ChatParticipant.user` and `Message.send
 
 ## The design: possession of the PIN is the credential
 
-There is no registration step and no password anymore. Creating or joining a chat issues a **bearer token scoped to exactly one `ChatParticipant` row** — a free-standing identity that exists only for that one chat, holds its own encryption/signing keys (see below), and is discarded the moment its participant leaves. Nothing links one chat's participant to any other chat the same person may have joined, because nothing *is* shared between them: no username, no account row, no reused keypair.
+There is no registration step and no password anymore. Creating or joining a chat issues a **bearer token scoped to exactly one `ChatParticipant` row** — a free-standing identity that exists only for that one chat, holds its own encryption key (see below), and is discarded the moment its participant leaves. Nothing links one chat's participant to any other chat the same person may have joined, because nothing *is* shared between them: no username, no account row, no reused keypair.
 
 Concretely:
-- `ChatParticipant` gained `display_name`, `public_key`, `signing_public_key`, and `auth_token_hash` (a SHA-256 hash — the raw token is returned to the client exactly once, at creation/join time, and is never stored or logged server-side; this is already stronger than DRF's own default `authtoken.Token`, which stores tokens in plaintext).
+- `ChatParticipant` gained `display_name`, `public_key`, and `auth_token_hash` (a SHA-256 hash — the raw token is returned to the client exactly once, at creation/join time, and is never stored or logged server-side; this is already stronger than DRF's own default `authtoken.Token`, which stores tokens in plaintext). No signing key -- per-message authentication moved to a ratchet-derived MAC, see [docs/DENIABLE_AUTH.md](DENIABLE_AUTH.md).
 - `Message.sender` and `MessageKey.recipient` now point at `ChatParticipant`, not `User`.
 - `django.contrib.auth`'s `User` model still exists, but solely so Django's own admin/staff login keeps working. No end-user chat functionality touches it anymore.
 - A new `ParticipantTokenAuthentication` (`chat/auth.py`) resolves a bearer token straight to a `ChatParticipant`; a token stops authenticating the instant that participant's `left_at` is set.

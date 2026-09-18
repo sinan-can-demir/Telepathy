@@ -202,7 +202,6 @@
     // reused across chats, and deleted the moment the chat is left -- there
     // is no persistent account-level identity anymore.
     const privKeyName = cid => `priv_${cid}`, pubKeyName = cid => `pub_${cid}`;
-    const signPrivKeyName = cid => `sign_priv_${cid}`, signPubKeyName = cid => `sign_pub_${cid}`;
     const tokenName = cid => `participant_token_${cid}`, participantIdName = cid => `participant_id_${cid}`;
 
     // ── Private-key/token storage (IndexedDB) ───────────────────────────────
@@ -275,12 +274,11 @@
     }
 
     // ── TOFU key pinning ─────────────────────────────────────────────────────
-    // Pins the raw PEM of every other participant's keys the first time this
-    // browser sees them for this chat, so later fetches/messages can be
-    // checked against what was actually trusted before -- independent of
-    // whatever the server hands back next. See docs/KEY_VERIFICATION.md.
+    // Pins the raw PEM of every other participant's public key the first
+    // time this browser sees it for this chat, so later fetches/messages
+    // can be checked against what was actually trusted before -- independent
+    // of whatever the server hands back next. See docs/KEY_VERIFICATION.md.
     const pinnedEncKeyName = (cid, pid) => `pinned_enc_${cid}_${pid}`;
-    const pinnedSignKeyName = (cid, pid) => `pinned_sign_${cid}_${pid}`;
 
     // ── Crypto helpers ──────────────────────────────────────────────────────
     function derToPem(buf, label) {
@@ -303,26 +301,26 @@
         return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // Short, human-comparable fingerprint of a participant's key pair, e.g.
-    // "A1B2-C3D4-E5F6-0789" -- meant to be read aloud/compared out-of-band,
-    // Signal-safety-number style. Always computed over whichever PEMs are
-    // passed in; callers pass the *pinned* (trusted) PEMs, not fresh ones
-    // straight off the wire, so the displayed value only changes when the
-    // user explicitly re-trusts a new key.
-    async function computeKeyFingerprint(pubEncPem, pubSignPem) {
-        const hex = await sha256Hex((pubEncPem || '') + '|' + (pubSignPem || ''));
+    // Short, human-comparable fingerprint of a participant's public key,
+    // e.g. "A1B2-C3D4-E5F6-0789" -- meant to be read aloud/compared
+    // out-of-band, Signal-safety-number style. Always computed over
+    // whichever PEM is passed in; callers pass the *pinned* (trusted) PEM,
+    // not a fresh one straight off the wire, so the displayed value only
+    // changes when the user explicitly re-trusts a new key.
+    async function computeKeyFingerprint(pubEncPem) {
+        const hex = await sha256Hex(pubEncPem || '');
         return hex.slice(0, 16).toUpperCase().match(/.{1,4}/g).join('-');
     }
 
     function computeChainHash(msg) {
         const parts = [msg.prev_hash, String(msg.seq), String(msg.sender_id),
-            msg.encrypted_text, msg.aes_nonce || '', msg.aes_tag || '', msg.signature || ''];
+            msg.encrypted_text, msg.aes_nonce || '', msg.aes_tag || '', msg.mac || ''];
         return sha256Hex(parts.join('|'));
     }
 
-    // What actually gets RSA-PSS signed/verified: binding seq+prev_hash+chat_id
-    // into the signature means a message can't be replayed at a different
-    // position in the chain -- its signature simply won't match there anymore.
+    // What actually gets MAC'd/verified: binding seq+prev_hash+chat_id into
+    // the tag means a message can't be replayed at a different position in
+    // the chain -- its MAC simply won't match there anymore.
     function signedPayloadBytes(seq, prevHash, cid, plaintext) {
         return new TextEncoder().encode(`${seq}|${prevHash}|${cid}|${plaintext}`);
     }
@@ -345,17 +343,27 @@
     // raw bytes itself. The *output* of an HMAC is unavoidably a raw
     // ArrayBuffer -- that's what gets wrapped into a fresh non-extractable
     // key immediately below, rather than ever being persisted as-is.
-    function importHmacKey(rawBytes) {
-        return crypto.subtle.importKey('raw', rawBytes, {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
+    //
+    // Three values are derived per step, each its own HMAC label so none
+    // can be computed from another: 0x01 the AES-GCM message key, 0x02 the
+    // next chain key, 0x03 a per-message MAC key (see docs/DENIABLE_AUTH.md,
+    // issue #61) -- authentication derived from the same one-way chain as
+    // encryption, verifiable by anyone who independently derives it (every
+    // other current participant), not provable to anyone else. That's
+    // deliberate: unlike an RSA-PSS signature, a MAC can't be shown to a
+    // third party as proof of who sent a message.
+    function importHmacKey(rawBytes, usages=['sign']) {
+        return crypto.subtle.importKey('raw', rawBytes, {name:'HMAC', hash:'SHA-256'}, false, usages);
     }
     function importAesKey(rawBytes, usages) {
         return crypto.subtle.importKey('raw', rawBytes, {name:'AES-GCM'}, false, usages);
     }
     async function ratchetStep(chainKey) {
         const messageKeyBytes = new Uint8Array(await crypto.subtle.sign('HMAC', chainKey, new Uint8Array([0x01])));
+        const authKeyBytes = new Uint8Array(await crypto.subtle.sign('HMAC', chainKey, new Uint8Array([0x03])));
         const nextChainKeyBytes = await crypto.subtle.sign('HMAC', chainKey, new Uint8Array([0x02]));
         const nextChainKey = await importHmacKey(nextChainKeyBytes);
-        return { messageKeyBytes, nextChainKey };
+        return { messageKeyBytes, authKeyBytes, nextChainKey };
     }
 
     const myChainEpochName = cid => `chain_my_epoch_${cid}`;
@@ -440,12 +448,13 @@
         return chainKeysFetchCache;
     }
 
-    // Returns a non-extractable AES-GCM CryptoKey, both the freshly-derived
-    // and the cached-from-IndexedDB case -- decryptWithAES only ever gets a
-    // CryptoKey, never raw key bytes, on this (receiving) path. See #55.
-    async function deriveReceivedMessageKey(msg){
-        const cachedKey = await idbGet(msgKeyName(chatId, msg.id));
-        if (cachedKey) return cachedKey;
+    // Returns { messageKey, authKey } -- both non-extractable CryptoKeys,
+    // both the freshly-derived and the cached-from-IndexedDB case.
+    // decryptWithAES and the MAC verify below only ever get CryptoKeys,
+    // never raw key bytes, on this (receiving) path. See #55/#61.
+    async function deriveReceivedKeys(msg){
+        const cached = await idbGet(msgKeyName(chatId, msg.id));
+        if (cached) return cached;
 
         const senderId = msg.sender_id, msgEpoch = msg.sender_chain_epoch;
         let epoch = localStorage.getItem(recvChainEpochName(chatId, senderId));
@@ -464,11 +473,13 @@
         }
         if (epoch !== msgEpoch) throw new Error('Chain epoch mismatch; cannot derive message key');
 
-        const { messageKeyBytes, nextChainKey } = await ratchetStep(chainKey);
+        const { messageKeyBytes, authKeyBytes, nextChainKey } = await ratchetStep(chainKey);
         await idbSet(recvChainKeyName(chatId, senderId), nextChainKey);
         const messageKey = await importAesKey(messageKeyBytes, ['decrypt']);
-        await idbSet(msgKeyName(chatId, msg.id), messageKey);
-        return messageKey;
+        const authKey = await importHmacKey(authKeyBytes, ['verify']);
+        const derived = { messageKey, authKey };
+        await idbSet(msgKeyName(chatId, msg.id), derived);
+        return derived;
     }
 
     // ── Plaintext padding (ciphertext-length hiding) ────────────────────────
@@ -526,17 +537,15 @@
         return crypto.subtle.importKey(format,der,{name:algo,hash:'SHA-256'},true,usages);
     }
     const importPubEnc=p=>importKey(p,'spki','RSA-OAEP',['encrypt']);
-    const importPubVer=p=>importKey(p,'spki','RSA-PSS',['verify']);
 
     // ── State ───────────────────────────────────────────────────────────────
-    let myEncKeys, mySignKeys;
+    let myEncKeys;
     let chatId = localStorage.getItem('chat_id');
     let token, myParticipantId;
     let partnerUsername = '…';
     let pollInterval=null;
     let ws=null, wsReconnectTimer=null, wsReconnectDelay=1000, wsClosedByUs=false;
     const renderedIds = new Set(); // track rendered message IDs to avoid duplicates
-    const signVerifyKeyCache = new Map(); // PEM string -> imported RSA-PSS verify CryptoKey
 
     // Chain tip state, recomputed from scratch on every fetch (chats here
     // are small/short-lived, so re-verifying the whole chain each time is
@@ -574,13 +583,7 @@
         transcriptFingerprintEl.textContent = 'fingerprint: ' + chainTipHash.slice(0,4)+'-'+chainTipHash.slice(4,8);
     }
 
-    async function getVerifyKey(pem){
-        if(!pem) return null;
-        if(!signVerifyKeyCache.has(pem)) signVerifyKeyCache.set(pem, await importPubVer(pem));
-        return signVerifyKeyCache.get(pem);
-    }
-
-    // Pins a participant's keys on first sight for this chat, or checks a
+    // Pins a participant's key on first sight for this chat, or checks a
     // later sighting against what was pinned before. A mismatch is left
     // unresolved in keyMismatches (rather than auto-trusted) until the user
     // explicitly calls trustNewKey -- that's the "block by default" half of
@@ -588,30 +591,25 @@
     // shows, so it never reflects an unresolved/untrusted key.
     async function verifyAndPinKey(participant){
         const encName = pinnedEncKeyName(chatId, participant.id);
-        const signName = pinnedSignKeyName(chatId, participant.id);
         const pinnedEnc = localStorage.getItem(encName);
-        const pinnedSign = localStorage.getItem(signName);
-        const seenSign = participant.signing_public_key || '';
 
-        if(pinnedEnc === null && pinnedSign === null){
+        if(pinnedEnc === null){
             localStorage.setItem(encName, participant.public_key);
-            localStorage.setItem(signName, seenSign);
             keyMismatches.delete(participant.id);
-            return {trusted:true, fp: await computeKeyFingerprint(participant.public_key, seenSign)};
+            return {trusted:true, fp: await computeKeyFingerprint(participant.public_key)};
         }
-        const matches = pinnedEnc === participant.public_key && pinnedSign === seenSign;
+        const matches = pinnedEnc === participant.public_key;
         if(matches){
             keyMismatches.delete(participant.id);
         } else {
             keyMismatches.set(participant.id, {
                 displayName: participant.display_name,
                 encPem: participant.public_key,
-                signPem: seenSign,
-                pinnedFp: await computeKeyFingerprint(pinnedEnc, pinnedSign),
-                seenFp: await computeKeyFingerprint(participant.public_key, seenSign),
+                pinnedFp: await computeKeyFingerprint(pinnedEnc),
+                seenFp: await computeKeyFingerprint(participant.public_key),
             });
         }
-        return {trusted: matches, fp: await computeKeyFingerprint(pinnedEnc, pinnedSign)};
+        return {trusted: matches, fp: await computeKeyFingerprint(pinnedEnc)};
     }
 
     // Explicit user override after a reviewed key change -- re-pins to the
@@ -620,7 +618,6 @@
         const entry = keyMismatches.get(participantId);
         if(!entry) return;
         localStorage.setItem(pinnedEncKeyName(chatId, participantId), entry.encPem);
-        localStorage.setItem(pinnedSignKeyName(chatId, participantId), entry.signPem);
         keyMismatches.delete(participantId);
         renderKeyMismatchWarning();
     }
@@ -700,7 +697,7 @@
         'Deriving forward-secret session key (ratchet)…',
         'Encrypting message (AES-256-GCM)…',
         'Wrapping key for yourself (RSA-OAEP)…',
-        'Signing message (RSA-PSS)…',
+        'Authenticating message (deniable MAC)…',
         'Sending encrypted payload…'
     ];
     const sendModal=document.getElementById('sendModal');
@@ -753,47 +750,42 @@
     }
 
     // ── Key generation / restoration ────────────────────────────────────────
-    // Both keypairs are generated non-extractable (the `false` 2nd arg) --
-    // per the WebCrypto spec, this only applies to the private half; the
-    // public half stays extractable regardless, since it isn't secret. So
-    // exportKey('spki', ...publicKey) below keeps working unchanged, while
-    // the private keys become CryptoKey objects whose raw bytes can never
-    // be exported by any JS, ever. See docs/CLIENT_KEY_STORAGE.md.
+    // Generated non-extractable (the `false` 2nd arg) -- per the WebCrypto
+    // spec, this only applies to the private half; the public half stays
+    // extractable regardless, since it isn't secret. So exportKey('spki',
+    // publicKey) below keeps working unchanged, while the private key
+    // becomes a CryptoKey object whose raw bytes can never be exported by
+    // any JS, ever. See docs/CLIENT_KEY_STORAGE.md.
+    //
+    // No signing keypair: per-message authentication is a MAC derived from
+    // the forward-secrecy ratchet (see ratchetStep), not a persistent
+    // signing identity. See docs/DENIABLE_AUTH.md (issue #61).
     async function generateFreshKeys(){
         const enc=await crypto.subtle.generateKey({name:'RSA-OAEP',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},false,['encrypt','decrypt']);
-        const sign=await crypto.subtle.generateKey({name:'RSA-PSS',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},false,['sign','verify']);
         myEncKeys={privateKey:enc.privateKey,publicKey:enc.publicKey};
-        mySignKeys={privateKey:sign.privateKey,publicKey:sign.publicKey};
         return {
             privKey: enc.privateKey,
             pubPem: derToPem(await crypto.subtle.exportKey('spki',enc.publicKey),'PUBLIC KEY'),
-            signPrivKey: sign.privateKey,
-            signPubPem: derToPem(await crypto.subtle.exportKey('spki',sign.publicKey),'PUBLIC KEY'),
         };
     }
 
     async function persistKeys(cid, keys){
         localStorage.setItem(pubKeyName(cid), keys.pubPem);
-        localStorage.setItem(signPubKeyName(cid), keys.signPubPem);
         await idbSet(privKeyName(cid), keys.privKey);
-        await idbSet(signPrivKeyName(cid), keys.signPrivKey);
     }
 
     async function restoreKeys(cid){
-        const u=localStorage.getItem(pubKeyName(cid)), su=localStorage.getItem(signPubKeyName(cid));
-        const privKey=await idbGet(privKeyName(cid)), signPrivKey=await idbGet(signPrivKeyName(cid));
-        if(!u||!su||!privKey||!signPrivKey) return false;
+        const u=localStorage.getItem(pubKeyName(cid));
+        const privKey=await idbGet(privKeyName(cid));
+        if(!u||!privKey) return false;
         myEncKeys={privateKey:privKey,publicKey:await importPubEnc(u)};
-        mySignKeys={privateKey:signPrivKey,publicKey:await importPubVer(su)};
         return true;
     }
 
     async function destroyKeys(cid){
         localStorage.removeItem(pubKeyName(cid));
-        localStorage.removeItem(signPubKeyName(cid));
         localStorage.removeItem(participantIdName(cid));
         await idbDelete(privKeyName(cid));
-        await idbDelete(signPrivKeyName(cid));
         await idbDelete(tokenName(cid));
         await destroyChainState(cid);
         destroyPinnedKeys(cid);
@@ -802,7 +794,7 @@
     // TOFU pins are chat-scoped burner state too -- they should die with the
     // rest of this chat's identity rather than outliving it.
     function destroyPinnedKeys(cid){
-        const prefixes = [`pinned_enc_${cid}_`, `pinned_sign_${cid}_`];
+        const prefixes = [`pinned_enc_${cid}_`];
         const toRemove = [];
         for(let i = 0; i < localStorage.length; i++){
             const key = localStorage.key(i);
@@ -832,7 +824,7 @@
         }
 
         const keys = await generateFreshKeys();
-        const body = { display_name: displayName || undefined, public_key: keys.pubPem, signing_public_key: keys.signPubPem };
+        const body = { display_name: displayName || undefined, public_key: keys.pubPem };
         let resp;
         try{
             if(action === 'create'){
@@ -934,7 +926,7 @@
 
     // updateChainState/appendNewMessages both read-then-later-write shared,
     // non-reentrant state (chainTipHash/Seq, and per-sender ratchet chain
-    // keys in IndexedDB via deriveReceivedMessageKey) across `await`
+    // keys in IndexedDB via deriveReceivedKeys) across `await`
     // points. The app deliberately runs a WebSocket push and a polling
     // fallback concurrently (see connectRealtime/fetchNewMessages below),
     // so two fetches can easily land close enough together to overlap --
@@ -1009,12 +1001,12 @@
     }
 
     // ── Only render NEW messages (by ID), strictly in seq order ─────────────
-    // Order matters here beyond display: deriveReceivedMessageKey advances a
+    // Order matters here beyond display: deriveReceivedKeys advances a
     // per-sender ratchet exactly once per new message, so processing out of
     // seq order would derive the wrong keys. renderedIds already guarantees
     // "exactly once ever" (not just "once per batch") for that advancement,
     // since it's never cleared and a page reload starts a fresh in-memory
-    // Set but relies on deriveReceivedMessageKey's own per-message cache
+    // Set but relies on deriveReceivedKeys's own per-message cache
     // (keyed by msg.id, in IndexedDB) to avoid re-advancing on reload.
     // Only ever called from processMessages, which serializes overlapping
     // callers (see #68) -- never call this directly.
@@ -1045,7 +1037,7 @@
         const cryptoSteps = []; // {label, ok}
 
         try{
-            let aesKey;
+            let aesKey, authKey = null;
             if(isMine){
                 cryptoSteps.push({label:'RSA-OAEP key unwrap (self)', ok:null});
                 const wk = msg.my_encrypted_symmetric_key;
@@ -1055,7 +1047,7 @@
                 cryptoSteps[0].ok = true;
             } else {
                 cryptoSteps.push({label:'Chain ratchet (forward-secret)', ok:null});
-                aesKey = await deriveReceivedMessageKey(msg);
+                ({messageKey: aesKey, authKey} = await deriveReceivedKeys(msg));
                 cryptoSteps[0].ok = true;
             }
 
@@ -1063,34 +1055,37 @@
             text = await decryptWithAES(aesKey,{ciphertext:msg.encrypted_text,nonce:msg.aes_nonce,tag:msg.aes_tag});
             cryptoSteps[1].ok = true;
 
-            if(!isMine && msg.signature && msg.sender_signing_public_key){
-                cryptoSteps.push({label:'RSA-PSS signature verify', ok:null});
+            // Deniable by design (issue #61): this MAC is verifiable only by
+            // someone who independently derives the same ratchet-chain auth
+            // key -- i.e. another current participant -- not provable to a
+            // third party the way an RSA-PSS signature would be.
+            if(!isMine && msg.mac && authKey){
+                cryptoSteps.push({label:'Chain MAC verify (deniable)', ok:null});
                 try{
-                    const senderSignKey = await getVerifyKey(msg.sender_signing_public_key);
                     const v = await crypto.subtle.verify(
-                        {name:'RSA-PSS',saltLength:32}, senderSignKey, b642ab(msg.signature),
+                        'HMAC', authKey, b642ab(msg.mac),
                         signedPayloadBytes(msg.seq, msg.prev_hash, chatId, text)
                     );
                     cryptoSteps[2].ok = v;
                 }catch(e){cryptoSteps[2].ok=false;}
             } else if(isMine){
-                cryptoSteps.push({label:'Signed by you', ok:true});
+                cryptoSteps.push({label:'Sent by you', ok:true});
             }
         }catch(e){
             console.warn('Decrypt failed',msg.id,e);
             return; // skip broken messages
         }
 
-        // TOFU: an attacker holding the *current* signing key can produce a
-        // validly-signed message under it, so signature success alone can't
-        // catch a server-side key swap -- only comparing against what was
-        // actually pinned before can. Checked independently of cryptoSteps
-        // above so it overrides the badge even if the signature "passes".
+        // TOFU: an attacker holding the *current* encryption key can produce
+        // a validly-MAC'd message under it, so MAC success alone can't catch
+        // a server-side key swap -- only comparing against what was actually
+        // pinned before can. Checked independently of cryptoSteps above so
+        // it overrides the badge even if the MAC "passes".
         let keyMismatch = false;
         if(!isMine){
-            const pinnedSign = localStorage.getItem(pinnedSignKeyName(chatId, msg.sender_id));
-            if(pinnedSign !== null && msg.sender_signing_public_key){
-                keyMismatch = msg.sender_signing_public_key !== pinnedSign;
+            const pinnedEnc = localStorage.getItem(pinnedEncKeyName(chatId, msg.sender_id));
+            if(pinnedEnc !== null && msg.sender_public_key){
+                keyMismatch = msg.sender_public_key !== pinnedEnc;
                 cryptoSteps.push({label:'Sender key matches pinned (TOFU)', ok: !keyMismatch});
             }
         }
@@ -1157,7 +1152,7 @@
         e.preventDefault();
         const plaintext=messageInput.value.trim();
         if(!plaintext) return;
-        if(!myEncKeys?.publicKey||!mySignKeys?.privateKey){showError('Keys not loaded.');return;}
+        if(!myEncKeys?.publicKey){showError('Keys not loaded.');return;}
 
         sendBtn.disabled=true;
         showSendModal();
@@ -1188,7 +1183,7 @@
             // messageKeyBytes exists as raw bytes only transiently, here,
             // because the RSA-OAEP self-wrap below needs plaintext bytes to
             // encrypt -- it's never persisted anywhere in this form. See #55.
-            const { messageKeyBytes, nextChainKey } = await ratchetStep(currentChainKey);
+            const { messageKeyBytes, authKeyBytes, nextChainKey } = await ratchetStep(currentChainKey);
             // Do NOT commit nextChainKey yet. A 409 (someone else's message
             // landed first -- an ordinary outcome of concurrent sends, not
             // an error) means this attempt was never actually stored, so
@@ -1214,8 +1209,13 @@
             advanceSendStep(3);
             const predictedSeq = chainTipSeq + 1;
             const prevHash = chainTipHash;
-            const sig=await crypto.subtle.sign(
-                {name:'RSA-PSS',saltLength:32}, mySignKeys.privateKey,
+            // Deniable by design (issue #61): a MAC keyed from this message's
+            // own ratchet step, not a persistent RSA-PSS signing identity --
+            // verifiable by any other current participant (they derive the
+            // same auth key independently), never provable to anyone else.
+            const authKey = await importHmacKey(authKeyBytes, ['sign']);
+            const mac = await crypto.subtle.sign(
+                'HMAC', authKey,
                 signedPayloadBytes(predictedSeq, prevHash, chatId, plaintext)
             );
             completeSendStep(3);
@@ -1225,7 +1225,7 @@
                 method:'POST',headers:authHeaders({'Content-Type':'application/json'}),
                 body:JSON.stringify({
                     encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,
-                    signature:ab2b64(sig),prev_hash:prevHash,sender_chain_epoch:senderChainEpoch,
+                    mac:ab2b64(mac),prev_hash:prevHash,sender_chain_epoch:senderChainEpoch,
                 })
             });
             completeSendStep(4,resp.ok);
