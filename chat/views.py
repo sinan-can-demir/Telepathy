@@ -10,12 +10,15 @@ import random
 import time
 from .models import Chat, ChatParticipant, ChainKey, ChainKeyWrap
 from django.db import transaction
+from django.db.models import Max
 from django.utils import timezone
 from django.shortcuts import render, redirect, get_object_or_404
 from rest_framework.response import Response
 from .auth import ParticipantTokenAuthentication, hash_token
 from .chain import GENESIS_HASH, compute_chain_hash
 from .realtime import notify_chat
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 
 # Track failed chat-join attempts per source IP, to slow brute-forcing the
@@ -33,6 +36,29 @@ logger = logging.getLogger(__name__)
 
 def _is_valid_display_name(name):
     return bool(name) and re.match(r'^[a-zA-Z0-9_ -]{1,32}$', name) is not None
+
+
+# A 2048-bit RSA SPKI PEM is well under 1KB; capping length before ever
+# parsing it keeps a hostile/malformed value from being an amplification
+# vector (see issue #72) and gives load_pem_public_key a bounded input.
+_MAX_PUBLIC_KEY_PEM_LEN = 2000
+
+
+def _is_valid_rsa_public_key_pem(pem):
+    """Every client-side importKey call assumes a 2048-bit RSA SPKI PEM
+    (see generateFreshKeys in chatbox.html) -- this checks a submitted key
+    actually is one, rather than only checking it's non-empty. The server
+    still can't (and shouldn't try to) vouch for a key being honestly
+    generated in an E2EE design; this only rules out malformed/wrong-type/
+    oversized values that would otherwise silently break every other
+    participant's crypto calls against this one."""
+    if not pem or len(pem) > _MAX_PUBLIC_KEY_PEM_LEN:
+        return False
+    try:
+        key = serialization.load_pem_public_key(pem.encode())
+    except ValueError:
+        return False
+    return isinstance(key, rsa.RSAPublicKey) and key.key_size == 2048
 
 
 def _client_ip(request):
@@ -92,8 +118,12 @@ class CreateChatView(APIView):
 
     def post(self, request):
         public_key = request.data.get("public_key")
-        if not public_key:
-            return Response({"message": "public_key is required."}, status=400)
+        if not _is_valid_rsa_public_key_pem(public_key):
+            return Response({"message": "public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
+
+        signing_public_key = request.data.get("signing_public_key")
+        if signing_public_key and not _is_valid_rsa_public_key_pem(signing_public_key):
+            return Response({"message": "signing_public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
 
         display_name = request.data.get("display_name") or f"Participant-{secrets.token_hex(2)}"
         if not _is_valid_display_name(display_name):
@@ -118,7 +148,7 @@ class CreateChatView(APIView):
             is_group=max_participants > 2,
         )
         participant, raw_token = _issue_participant(
-            chat, display_name, public_key, request.data.get("signing_public_key")
+            chat, display_name, public_key, signing_public_key
         )
         logger.info(f"[CREATE-CHAT] Created chat {chat}, PIN: {chat.pin}")
 
@@ -144,8 +174,12 @@ class JoinChatView(APIView):
             return Response({"message": "Chat ID is required."}, status=400)
 
         public_key = request.data.get("public_key")
-        if not public_key:
-            return Response({"message": "public_key is required."}, status=400)
+        if not _is_valid_rsa_public_key_pem(public_key):
+            return Response({"message": "public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
+
+        signing_public_key = request.data.get("signing_public_key")
+        if signing_public_key and not _is_valid_rsa_public_key_pem(signing_public_key):
+            return Response({"message": "signing_public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
 
         display_name = request.data.get("display_name") or f"Participant-{secrets.token_hex(2)}"
         if not _is_valid_display_name(display_name):
@@ -183,7 +217,7 @@ class JoinChatView(APIView):
             return Response({"message": "Chat is full."}, status=400)
 
         participant, raw_token = _issue_participant(
-            chat, display_name, public_key, request.data.get("signing_public_key")
+            chat, display_name, public_key, signing_public_key
         )
         logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat_id}'.")
         notify_chat(chat_id, "roster_changed")
@@ -295,8 +329,19 @@ class SendMessageView(APIView):
             if me.chat_id != chat.pk or me.left_at is not None:
                 return Response({"detail": "Forbidden"}, status=403)
 
-            if not ChainKey.objects.filter(sender=me, epoch=sender_chain_epoch).exists():
+            # Must be the sender's CURRENT epoch, not merely one that once
+            # existed -- re-keying on roster change (see ChainKey's
+            # docstring) only bounds a leaver's exposure if the server
+            # actually refuses a stale epoch a departed participant could
+            # still hold the seed for. See issue #69.
+            latest_epoch = ChainKey.objects.filter(sender=me).aggregate(Max("epoch"))["epoch__max"]
+            if latest_epoch is None:
                 return Response({"message": "Unknown sender_chain_epoch; issue a chain key first."}, status=400)
+            if sender_chain_epoch != latest_epoch:
+                return Response(
+                    {"message": "sender_chain_epoch is stale; issue a fresh chain key and resend."},
+                    status=400,
+                )
 
             tip = chat.messages.order_by("-seq").first()
             expected_prev_hash = compute_chain_hash(tip) if tip else GENESIS_HASH
