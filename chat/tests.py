@@ -107,21 +107,6 @@ class ChatCreationTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    def test_create_chat_accepts_valid_signing_public_key_and_rejects_invalid_one(self):
-        good = self.client.post(
-            "/chat/create-chat/",
-            {"display_name": "alice", "public_key": _fake_public_key_pem(), "signing_public_key": _fake_public_key_pem()},
-            format="json",
-        )
-        self.assertEqual(good.status_code, 201, good.data)
-
-        bad = self.client.post(
-            "/chat/create-chat/",
-            {"display_name": "alice", "public_key": _fake_public_key_pem(), "signing_public_key": "garbage"},
-            format="json",
-        )
-        self.assertEqual(bad.status_code, 400)
-
 
 class TokenAuthTests(TestCase):
     """Coverage for the accountless auth model: possession of a per-chat
@@ -280,7 +265,7 @@ class MessageRoundTripTests(TestCase):
         return client.post(
             f"/chat/send-message/{self.chat_id}/",
             {
-                "encrypted_text": "ciphertext", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "encrypted_text": "ciphertext", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": prev_hash,
                 "sender_chain_epoch": epoch,
                 "wrapped_keys": [{"recipient_id": sender_id, "encrypted_symmetric_key": key_for_self}],
@@ -424,7 +409,7 @@ class GroupChatFeatureTests(TestCase):
         send = self.alice.post(
             f"/chat/send-message/{self.chat_id}/",
             {
-                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": GENESIS_HASH,
                 "sender_chain_epoch": issued.data["epoch"],
                 "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"}],
@@ -520,7 +505,7 @@ class TranscriptChainTests(TestCase):
         return client.post(
             f"/chat/send-message/{self.chat_id}/",
             {
-                "encrypted_text": text, "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "encrypted_text": text, "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": prev_hash,
                 "sender_chain_epoch": epoch,
                 "wrapped_keys": [{"recipient_id": sender_id, "encrypted_symmetric_key": "key-self"}],
@@ -542,7 +527,7 @@ class TranscriptChainTests(TestCase):
         response = self.alice.post(
             f"/chat/send-message/{self.chat_id}/",
             {
-                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "signature": "s",
+                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "wrapped_keys": [
                     {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"},
                     {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-b"},

@@ -9,7 +9,7 @@
 
 **Telepathy** is a secure, anonymous chat application where **privacy is guaranteed by design**. Messages are encrypted entirely on the client side using the Web Crypto API before they ever reach the server — meaning the server **never sees plaintext**. Even if the database were compromised, no readable message content would be exposed.
 
-Two parties join a chat room via a shared 4-digit PIN. Once both connect, they exchange messages secured by **hybrid RSA + AES-GCM encryption** and verified with **RSA-PSS digital signatures**. Every encryption step is visible to the user in real-time through a send progress modal and per-message verification badges.
+Two parties join a chat room via a shared 4-digit PIN. Once both connect, they exchange messages secured by **hybrid RSA + AES-GCM encryption** and authenticated with a **deniable, ratchet-derived MAC** — verifiable by the chat's other participants, but not provable to anyone outside it. Every encryption step is visible to the user in real-time through a send progress modal and per-message verification badges.
 
 ---
 
@@ -17,13 +17,13 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 
 | Feature | Description |
 |---|---|
-| 🔑 **Per-Chat "Burner" Keys** | A fresh RSA-2048 key pair (encryption + signing) is generated in the browser for every chat created or joined; private keys never leave the client and are deleted the moment the chat is left |
+| 🔑 **Per-Chat "Burner" Keys** | A fresh RSA-2048 encryption key pair is generated in the browser for every chat created or joined; private keys never leave the client and are deleted the moment the chat is left |
 | 🛡️ **Non-Extractable Private Keys** | Private keys are generated as non-extractable `CryptoKey` objects and stored in IndexedDB, not `localStorage` — even an XSS payload with full JS execution can't export their raw bytes — see [docs/CLIENT_KEY_STORAGE.md](docs/CLIENT_KEY_STORAGE.md) |
 | 🔒 **Hybrid Encryption** | AES-256-GCM encrypts the message body; the AES key comes from a forward-secret sending-chain ratchet, not a static wrap — see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md) |
 | ⏩ **Forward Secrecy** | Each sender's messages are keyed from a one-way HMAC-SHA256 chain (Signal "Sender Key"-style); stealing current key material can't unlock messages sent before that point |
 | 🔑 **Key Verification (TOFU)** | Each participant's keys are pinned in the browser the first time they're seen per chat; a later mismatch blocks sending and badges their messages ⚠, and a fingerprint is shown for out-of-band comparison — see [docs/KEY_VERIFICATION.md](docs/KEY_VERIFICATION.md) |
 | ⚡ **Real-Time via WebSockets** | New messages and roster changes push instantly over a websocket (Django Channels + Redis), with HTTP polling kept as a slow fallback for reconnect gaps |
-| ✍️ **Digital Signatures** | Every message is signed with RSA-PSS (binding its position in the transcript chain too) — the receiver sees a clickable ✓ Verified badge with full crypto details |
+| ✍️ **Deniable Authentication** | Every message is authenticated with an HMAC-SHA256 MAC derived from the sender's forward-secrecy ratchet (binding its position in the transcript chain too) — verifiable by the chat's other participants but not provable to a third party, unlike a digital signature. The receiver sees a clickable ✓ Verified badge with full crypto details — see [docs/DENIABLE_AUTH.md](docs/DENIABLE_AUTH.md) |
 | 🔗 **Transcript Tamper-Evidence** | Messages are hash-chained; a dropped, reordered, or replayed message breaks a verifiable link instead of being silently trusted |
 | 📊 **Send Progress Modal** | An animated progress bar shows each encryption operation in real-time when sending a message |
 | 💾 **Encrypted-at-Rest** | Only ciphertext is stored in the database — decryption happens exclusively in the browser |
@@ -66,19 +66,21 @@ SENDER (Browser A)                          SERVER                    RECEIVER (
 1. Advance own sending-chain ratchet
    (HMAC-SHA256) to get this
    message's forward-secret key
+   and its own MAC auth key
 2. Encrypt message with AES-GCM
 3. Wrap that key with own                  Stores ONLY:
    RSA-OAEP public key (self-copy)  ───►   • AES-GCM ciphertext
-4. Sign seq|prev_hash|chat_id|plaintext     • Self-wrapped key, seq, prev_hash
-   with RSA-PSS                            • Nonce, tag, signature
+4. MAC seq|prev_hash|chat_id|plaintext      • Self-wrapped key, seq, prev_hash
+   with the ratchet-derived auth key        • Nonce, tag, MAC
+   (HMAC-SHA256, deniable)
 5. POST all fields to API
                                                                      6. GET encrypted messages
-                                                                     7. Derive same key by advancing
+                                                                     7. Derive same keys by advancing
                                                                         own cached copy of sender's
                                                                         chain (seeded once via
                                                                         /issue-chain-key/, RSA-OAEP)
                                                                      8. Decrypt message (AES-GCM)
-                                                                     9. Verify signature (RSA-PSS)
+                                                                     9. Verify MAC (HMAC-SHA256)
                                                                     10. Display ✓ Verified badge
 ```
 
@@ -92,7 +94,7 @@ See [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md) for why the AES key comes
 |-------|------------|
 | **Backend** | Django 5.1, Django REST Framework |
 | **Database** | PostgreSQL (UUID-indexed messages) |
-| **Client Crypto** | Web Crypto API (RSA-OAEP, RSA-PSS, AES-256-GCM, HMAC-SHA256 sending-chain ratchet) |
+| **Client Crypto** | Web Crypto API (RSA-OAEP, AES-256-GCM, HMAC-SHA256 sending-chain ratchet + deniable MAC) |
 | **Server Crypto** | `cryptography` library (PEM key validation) |
 | **Frontend** | Vanilla HTML/CSS/JS with glassmorphism design system |
 
@@ -213,9 +215,9 @@ Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your browser.
    - Deriving forward-secret session key (ratchet)
    - Encrypting message (AES-256-GCM)
    - Wrapping key for yourself (RSA-OAEP)
-   - Signing message (RSA-PSS)
+   - Authenticating message (deniable MAC)
    - Sending encrypted payload
-5. **Receiver** sees the message with a **✓ Verified** badge — click it to see the individual crypto verification steps (chain ratchet, decrypt, signature verify)
+5. **Receiver** sees the message with a **✓ Verified** badge — click it to see the individual crypto verification steps (chain ratchet, decrypt, MAC verify)
 6. **Leave** the chat from either side to end it. If everyone leaves, message history is deleted; each browser's per-chat keys are deleted from that browser's `localStorage` on leave, regardless.
 
 ### Group chats (3–8 people)
@@ -262,7 +264,7 @@ A participant's entire identity for exactly one chat — see [docs/ACCOUNTLESS_I
 |-------|------|-------------|
 | `chat` | `FK(Chat)` | The chat this participation belongs to |
 | `display_name` | `CharField` | Self-chosen, chat-scoped only (not globally unique) |
-| `public_key` / `signing_public_key` | `TextField` | This chat's freshly generated RSA-OAEP/RSA-PSS public keys (PEM) |
+| `public_key` | `TextField` | This chat's freshly generated RSA-OAEP public key (PEM); no signing key -- see [docs/DENIABLE_AUTH.md](docs/DENIABLE_AUTH.md) |
 | `auth_token_hash` | `CharField` | SHA-256 hash of the bearer token issued at join time; the raw token is never stored |
 | `joined_at` / `left_at` | `DateTimeField` | Presence window; a token stops authenticating once `left_at` is set |
 
@@ -274,7 +276,7 @@ A participant's entire identity for exactly one chat — see [docs/ACCOUNTLESS_I
 | `sender` | `FK(ChatParticipant)` | Who sent it |
 | `encrypted_text` | `TextField` | AES-GCM ciphertext (Base64) |
 | `aes_nonce` / `aes_tag` | `TextField` | AES-GCM IV and authentication tag |
-| `signature` | `TextField` | RSA-PSS digital signature (Base64), covering `seq\|prev_hash\|chat_id\|plaintext` |
+| `mac` | `TextField` | HMAC-SHA256 tag (Base64), covering `seq\|prev_hash\|chat_id\|plaintext`, keyed from the sender's ratchet -- deniable, see [docs/DENIABLE_AUTH.md](docs/DENIABLE_AUTH.md) |
 | `seq` / `prev_hash` | `PositiveIntegerField` / `CharField` | Position in the chat's tamper-evident hash chain (see `chat/chain.py`) |
 | `sender_chain_epoch` | `PositiveIntegerField` | Which epoch of the sender's forward-secret ratchet this message's key came from (see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md)) |
 

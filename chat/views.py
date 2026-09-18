@@ -65,7 +65,7 @@ def _client_ip(request):
     return request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
 
 
-def _issue_participant(chat, display_name, public_key, signing_public_key):
+def _issue_participant(chat, display_name, public_key):
     """Creates a ChatParticipant with a fresh bearer token and returns
     (participant, raw_token). The raw token is never stored -- only its hash
     is -- and this is the only place in the app it's ever computed."""
@@ -74,7 +74,6 @@ def _issue_participant(chat, display_name, public_key, signing_public_key):
         chat=chat,
         display_name=display_name,
         public_key=public_key,
-        signing_public_key=signing_public_key,
         auth_token_hash=hash_token(raw_token),
     )
     return participant, raw_token
@@ -108,8 +107,7 @@ class CreateChatView(APIView):
     """
     POST /chat/create-chat/
     No account needed -- this *is* the entry point. Optionally accepts
-    { "display_name": "...", "max_participants": <2-8>, "public_key": "...",
-      "signing_public_key": "..." }.
+    { "display_name": "...", "max_participants": <2-8>, "public_key": "..." }.
     Returns: { "chat_id": "<4-digit PIN>", "participant_token": "<raw token>" }
     (the token is shown exactly once and never recoverable afterward).
     """
@@ -120,10 +118,6 @@ class CreateChatView(APIView):
         public_key = request.data.get("public_key")
         if not _is_valid_rsa_public_key_pem(public_key):
             return Response({"message": "public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
-
-        signing_public_key = request.data.get("signing_public_key")
-        if signing_public_key and not _is_valid_rsa_public_key_pem(signing_public_key):
-            return Response({"message": "signing_public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
 
         display_name = request.data.get("display_name") or f"Participant-{secrets.token_hex(2)}"
         if not _is_valid_display_name(display_name):
@@ -148,7 +142,7 @@ class CreateChatView(APIView):
             is_group=max_participants > 2,
         )
         participant, raw_token = _issue_participant(
-            chat, display_name, public_key, signing_public_key
+            chat, display_name, public_key
         )
         logger.info(f"[CREATE-CHAT] Created chat {chat}, PIN: {chat.pin}")
 
@@ -162,7 +156,7 @@ class JoinChatView(APIView):
     """
     POST /chat/join-chat/
     No account needed. Expects JSON: { "chat_id": "<4-digit-PIN>",
-    "display_name": "...", "public_key": "...", "signing_public_key": "..." }
+    "display_name": "...", "public_key": "..." }
     Returns: { "participant_token": "<raw token>", "participant_id": <int> }
     """
     authentication_classes = []
@@ -176,10 +170,6 @@ class JoinChatView(APIView):
         public_key = request.data.get("public_key")
         if not _is_valid_rsa_public_key_pem(public_key):
             return Response({"message": "public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
-
-        signing_public_key = request.data.get("signing_public_key")
-        if signing_public_key and not _is_valid_rsa_public_key_pem(signing_public_key):
-            return Response({"message": "signing_public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
 
         display_name = request.data.get("display_name") or f"Participant-{secrets.token_hex(2)}"
         if not _is_valid_display_name(display_name):
@@ -217,7 +207,7 @@ class JoinChatView(APIView):
             return Response({"message": "Chat is full."}, status=400)
 
         participant, raw_token = _issue_participant(
-            chat, display_name, public_key, signing_public_key
+            chat, display_name, public_key
         )
         logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat_id}'.")
         notify_chat(chat_id, "roster_changed")
@@ -315,12 +305,12 @@ class SendMessageView(APIView):
         encrypted_text = request.data.get("encrypted_text")
         aes_nonce = request.data.get("aes_nonce")
         aes_tag = request.data.get("aes_tag")
-        signature = request.data.get("signature")
+        mac = request.data.get("mac")
         wrapped_keys = request.data.get("wrapped_keys")
         prev_hash = request.data.get("prev_hash")
         sender_chain_epoch = request.data.get("sender_chain_epoch")
 
-        if not all([encrypted_text, aes_nonce, aes_tag, signature, prev_hash]) or not wrapped_keys \
+        if not all([encrypted_text, aes_nonce, aes_tag, mac, prev_hash]) or not wrapped_keys \
                 or sender_chain_epoch is None:
             return Response({"message": "Missing required encryption fields."}, status=400)
 
@@ -368,7 +358,7 @@ class SendMessageView(APIView):
                 encrypted_text=encrypted_text,
                 aes_nonce=aes_nonce,
                 aes_tag=aes_tag,
-                signature=signature,
+                mac=mac,
                 seq=(tip.seq + 1) if tip else 0,
                 prev_hash=prev_hash,
                 sender_chain_epoch=sender_chain_epoch,
@@ -472,7 +462,7 @@ class GetChainKeysView(APIView):
 class GetChatParticipantsView(APIView):
     """
     GET /chat/get-chat-participants/<chat_id>/
-    Returns every active participant's id/display_name/public keys, so the
+    Returns every active participant's id/display_name/public key, so the
     sender can wrap the per-message AES key for each of them. Requires the
     caller to be an active participant themselves.
     """
@@ -491,7 +481,6 @@ class GetChatParticipantsView(APIView):
                     "id": p.pk,
                     "display_name": p.display_name,
                     "public_key": p.public_key,
-                    "signing_public_key": p.signing_public_key,
                 }
                 for p in active
             ]

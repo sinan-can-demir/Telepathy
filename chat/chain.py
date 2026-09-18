@@ -11,7 +11,7 @@ def compute_chain_hash(message):
     this from fields that are already stored/transmitted -- nothing about it
     is itself persisted, so there's no denormalized value to keep in sync.
 
-    Chaining prev_hash into this (and prev_hash into what senders sign, see
+    Chaining prev_hash into this (and prev_hash into what senders MAC, see
     chatbox.html) is what turns "dropped/reordered/replayed message" into a
     detectable break instead of something a client would silently trust."""
     parts = [
@@ -21,6 +21,6 @@ def compute_chain_hash(message):
         message.encrypted_text,
         message.aes_nonce or "",
         message.aes_tag or "",
-        message.signature or "",
+        message.mac or "",
     ]
     return hashlib.sha256("|".join(parts).encode()).hexdigest()

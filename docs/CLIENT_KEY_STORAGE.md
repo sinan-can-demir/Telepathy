@@ -26,6 +26,8 @@ An XSS payload (or any other JS running on the page, current or injected) that t
 - **No equivalent guarantee for the bearer token.** A string can't be made non-extractable. Moving it to IndexedDB is defense-in-depth against low-effort/generic scraping, not a hard security boundary — a targeted, live XSS can query IndexedDB just as easily as it could `localStorage`.
 - **The forward-secrecy ratchet seeds and per-message derived keys were unaffected by this change**, and moved to the same non-extractable-CryptoKey-in-IndexedDB pattern separately (issue #55, see `docs/FORWARD_SECRECY.md`).
 
+**Update (issue #61):** the RSA-PSS signing keypair described above no longer exists at all -- per-message authentication moved to a ratchet-derived MAC instead of a persistent signing identity, so `sign_priv_<chat_id>`/`sign_pub_<chat_id>` were removed rather than migrated. See `docs/DENIABLE_AUTH.md`. Everything above about the RSA-OAEP encryption keypair and the bearer token is still accurate.
+
 ## What this is not
 
 Same caveat as the project's other security docs: this narrows a real gap, it doesn't make Telepathy ready for a high-stakes use case like source protection on its own. See `ARCHITECTURE.md` for the full limitations list.

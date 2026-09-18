@@ -9,7 +9,6 @@ class MessageSerializer(serializers.ModelSerializer):
     # comparing display-name strings.
     sender_id = serializers.IntegerField(read_only=True)
     sender_public_key = serializers.CharField(source="sender.public_key",         read_only=True)
-    sender_signing_public_key = serializers.CharField(source="sender.signing_public_key", read_only=True)
     sender_username = serializers.CharField(source="sender.display_name",       read_only=True)
     my_encrypted_symmetric_key = serializers.SerializerMethodField()
     # Bucketed to the minute -- see issue #59: a full (microsecond-precision)
@@ -29,14 +28,13 @@ class MessageSerializer(serializers.ModelSerializer):
             "my_encrypted_symmetric_key",
             "aes_nonce",
             "aes_tag",
-            "signature",
+            "mac",
             "seq",
             "prev_hash",
             "sender_chain_epoch",
             "timestamp",
             "sender_id",
             "sender_public_key",
-            "sender_signing_public_key",
             "sender_username",
         ]
 
