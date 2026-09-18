@@ -24,7 +24,7 @@ An XSS payload (or any other JS running on the page, current or injected) that t
 
 - **No protection against an *active* XSS using the keys while it's running.** A non-extractable key can still be *used* — `sign`/`decrypt` calls succeed for any JS with a reference to it or that can look it up in IndexedDB. This stops key *theft for later/offline reuse*, not real-time abuse by malicious code currently executing on the page. Those are different threat models; this only closes the first one.
 - **No equivalent guarantee for the bearer token.** A string can't be made non-extractable. Moving it to IndexedDB is defense-in-depth against low-effort/generic scraping, not a hard security boundary — a targeted, live XSS can query IndexedDB just as easily as it could `localStorage`.
-- **The forward-secrecy ratchet seeds and per-message derived keys are unaffected.** `chain_my_key_*`, `chain_recv_key_*`, and `msgkey_*` (see `docs/FORWARD_SECRECY.md`) still sit in `localStorage` as raw base64 strings, with the same XSS exposure this fix closes for the RSA keys — deliberately out of scope here since neither #21 nor #42 named them, and fixing it touches the ratchet's raw-byte HMAC code path in several places. Tracked separately as issue #55.
+- **The forward-secrecy ratchet seeds and per-message derived keys were unaffected by this change**, and moved to the same non-extractable-CryptoKey-in-IndexedDB pattern separately (issue #55, see `docs/FORWARD_SECRECY.md`).
 
 ## What this is not
 

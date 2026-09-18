@@ -214,7 +214,9 @@
     // bearer token lives here too -- not because it gets the same
     // non-extractable guarantee (it's just a string), but to keep it off
     // the more commonly/opportunistically scraped localStorage. See
-    // docs/CLIENT_KEY_STORAGE.md.
+    // docs/CLIENT_KEY_STORAGE.md. The forward-secrecy ratchet's chain/
+    // message keys (see "Forward secrecy: sender-chain ratchet" below) use
+    // this same store for the same reason -- see #55.
     const KEYSTORE_DB = 'telepathy_keystore', KEYSTORE_STORE = 'keys';
 
     function openKeystore(){
@@ -247,6 +249,26 @@
         return new Promise((resolve, reject) => {
             const tx = db.transaction(KEYSTORE_STORE, 'readwrite');
             tx.objectStore(KEYSTORE_STORE).delete(key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+    }
+    // Cursor-scan delete for keys whose *name* is only known by prefix (e.g.
+    // one msgkey_<chat_id>_<msg_id> entry per message) -- IndexedDB has no
+    // native prefix query, unlike the equivalent localStorage.key(i) loop
+    // used elsewhere in this file for the same purpose.
+    async function idbDeleteByPrefix(prefixes){
+        const db = await openKeystore();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(KEYSTORE_STORE, 'readwrite');
+            const req = tx.objectStore(KEYSTORE_STORE).openCursor();
+            req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) return;
+                if (typeof cursor.key === 'string' && prefixes.some(p => cursor.key.startsWith(p))) cursor.delete();
+                cursor.continue();
+            };
+            req.onerror = () => reject(req.error);
             tx.oncomplete = () => resolve();
             tx.onerror = () => reject(tx.error);
         });
@@ -309,19 +331,31 @@
     // Mirrors a Signal "Sender Key"-style symmetric ratchet: HMAC-SHA256 with
     // a one-byte label, exactly like the message-key/chain-key derivation in
     // Signal's own KDF chain. Each step is one-way (you can't run HMAC
-    // backward), so stealing chainKeyBytes at some point only yields message
+    // backward), so stealing a chain key at some point only yields message
     // keys from there forward, never the ones already ratcheted past --
     // that's the actual forward-secrecy property. What this does NOT give:
     // post-compromise security (self-healing) -- see docs/FORWARD_SECRECY.md.
-    async function hmacSha256(keyBytes, labelByte) {
-        const key = await crypto.subtle.importKey('raw', keyBytes, {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
-        const sig = await crypto.subtle.sign('HMAC', key, new Uint8Array([labelByte]));
-        return new Uint8Array(sig);
+    //
+    // Chain keys (both the sending chain and each per-sender receiving
+    // chain) live only as non-extractable HMAC CryptoKey objects in
+    // IndexedDB, never as raw bytes at rest -- see #55/docs/CLIENT_KEY_
+    // STORAGE.md. chainKey is always such a CryptoKey here; it's used
+    // directly as the HMAC key (crypto.subtle.sign accepts a CryptoKey, no
+    // export/import round-trip needed) and never leaves this function as
+    // raw bytes itself. The *output* of an HMAC is unavoidably a raw
+    // ArrayBuffer -- that's what gets wrapped into a fresh non-extractable
+    // key immediately below, rather than ever being persisted as-is.
+    function importHmacKey(rawBytes) {
+        return crypto.subtle.importKey('raw', rawBytes, {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
     }
-    async function ratchetStep(chainKeyBytes) {
-        const messageKey = await hmacSha256(chainKeyBytes, 0x01);
-        const nextChainKey = await hmacSha256(chainKeyBytes, 0x02);
-        return { messageKey, nextChainKey };
+    function importAesKey(rawBytes, usages) {
+        return crypto.subtle.importKey('raw', rawBytes, {name:'AES-GCM'}, false, usages);
+    }
+    async function ratchetStep(chainKey) {
+        const messageKeyBytes = new Uint8Array(await crypto.subtle.sign('HMAC', chainKey, new Uint8Array([0x01])));
+        const nextChainKeyBytes = await crypto.subtle.sign('HMAC', chainKey, new Uint8Array([0x02]));
+        const nextChainKey = await importHmacKey(nextChainKeyBytes);
+        return { messageKeyBytes, nextChainKey };
     }
 
     const myChainEpochName = cid => `chain_my_epoch_${cid}`;
@@ -331,17 +365,18 @@
     const recvChainKeyName = (cid, sid) => `chain_recv_key_${cid}_${sid}`;
     const msgKeyName = (cid, msgId) => `msgkey_${cid}_${msgId}`;
 
-    function destroyChainState(cid) {
+    async function destroyChainState(cid) {
         localStorage.removeItem(myChainEpochName(cid));
-        localStorage.removeItem(myChainKeyName(cid));
         localStorage.removeItem(myChainRosterName(cid));
-        const prefixes = [`chain_recv_epoch_${cid}_`, `chain_recv_key_${cid}_`, `msgkey_${cid}_`];
+        await idbDelete(myChainKeyName(cid));
+        const prefixes = [`chain_recv_epoch_${cid}_`];
         const toRemove = [];
         for (let i = 0; i < localStorage.length; i++) {
             const key = localStorage.key(i);
             if (key && prefixes.some(p => key.startsWith(p))) toRemove.push(key);
         }
         toRemove.forEach(k => localStorage.removeItem(k));
+        await idbDeleteByPrefix([`chain_recv_key_${cid}_`, `msgkey_${cid}_`]);
     }
 
     // Issues a fresh chain-key epoch (wrapped RSA-OAEP per recipient) iff the
@@ -374,8 +409,11 @@
             throw new Error('Failed to issue chain key: ' + (err.message || resp.statusText));
         }
         const data = await resp.json();
+        // seed only ever exists as raw bytes transiently, here, to RSA-OAEP-
+        // wrap it per recipient above -- what actually persists is this
+        // non-extractable HMAC key, never the raw seed itself.
+        await idbSet(myChainKeyName(chatId), await importHmacKey(seed.buffer));
         localStorage.setItem(myChainEpochName(chatId), String(data.epoch));
-        localStorage.setItem(myChainKeyName(chatId), ab2b64(seed));
         localStorage.setItem(myChainRosterName(chatId), JSON.stringify(sortedIds));
     }
 
@@ -402,36 +440,44 @@
         return chainKeysFetchCache;
     }
 
+    // Returns a non-extractable AES-GCM CryptoKey, both the freshly-derived
+    // and the cached-from-IndexedDB case -- decryptWithAES only ever gets a
+    // CryptoKey, never raw key bytes, on this (receiving) path. See #55.
     async function deriveReceivedMessageKey(msg){
-        const cached = localStorage.getItem(msgKeyName(chatId, msg.id));
-        if (cached) return new Uint8Array(b642ab(cached));
+        const cachedKey = await idbGet(msgKeyName(chatId, msg.id));
+        if (cachedKey) return cachedKey;
 
         const senderId = msg.sender_id, msgEpoch = msg.sender_chain_epoch;
         let epoch = localStorage.getItem(recvChainEpochName(chatId, senderId));
         epoch = epoch === null ? null : Number(epoch);
+        let chainKey = epoch === null ? null : await idbGet(recvChainKeyName(chatId, senderId));
 
         if (epoch === null || epoch < msgEpoch) {
             const remote = await fetchChainKeysOnce();
             const entry = remote.get(senderId);
             if (!entry || entry.epoch < msgEpoch) throw new Error('No chain key available for this sender/epoch');
             const seedBuf = await crypto.subtle.decrypt({name:'RSA-OAEP'}, myEncKeys.privateKey, b642ab(entry.encrypted_seed));
+            chainKey = await importHmacKey(seedBuf);
+            await idbSet(recvChainKeyName(chatId, senderId), chainKey);
             localStorage.setItem(recvChainEpochName(chatId, senderId), String(entry.epoch));
-            localStorage.setItem(recvChainKeyName(chatId, senderId), ab2b64(seedBuf));
             epoch = entry.epoch;
         }
         if (epoch !== msgEpoch) throw new Error('Chain epoch mismatch; cannot derive message key');
 
-        const currentBytes = new Uint8Array(b642ab(localStorage.getItem(recvChainKeyName(chatId, senderId))));
-        const { messageKey, nextChainKey } = await ratchetStep(currentBytes);
-        localStorage.setItem(recvChainKeyName(chatId, senderId), ab2b64(nextChainKey.buffer));
-        localStorage.setItem(msgKeyName(chatId, msg.id), ab2b64(messageKey.buffer));
+        const { messageKeyBytes, nextChainKey } = await ratchetStep(chainKey);
+        await idbSet(recvChainKeyName(chatId, senderId), nextChainKey);
+        const messageKey = await importAesKey(messageKeyBytes, ['decrypt']);
+        await idbSet(msgKeyName(chatId, msg.id), messageKey);
         return messageKey;
     }
 
+    // key is always an already-imported AES-GCM CryptoKey here -- callers
+    // that only have raw key bytes (e.g. a freshly-unwrapped self-encrypted
+    // key) import via importAesKey first, so a raw key never needs to pass
+    // through here to get used.
     async function encryptWithAES(key, plaintext) {
         const iv = crypto.getRandomValues(new Uint8Array(12));
-        const ck = await crypto.subtle.importKey('raw',key,{name:'AES-GCM'},false,['encrypt']);
-        const enc = await crypto.subtle.encrypt({name:'AES-GCM',iv},ck,new TextEncoder().encode(plaintext));
+        const enc = await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(plaintext));
         return { ciphertext:ab2b64(enc.slice(0,enc.byteLength-16)), nonce:ab2b64(iv), tag:ab2b64(enc.slice(enc.byteLength-16)) };
     }
 
@@ -439,8 +485,7 @@
         const ct=b642ab(data.ciphertext), nonce=b642ab(data.nonce), tag=b642ab(data.tag);
         const combined=new Uint8Array(ct.byteLength+tag.byteLength);
         combined.set(new Uint8Array(ct)); combined.set(new Uint8Array(tag),ct.byteLength);
-        const ck=await crypto.subtle.importKey('raw',key,{name:'AES-GCM'},false,['decrypt']);
-        return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce},ck,combined));
+        return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce},key,combined));
     }
 
     function importKey(pem,format,algo,usages){
@@ -718,7 +763,7 @@
         await idbDelete(privKeyName(cid));
         await idbDelete(signPrivKeyName(cid));
         await idbDelete(tokenName(cid));
-        destroyChainState(cid);
+        await destroyChainState(cid);
         destroyPinnedKeys(cid);
     }
 
@@ -857,7 +902,7 @@
 
     // updateChainState/appendNewMessages both read-then-later-write shared,
     // non-reentrant state (chainTipHash/Seq, and per-sender ratchet chain
-    // keys in localStorage via deriveReceivedMessageKey) across `await`
+    // keys in IndexedDB via deriveReceivedMessageKey) across `await`
     // points. The app deliberately runs a WebSocket push and a polling
     // fallback concurrently (see connectRealtime/fetchNewMessages below),
     // so two fetches can easily land close enough together to overlap --
@@ -938,7 +983,7 @@
     // "exactly once ever" (not just "once per batch") for that advancement,
     // since it's never cleared and a page reload starts a fresh in-memory
     // Set but relies on deriveReceivedMessageKey's own per-message cache
-    // (keyed by msg.id, in localStorage) to avoid re-advancing on reload.
+    // (keyed by msg.id, in IndexedDB) to avoid re-advancing on reload.
     // Only ever called from processMessages, which serializes overlapping
     // callers (see #68) -- never call this directly.
     async function appendNewMessages(msgs){
@@ -968,21 +1013,22 @@
         const cryptoSteps = []; // {label, ok}
 
         try{
-            let aesKeyBytes;
+            let aesKey;
             if(isMine){
                 cryptoSteps.push({label:'RSA-OAEP key unwrap (self)', ok:null});
                 const wk = msg.my_encrypted_symmetric_key;
                 if(!wk) throw new Error('No self-wrapped key');
-                aesKeyBytes = new Uint8Array(await crypto.subtle.decrypt({name:'RSA-OAEP'},myEncKeys.privateKey,b642ab(wk)));
+                const rawKey = await crypto.subtle.decrypt({name:'RSA-OAEP'},myEncKeys.privateKey,b642ab(wk));
+                aesKey = await importAesKey(rawKey, ['decrypt']);
                 cryptoSteps[0].ok = true;
             } else {
                 cryptoSteps.push({label:'Chain ratchet (forward-secret)', ok:null});
-                aesKeyBytes = await deriveReceivedMessageKey(msg);
+                aesKey = await deriveReceivedMessageKey(msg);
                 cryptoSteps[0].ok = true;
             }
 
             cryptoSteps.push({label:'AES-256-GCM decrypt', ok:null});
-            text = await decryptWithAES(aesKeyBytes,{ciphertext:msg.encrypted_text,nonce:msg.aes_nonce,tag:msg.aes_tag});
+            text = await decryptWithAES(aesKey,{ciphertext:msg.encrypted_text,nonce:msg.aes_nonce,tag:msg.aes_tag});
             cryptoSteps[1].ok = true;
 
             if(!isMine && msg.signature && msg.sender_signing_public_key){
@@ -1106,8 +1152,11 @@
                 return;
             }
             await ensureMyChainKey(recipients);
-            const currentChainBytes = new Uint8Array(b642ab(localStorage.getItem(myChainKeyName(chatId))));
-            const { messageKey, nextChainKey } = await ratchetStep(currentChainBytes);
+            const currentChainKey = await idbGet(myChainKeyName(chatId));
+            // messageKeyBytes exists as raw bytes only transiently, here,
+            // because the RSA-OAEP self-wrap below needs plaintext bytes to
+            // encrypt -- it's never persisted anywhere in this form. See #55.
+            const { messageKeyBytes, nextChainKey } = await ratchetStep(currentChainKey);
             // Do NOT commit nextChainKey yet. A 409 (someone else's message
             // landed first -- an ordinary outcome of concurrent sends, not
             // an error) means this attempt was never actually stored, so
@@ -1121,11 +1170,12 @@
             completeSendStep(0);
 
             advanceSendStep(1);
+            const messageKey = await importAesKey(messageKeyBytes, ['encrypt']);
             const aesEnc=await encryptWithAES(messageKey,plaintext);
             completeSendStep(1);
 
             advanceSendStep(2);
-            const wSelf=await crypto.subtle.encrypt({name:'RSA-OAEP'},myEncKeys.publicKey,messageKey);
+            const wSelf=await crypto.subtle.encrypt({name:'RSA-OAEP'},myEncKeys.publicKey,messageKeyBytes);
             const wrapped_keys=[{recipient_id:Number(myParticipantId),encrypted_symmetric_key:ab2b64(wSelf)}];
             completeSendStep(2);
 
@@ -1152,7 +1202,7 @@
                 // Only now is it safe to commit the ratchet advance -- the
                 // message this key belongs to is confirmed stored, so a
                 // receiver will advance to meet it.
-                localStorage.setItem(myChainKeyName(chatId), ab2b64(nextChainKey.buffer));
+                await idbSet(myChainKeyName(chatId), nextChainKey);
                 messageInput.value='';
                 closeSendModal(true);
                 await fetchNewMessages();
