@@ -471,13 +471,44 @@
         return messageKey;
     }
 
+    // ── Plaintext padding (ciphertext-length hiding) ────────────────────────
+    // AES-GCM ciphertext length is plaintext length + a fixed 16-byte tag,
+    // so without this an observer with access to stored ciphertext (a
+    // compromised DB, or the server operator) could infer message length --
+    // e.g. tell a one-word reply from a paragraph apart -- without ever
+    // breaking the encryption. See issue #58.
+    //
+    // A 4-byte big-endian length prefix + zero-padding to the next
+    // AES_PAD_BUCKET-byte boundary, rather than PKCS#7-style byte-value
+    // padding: PKCS#7 needs the pad *count* to fit in one byte (0-255), but
+    // a full empty bucket here is exactly 256 bytes, which doesn't fit.
+    // This still only hides length to the nearest bucket, not perfectly --
+    // that's the same tradeoff #59's timestamp bucketing makes.
+    const AES_PAD_BUCKET = 256;
+
+    function padPlaintext(bytes) {
+        const withPrefix = new Uint8Array(4 + bytes.byteLength);
+        new DataView(withPrefix.buffer).setUint32(0, bytes.byteLength);
+        withPrefix.set(bytes, 4);
+        const paddedLen = Math.ceil(withPrefix.byteLength / AES_PAD_BUCKET) * AES_PAD_BUCKET;
+        const padded = new Uint8Array(paddedLen); // zero-filled by construction
+        padded.set(withPrefix);
+        return padded;
+    }
+
+    function unpadPlaintext(padded) {
+        const len = new DataView(padded.buffer, padded.byteOffset, padded.byteLength).getUint32(0);
+        return padded.slice(4, 4 + len);
+    }
+
     // key is always an already-imported AES-GCM CryptoKey here -- callers
     // that only have raw key bytes (e.g. a freshly-unwrapped self-encrypted
     // key) import via importAesKey first, so a raw key never needs to pass
     // through here to get used.
     async function encryptWithAES(key, plaintext) {
         const iv = crypto.getRandomValues(new Uint8Array(12));
-        const enc = await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(plaintext));
+        const padded = padPlaintext(new TextEncoder().encode(plaintext));
+        const enc = await crypto.subtle.encrypt({name:'AES-GCM',iv},key,padded);
         return { ciphertext:ab2b64(enc.slice(0,enc.byteLength-16)), nonce:ab2b64(iv), tag:ab2b64(enc.slice(enc.byteLength-16)) };
     }
 
@@ -485,7 +516,8 @@
         const ct=b642ab(data.ciphertext), nonce=b642ab(data.nonce), tag=b642ab(data.tag);
         const combined=new Uint8Array(ct.byteLength+tag.byteLength);
         combined.set(new Uint8Array(ct)); combined.set(new Uint8Array(tag),ct.byteLength);
-        return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce},key,combined));
+        const padded = new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:nonce},key,combined));
+        return new TextDecoder().decode(unpadPlaintext(padded));
     }
 
     function importKey(pem,format,algo,usages){
