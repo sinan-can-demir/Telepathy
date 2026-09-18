@@ -11,6 +11,7 @@ from chat.views import failed_join_attempts
 from chat.models import Chat, ChatParticipant, Message, MessageKey
 from chat.auth import hash_token, IDLE_TIMEOUT
 from chat.chain import GENESIS_HASH, compute_chain_hash
+from chat import services
 
 
 def _fake_public_key_pem():
@@ -567,3 +568,148 @@ class TranscriptChainTests(TestCase):
             list(Message.objects.filter(chat__pin=self.chat_id).order_by("seq").values_list("seq", flat=True)),
             [0, 1],
         )
+
+
+class ChatServicesUnitTests(TestCase):
+    """Exercises chat/services.py directly, with no APIClient/HTTP round
+    trip at all -- the actual point of issue #39/ARCHITECTURE.md #6: these
+    run against the test database in milliseconds instead of driving a
+    full request/response cycle for every domain-rule check."""
+
+    def setUp(self):
+        self.chat, self.alice, self.alice_token = services.create_chat(
+            "alice", _fake_public_key_pem(), max_participants=2
+        )
+        self.bob, self.bob_token = services.join_chat(self.chat, "bob", _fake_public_key_pem())
+
+    def _send(self, sender, **overrides):
+        kwargs = dict(
+            encrypted_text="ct", aes_nonce="n", aes_tag="t", mac="m",
+            wrapped_keys=[{"recipient_id": sender.pk, "encrypted_symmetric_key": "k"}],
+            prev_hash=GENESIS_HASH, sender_chain_epoch=0,
+        )
+        kwargs.update(overrides)
+        return services.send_message(self.chat.pin, sender, **kwargs)
+
+    def test_create_chat_generates_a_4_digit_pin_and_first_participant(self):
+        self.assertRegex(self.chat.pin, r'^\d{4}$')
+        self.assertEqual(self.alice.display_name, "alice")
+        self.assertEqual(self.alice.chat_id, self.chat.pk)
+
+    def test_join_chat_rejects_once_the_chat_is_full(self):
+        with self.assertRaises(services.ChatFull):
+            services.join_chat(self.chat, "carol", _fake_public_key_pem())
+
+    def test_get_chat_raises_not_found_for_an_unknown_pin(self):
+        with self.assertRaises(services.ChatNotFound):
+            services.get_chat("0000")
+
+    def test_leave_chat_keeps_the_chat_alive_while_someone_remains(self):
+        deleted, remaining = services.leave_chat(self.alice, self.chat.pin)
+        self.assertFalse(deleted)
+        self.assertEqual(remaining, 1)
+        self.assertTrue(Chat.objects.filter(pk=self.chat.pk).exists())
+
+    def test_leave_chat_deletes_the_chat_once_everyone_has_left(self):
+        services.leave_chat(self.alice, self.chat.pin)
+        deleted, remaining = services.leave_chat(self.bob, self.chat.pin)
+        self.assertTrue(deleted)
+        self.assertEqual(remaining, 0)
+        self.assertFalse(Chat.objects.filter(pk=self.chat.pk).exists())
+
+    def test_leave_chat_rejects_a_participant_who_isnt_in_that_chat(self):
+        _other_chat, carol, _token = services.create_chat("carol", _fake_public_key_pem(), max_participants=2)
+        with self.assertRaises(services.NotAParticipant):
+            services.leave_chat(carol, self.chat.pin)
+
+    def test_send_message_requires_a_chain_key_to_be_issued_first(self):
+        with self.assertRaises(services.UnknownChainEpoch):
+            self._send(self.alice)
+
+    def test_send_message_rejects_a_stale_chain_epoch(self):
+        epoch = services.issue_chain_key(
+            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
+        )
+        with self.assertRaises(services.StaleChainEpoch):
+            self._send(self.alice, sender_chain_epoch=epoch + 1)
+
+    def test_send_message_rejects_a_stale_prev_hash(self):
+        services.issue_chain_key(
+            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
+        )
+        with self.assertRaises(services.StaleTranscript) as ctx:
+            self._send(self.alice, prev_hash="not-the-real-genesis-hash")
+        self.assertEqual(ctx.exception.expected_prev_hash, GENESIS_HASH)
+
+    def test_send_message_requires_the_senders_own_self_wrap(self):
+        services.issue_chain_key(
+            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
+        )
+        with self.assertRaises(services.MissingSelfWrap):
+            self._send(self.alice, wrapped_keys=[{"recipient_id": self.bob.pk, "encrypted_symmetric_key": "k"}])
+
+    def test_send_message_appends_and_returns_the_created_message(self):
+        services.issue_chain_key(
+            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
+        )
+        msg = self._send(self.alice)
+        self.assertEqual(msg.seq, 0)
+        self.assertEqual(msg.sender_id, self.alice.pk)
+        self.assertEqual(Message.objects.count(), 1)
+
+    def test_issue_chain_key_rejects_wraps_that_dont_cover_exactly_the_roster(self):
+        with self.assertRaises(services.RosterMismatch):
+            services.issue_chain_key(self.chat.pin, self.alice, [])  # missing bob's wrap entirely
+        with self.assertRaises(services.RosterMismatch):
+            services.issue_chain_key(self.chat.pin, self.alice, [
+                {"recipient_id": self.bob.pk, "encrypted_seed": "seed"},
+                {"recipient_id": 999999, "encrypted_seed": "seed"},  # extra, unrelated recipient
+            ])
+
+    def test_issue_chain_key_epoch_increments_per_sender(self):
+        epoch0 = services.issue_chain_key(
+            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "s0"}]
+        )
+        epoch1 = services.issue_chain_key(
+            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "s1"}]
+        )
+        self.assertEqual([epoch0, epoch1], [0, 1])
+
+    def test_get_latest_chain_keys_dedupes_to_the_newest_epoch_per_sender(self):
+        services.issue_chain_key(
+            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "old-seed"}]
+        )
+        services.issue_chain_key(
+            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "new-seed"}]
+        )
+        result = services.get_latest_chain_keys_for_recipient(self.chat, self.bob)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], {"sender_id": self.alice.pk, "epoch": 1, "encrypted_seed": "new-seed"})
+
+    def test_require_same_chat_vs_require_active_participant_differ_on_a_left_participant(self):
+        # Documents a pre-existing, harmless asymmetry between these two
+        # checks rather than silently changing it as part of this refactor:
+        # ParticipantTokenAuthentication already guarantees a left
+        # participant's token can't authenticate at all (chat/auth.py
+        # filters left_at__isnull=True at the query level), so no live
+        # request can ever reach either check with a left participant --
+        # this test exercises the service functions directly, bypassing
+        # that guarantee, specifically to make the distinction visible.
+        services.leave_chat(self.bob, self.chat.pin)
+        bob_row = ChatParticipant.objects.get(pk=self.bob.pk)
+
+        services.require_same_chat(self.chat, bob_row)  # does not raise -- FK check only
+
+        with self.assertRaises(services.NotAParticipant):
+            services.require_active_participant(self.chat, bob_row)
+
+    def test_is_valid_display_name_rejects_empty_and_overlong_names(self):
+        self.assertTrue(services.is_valid_display_name("alice_01"))
+        self.assertFalse(services.is_valid_display_name(""))
+        self.assertFalse(services.is_valid_display_name("a" * 33))
+        self.assertFalse(services.is_valid_display_name("has/slash"))
+
+    def test_is_valid_rsa_public_key_pem_rejects_garbage(self):
+        self.assertTrue(services.is_valid_rsa_public_key_pem(_fake_public_key_pem()))
+        self.assertFalse(services.is_valid_rsa_public_key_pem("not a pem"))
+        self.assertFalse(services.is_valid_rsa_public_key_pem(None))

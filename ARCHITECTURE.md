@@ -4,7 +4,7 @@ This document captures the results of an architecture review of the current code
 
 ## Verdict
 
-The crypto/API layer is solid: end-to-end encryption, transcript tamper-evidence (hash-chained messages), forward secrecy (a per-sender HMAC ratchet), TOFU key verification, and hardened client-side key storage (non-extractable `CryptoKey`s in IndexedDB) are all in place — see `docs/ACCOUNTLESS_IDENTITY.md`, `docs/FORWARD_SECRECY.md`, `docs/KEY_VERIFICATION.md`, and `docs/CLIENT_KEY_STORAGE.md`. The structural data-model problems that used to block group chat and long-term PIN availability are both resolved, and the transport layer now pushes new messages/roster changes over a websocket instead of relying solely on polling. What's left is mostly about *how the code is organized* rather than what it's missing: no service layer (domain logic still lives in view methods).
+The crypto/API layer is solid: end-to-end encryption, transcript tamper-evidence (hash-chained messages), forward secrecy (a per-sender HMAC ratchet), deniable per-message authentication (a ratchet-derived MAC, not a signature — see `docs/DENIABLE_AUTH.md`), TOFU key verification, and hardened client-side key storage (non-extractable `CryptoKey`s in IndexedDB) are all in place — see `docs/ACCOUNTLESS_IDENTITY.md`, `docs/FORWARD_SECRECY.md`, `docs/KEY_VERIFICATION.md`, and `docs/CLIENT_KEY_STORAGE.md`. The structural data-model problems that used to block group chat and long-term PIN availability are both resolved, the transport layer pushes new messages/roster changes over a websocket instead of relying solely on polling, and domain logic now lives in `chat/services.py` rather than directly in view methods. All six items originally listed below are resolved.
 
 ## Known limitations, ranked by how much they block future work
 
@@ -30,11 +30,11 @@ One dependency note worth keeping in mind going forward: `channels_redis==4.2.1`
 
 The server used to also stash `chat_id` in the Django session (read by the page-rendering `chatbox` view), duplicating what the frontend JS already tracked in `localStorage`. The `chatbox` view no longer reads or writes any session state — `localStorage` (used by every fetch-based API call) is the sole source of truth for "what chat is this browser currently in."
 
-### 6. Fat views, no service layer
+### 6. ~~Fat views, no service layer~~ — Resolved
 
-Chat-pairing logic (slot assignment, message cleanup on leave, chain-key issuance) lives directly inside `APIView.post`/`get` methods in `chat/views.py`, mixing HTTP status-code decisions with domain rules. There's no `chat/services.py` or model-level methods (e.g. `Chat.add_participant(user)`) to unit-test independent of DRF request/response plumbing — every test of pairing/leave/visibility logic currently has to go through a full `APIClient` HTTP round trip (tracked as issue #39).
+Chat-pairing/leave/messaging/chain-key rules now live in `chat/services.py` as plain functions taking/returning model values and raising typed exceptions (`ChatNotFound`, `ChatFull`, `NotAParticipant`, `StaleTranscript`, `StaleChainEpoch`, `UnknownChainEpoch`, `MissingSelfWrap`, `RosterMismatch`, ...) for domain-rule violations — never a DRF `Response`. Every `APIView` method in `chat/views.py` is now a thin adapter: parse `request.data`, call into `services`, catch its exceptions, map each to the right HTTP status/body. `ChatServicesUnitTests` in `chat/tests.py` exercises these directly against the test database, with no `APIClient`/HTTP round trip at all (issue #39).
 
-**Direction**: extract pairing/leave/messaging rules into plain functions or model methods that views call into. Lets core chat rules be tested in milliseconds without spinning up the request/response cycle, and makes it easier to compose new behavior (e.g. "notify partner on join") without re-editing the view.
+One deliberate, non-behavior-preserving side effect: a handful of endpoints (`send-message`, `issue-chain-key`, `get-chain-keys`, `get-chat-participants`, `get-messages`) previously returned DRF's default `{"detail": "Not found."}` body for a missing chat, via `get_object_or_404`. They now return `{"message": "Chat not found."}`, matching the convention every other error response in this file already used — status codes are unchanged, and no test asserted the old body.
 
 ## What's already solid and doesn't need to change
 
@@ -53,10 +53,7 @@ Accounts, passwords, and 2FA have been removed entirely. `ChatParticipant` is no
 
 ## What's left for future work
 
-Both structural blockers (#1, #2 above) are resolved, the crypto layer now covers forward secrecy, transcript tamper-evidence, TOFU key verification, and hardened client-side key storage in addition to E2E encryption, and messages/roster changes now push over a websocket instead of relying solely on polling. What remains open:
-
-- **Service layer** (#6 above, issue #39): domain logic is still embedded in view methods.
-- **Forward-secrecy ratchet/message keys still sit in plaintext `localStorage`** (found scoping #21/#42, tracked as issue #55): `docs/CLIENT_KEY_STORAGE.md` fixed the RSA private keys and bearer token specifically, but `chain_my_key_*`/`chain_recv_key_*`/`msgkey_*` have the same XSS-readable exposure and weren't in either issue's original scope.
+All six numbered items above are resolved, including the service layer (#6, issue #39) and the forward-secrecy ratchet/message keys that used to sit in plaintext `localStorage` (issue #55, `docs/CLIENT_KEY_STORAGE.md`/`docs/FORWARD_SECRECY.md`). Remaining open work (a service-layer refactor pass, deployment/feature hardening, and larger strategic bets like post-compromise security or a P2P redesign) is tracked in the issue tracker rather than duplicated here — see `gh issue list`.
 
 ## Network-layer anonymity (Tor) and its rate-limiting tradeoffs
 

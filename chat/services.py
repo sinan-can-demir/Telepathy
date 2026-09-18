@@ -1,0 +1,327 @@
+"""Domain logic for chat creation/join/leave, the forward-secrecy chain-key
+protocol, and message visibility -- kept independent of DRF's request/
+response cycle. See ARCHITECTURE.md #6 / issue #39: this used to live
+directly inside APIView.post/get methods, mixing HTTP status-code decisions
+with the actual chat rules, so testing pairing/leave/visibility logic meant
+going through a full APIClient HTTP round trip every time.
+
+Every function here takes and returns plain Python/model values and raises
+one of the exceptions below for a domain-rule violation -- never a DRF
+Response. chat/views.py is the only place that knows about HTTP status
+codes; it catches these and maps them. That split is what lets these rules
+be unit-tested directly against the test database in milliseconds, with no
+request/response plumbing involved.
+"""
+
+import random
+import re
+import secrets
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from django.db import transaction
+from django.db.models import Max
+from django.utils import timezone
+
+from .auth import hash_token
+from .chain import GENESIS_HASH, compute_chain_hash
+from .models import Chat, ChainKey, ChainKeyWrap, ChatParticipant, Message, MessageKey
+
+
+class ChatServiceError(Exception):
+    """Base class for every domain-rule violation this module raises."""
+
+
+class ChatNotFound(ChatServiceError):
+    pass
+
+
+class ChatFull(ChatServiceError):
+    pass
+
+
+class NotAParticipant(ChatServiceError):
+    """The caller isn't an active participant of the chat they're acting on."""
+
+
+class UnknownChainEpoch(ChatServiceError):
+    """Caller has never issued a chain key in this chat."""
+
+
+class StaleChainEpoch(ChatServiceError):
+    """sender_chain_epoch names an epoch that isn't the sender's current one."""
+
+
+class StaleTranscript(ChatServiceError):
+    """prev_hash doesn't match the chat's actual current tip."""
+
+    def __init__(self, expected_prev_hash):
+        super().__init__("prev_hash does not match the chat's current tip")
+        self.expected_prev_hash = expected_prev_hash
+
+
+class MissingSelfWrap(ChatServiceError):
+    """wrapped_keys didn't include the sender's own self-wrapped copy."""
+
+
+class RosterMismatch(ChatServiceError):
+    """A chain-key issuance's wraps don't cover exactly the current roster."""
+
+
+# ── Validation ────────────────────────────────────────────────────────────
+
+def is_valid_display_name(name):
+    return bool(name) and re.match(r'^[a-zA-Z0-9_ -]{1,32}$', name) is not None
+
+
+# A 2048-bit RSA SPKI PEM is well under 1KB; capping length before ever
+# parsing it keeps a hostile/malformed value from being an amplification
+# vector (see issue #72) and gives load_pem_public_key a bounded input.
+_MAX_PUBLIC_KEY_PEM_LEN = 2000
+
+
+def is_valid_rsa_public_key_pem(pem):
+    """Every client-side importKey call assumes a 2048-bit RSA SPKI PEM
+    (see generateFreshKeys in chatbox.html) -- this checks a submitted key
+    actually is one, rather than only checking it's non-empty. The server
+    still can't (and shouldn't try to) vouch for a key being honestly
+    generated in an E2EE design; this only rules out malformed/wrong-type/
+    oversized values that would otherwise silently break every other
+    participant's crypto calls against this one."""
+    if not pem or len(pem) > _MAX_PUBLIC_KEY_PEM_LEN:
+        return False
+    try:
+        key = serialization.load_pem_public_key(pem.encode())
+    except ValueError:
+        return False
+    return isinstance(key, rsa.RSAPublicKey) and key.key_size == 2048
+
+
+# ── Participant issuance ─────────────────────────────────────────────────
+
+def issue_participant(chat, display_name, public_key):
+    """Creates a ChatParticipant with a fresh bearer token and returns
+    (participant, raw_token). The raw token is never stored -- only its hash
+    is -- and this is the only place in the app it's ever computed."""
+    raw_token = secrets.token_urlsafe(32)
+    participant = ChatParticipant.objects.create(
+        chat=chat,
+        display_name=display_name,
+        public_key=public_key,
+        auth_token_hash=hash_token(raw_token),
+    )
+    return participant, raw_token
+
+
+# ── Chat creation / joining / leaving ────────────────────────────────────
+
+def create_chat(display_name, public_key, max_participants):
+    """Generates a unique 4-digit PIN and creates a new Chat plus its first
+    participant. Returns (chat, participant, raw_token)."""
+    while True:
+        pin = f"{random.randint(0, 9999):04d}"
+        if not Chat.objects.filter(pin=pin).exists():
+            break
+
+    chat = Chat.objects.create(
+        pin=pin,
+        max_participants=max_participants,
+        is_group=max_participants > 2,
+    )
+    participant, raw_token = issue_participant(chat, display_name, public_key)
+    return chat, participant, raw_token
+
+
+def get_chat(chat_id):
+    """Raises ChatNotFound."""
+    try:
+        return Chat.objects.get(pin=chat_id)
+    except Chat.DoesNotExist:
+        raise ChatNotFound()
+
+
+def join_chat(chat, display_name, public_key):
+    """Raises ChatFull. Returns (participant, raw_token)."""
+    active_participants = chat.participants.filter(left_at__isnull=True)
+    if active_participants.count() >= chat.max_participants:
+        raise ChatFull()
+    return issue_participant(chat, display_name, public_key)
+
+
+def list_active_display_names(chat):
+    return list(
+        chat.participants.filter(left_at__isnull=True)
+        .order_by("joined_at")
+        .values_list("display_name", flat=True)
+    )
+
+
+def leave_chat(participant, chat_id):
+    """Marks participant as left; hard-deletes the chat if that empties it
+    -- see #35, this is what actually frees the PIN for reuse (a
+    permanently-retired-but-flagged row would make the PIN unavailable
+    forever, a hard ceiling given there are only 10,000 possible PINs).
+    Returns (chat_deleted: bool, remaining_count: int). Raises
+    ChatNotFound, NotAParticipant."""
+    chat = get_chat(chat_id)
+    if participant.chat_id != chat.pk:
+        raise NotAParticipant()
+
+    participant.left_at = timezone.now()
+    participant.save(update_fields=["left_at"])
+
+    remaining = chat.participants.filter(left_at__isnull=True).count()
+    if remaining == 0:
+        chat.delete()
+        return True, 0
+    return False, remaining
+
+
+# ── Messaging / forward-secrecy ratchet ──────────────────────────────────
+
+def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
+                  wrapped_keys, prev_hash, sender_chain_epoch):
+    """Validates and appends one message under a row lock -- assigning seq
+    here (not client-side) and rejecting a stale prev_hash both prevent two
+    concurrent sends from landing on the same chain position. Raises
+    ChatNotFound, NotAParticipant, UnknownChainEpoch, StaleChainEpoch,
+    StaleTranscript, MissingSelfWrap. Returns the created Message.
+
+    The `sender.left_at is not None` check below can never actually trigger
+    today -- ParticipantTokenAuthentication only ever authenticates a
+    participant whose left_at is still null (see chat/auth.py) -- but it's
+    kept as cheap defense-in-depth against that invariant changing later,
+    rather than relying solely on the auth layer to enforce it."""
+    with transaction.atomic():
+        try:
+            chat = Chat.objects.select_for_update().get(pin=chat_id)
+        except Chat.DoesNotExist:
+            raise ChatNotFound()
+        if sender.chat_id != chat.pk or sender.left_at is not None:
+            raise NotAParticipant()
+
+        # Must be the sender's CURRENT epoch, not merely one that once
+        # existed -- re-keying on roster change (see ChainKey's docstring)
+        # only bounds a leaver's exposure if the server actually refuses a
+        # stale epoch a departed participant could still hold the seed for.
+        # See issue #69.
+        latest_epoch = ChainKey.objects.filter(sender=sender).aggregate(Max("epoch"))["epoch__max"]
+        if latest_epoch is None:
+            raise UnknownChainEpoch()
+        if sender_chain_epoch != latest_epoch:
+            raise StaleChainEpoch()
+
+        tip = chat.messages.order_by("-seq").first()
+        expected_prev_hash = compute_chain_hash(tip) if tip else GENESIS_HASH
+        if prev_hash != expected_prev_hash:
+            raise StaleTranscript(expected_prev_hash)
+
+        self_wrap = next(
+            (wk.get("encrypted_symmetric_key") for wk in wrapped_keys
+             if wk.get("recipient_id") == sender.pk and wk.get("encrypted_symmetric_key")),
+            None,
+        )
+        if not self_wrap:
+            raise MissingSelfWrap()
+
+        msg = Message.objects.create(
+            chat=chat,
+            sender=sender,
+            encrypted_text=encrypted_text,
+            aes_nonce=aes_nonce,
+            aes_tag=aes_tag,
+            mac=mac,
+            seq=(tip.seq + 1) if tip else 0,
+            prev_hash=prev_hash,
+            sender_chain_epoch=sender_chain_epoch,
+        )
+        MessageKey.objects.create(message=msg, recipient=sender, encrypted_symmetric_key=self_wrap)
+
+    return msg
+
+
+def issue_chain_key(chat_id, sender, wraps):
+    """Issues a new epoch of sender's sending-chain seed, RSA-OAEP-wrapped
+    for every currently active *other* participant; wraps must cover
+    exactly that set. Raises ChatNotFound, NotAParticipant, RosterMismatch.
+    Returns the new epoch number."""
+    with transaction.atomic():
+        try:
+            chat = Chat.objects.select_for_update().get(pin=chat_id)
+        except Chat.DoesNotExist:
+            raise ChatNotFound()
+        participant = ChatParticipant.objects.select_for_update().get(pk=sender.pk)
+        if participant.chat_id != chat.pk or participant.left_at is not None:
+            raise NotAParticipant()
+
+        active_other_ids = set(
+            chat.participants.filter(left_at__isnull=True).exclude(pk=participant.pk)
+            .values_list("id", flat=True)
+        )
+        submitted = {
+            w.get("recipient_id"): w.get("encrypted_seed")
+            for w in wraps
+            if w.get("recipient_id") is not None and w.get("encrypted_seed")
+        }
+        if set(submitted.keys()) != active_other_ids:
+            raise RosterMismatch()
+
+        last = ChainKey.objects.filter(sender=participant).order_by("-epoch").first()
+        next_epoch = (last.epoch + 1) if last else 0
+        chain_key = ChainKey.objects.create(chat=chat, sender=participant, epoch=next_epoch)
+        ChainKeyWrap.objects.bulk_create([
+            ChainKeyWrap(chain_key=chain_key, recipient_id=recipient_id, encrypted_seed=seed)
+            for recipient_id, seed in submitted.items()
+        ])
+
+    return next_epoch
+
+
+def get_latest_chain_keys_for_recipient(chat, recipient):
+    """For every sender who has issued at least one chain-key epoch
+    addressed to recipient, returns the LATEST such epoch's wrapped seed --
+    what recipient needs to (re-)seed their receiving-side ratchet for that
+    sender. Returns a list of {"sender_id", "epoch", "encrypted_seed"}."""
+    wraps = (
+        ChainKeyWrap.objects
+        .filter(recipient=recipient, chain_key__chat=chat)
+        .select_related("chain_key")
+        .order_by("chain_key__sender_id", "-chain_key__epoch")
+    )
+    seen_senders = set()
+    result = []
+    for w in wraps:
+        sender_id = w.chain_key.sender_id
+        if sender_id in seen_senders:
+            continue
+        seen_senders.add(sender_id)
+        result.append({
+            "sender_id": sender_id,
+            "epoch": w.chain_key.epoch,
+            "encrypted_seed": w.encrypted_seed,
+        })
+    return result
+
+
+# ── Roster / message visibility ──────────────────────────────────────────
+
+def require_same_chat(chat, participant):
+    """Raises NotAParticipant unless participant belongs to chat at all
+    (their ChatParticipant.chat FK), regardless of active/left status."""
+    if participant.chat_id != chat.pk:
+        raise NotAParticipant()
+
+
+def require_active_participant(chat, participant, active=None):
+    """Raises NotAParticipant unless participant is a currently-active
+    (not left) member of chat. Pass an already-fetched `active` list (from
+    get_active_participants) to avoid a redundant query when the caller
+    needs that list anyway."""
+    if active is None:
+        active = get_active_participants(chat)
+    if not any(p.pk == participant.pk for p in active):
+        raise NotAParticipant()
+
+
+def get_active_participants(chat):
+    return list(chat.participants.filter(left_at__isnull=True))
