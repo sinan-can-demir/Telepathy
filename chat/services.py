@@ -16,6 +16,7 @@ request/response plumbing involved.
 import random
 import re
 import secrets
+from datetime import timedelta
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -25,7 +26,7 @@ from django.utils import timezone
 
 from .auth import hash_token
 from .chain import GENESIS_HASH, compute_chain_hash
-from .models import Chat, ChainKey, ChainKeyWrap, ChatParticipant, Message, MessageKey
+from .models import Chat, ChainKey, ChainKeyWrap, ChatParticipant, Message, MessageKey, MessageReadReceipt
 
 
 class ChatServiceError(Exception):
@@ -68,6 +69,10 @@ class RosterMismatch(ChatServiceError):
     """A chain-key issuance's wraps don't cover exactly the current roster."""
 
 
+class InvalidTTL(ChatServiceError):
+    """A submitted ttl_seconds is out of the allowed range."""
+
+
 # ── Validation ────────────────────────────────────────────────────────────
 
 def is_valid_display_name(name):
@@ -78,6 +83,14 @@ def is_valid_display_name(name):
 # parsing it keeps a hostile/malformed value from being an amplification
 # vector (see issue #72) and gives load_pem_public_key a bounded input.
 _MAX_PUBLIC_KEY_PEM_LEN = 2000
+
+
+# Disappearing-messages TTL bounds (issue #64). Floor keeps a message from
+# vanishing before anyone could plausibly have opened it; ceiling is just a
+# sanity cap, not a security boundary -- ttl_seconds=None (no cap at all)
+# remains the default for an ordinary, non-expiring message.
+MIN_TTL_SECONDS = 5
+MAX_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
 
 
 def is_valid_rsa_public_key_pem(pem):
@@ -180,18 +193,29 @@ def leave_chat(participant, chat_id):
 # ── Messaging / forward-secrecy ratchet ──────────────────────────────────
 
 def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
-                  wrapped_keys, prev_hash, sender_chain_epoch):
+                  wrapped_keys, prev_hash, sender_chain_epoch, ttl_seconds=None):
     """Validates and appends one message under a row lock -- assigning seq
     here (not client-side) and rejecting a stale prev_hash both prevent two
     concurrent sends from landing on the same chain position. Raises
     ChatNotFound, NotAParticipant, UnknownChainEpoch, StaleChainEpoch,
-    StaleTranscript, MissingSelfWrap. Returns the created Message.
+    StaleTranscript, MissingSelfWrap, InvalidTTL. Returns the created
+    Message.
 
     The `sender.left_at is not None` check below can never actually trigger
     today -- ParticipantTokenAuthentication only ever authenticates a
     participant whose left_at is still null (see chat/auth.py) -- but it's
     kept as cheap defense-in-depth against that invariant changing later,
-    rather than relying solely on the auth layer to enforce it."""
+    rather than relying solely on the auth layer to enforce it.
+
+    ttl_seconds (issue #64): if set, the sender's own read receipt is
+    created immediately below -- they've necessarily "read" a message they
+    just composed and sent, the same way isMine skips signature/MAC
+    verification client-side in chatbox.html's renderMsg. Their own copy's
+    expiry window starts now, same as everyone else's starts when they
+    first fetch it (see mark_messages_read)."""
+    if ttl_seconds is not None and not (MIN_TTL_SECONDS <= ttl_seconds <= MAX_TTL_SECONDS):
+        raise InvalidTTL()
+
     with transaction.atomic():
         try:
             chat = Chat.objects.select_for_update().get(pin=chat_id)
@@ -234,10 +258,91 @@ def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
             seq=(tip.seq + 1) if tip else 0,
             prev_hash=prev_hash,
             sender_chain_epoch=sender_chain_epoch,
+            ttl_seconds=ttl_seconds,
         )
         MessageKey.objects.create(message=msg, recipient=sender, encrypted_symmetric_key=self_wrap)
+        if ttl_seconds is not None:
+            MessageReadReceipt.objects.create(message=msg, participant=sender)
 
     return msg
+
+
+# ── Disappearing messages (issue #64) ────────────────────────────────────
+
+def mark_messages_read(chat, participant, messages):
+    """Records that participant has just fetched each expiring, not-yet-
+    tombstoned message in `messages` -- this app's only available "read"
+    signal, since the server never sees plaintext or a client-side
+    decrypt-success confirmation. Idempotent (ignore_conflicts against the
+    (message, participant) unique constraint), so calling this on every
+    poll/fetch is cheap and safe."""
+    expiring_ids = [m.id for m in messages if m.ttl_seconds is not None and m.tombstone_hash is None]
+    if not expiring_ids:
+        return
+    MessageReadReceipt.objects.bulk_create(
+        [MessageReadReceipt(message_id=mid, participant=participant) for mid in expiring_ids],
+        ignore_conflicts=True,
+    )
+
+
+def _tombstone(msg):
+    """Wipes msg's actual content, preserving compute_chain_hash's result
+    from the moment before the wipe so later messages' prev_hash stays
+    verifiable -- see Message.tombstone_hash. Both the sender's self-wrap
+    and everyone's read receipts are deleted along with it; neither has any
+    remaining purpose once the content they refer to is gone."""
+    msg.tombstone_hash = compute_chain_hash(msg)
+    msg.encrypted_text = None
+    msg.aes_nonce = None
+    msg.aes_tag = None
+    msg.mac = None
+    msg.tombstoned_at = timezone.now()
+    msg.save(update_fields=["tombstone_hash", "encrypted_text", "aes_nonce", "aes_tag", "mac", "tombstoned_at"])
+    MessageKey.objects.filter(message=msg).delete()
+    MessageReadReceipt.objects.filter(message=msg).delete()
+
+
+def sweep_expired_messages(chat):
+    """Tombstones every message in chat whose TTL has fully elapsed for
+    everyone who could still legitimately need to read it. Called lazily on
+    every message fetch (see views.GetMessagesView) -- this app has no
+    scheduled/cron job anywhere, consistent with how idle-token reclaim
+    (chat/auth.py) and empty-chat deletion (leave_chat above) already work.
+
+    "Could still legitimately need to read it" means: currently active
+    (not left) AND was already in the chat when the message was sent. The
+    second clause matters -- per forward secrecy, a participant who joined
+    afterward can never derive that epoch's key at all (see
+    docs/FORWARD_SECRECY.md), so waiting on a read receipt from them would
+    be waiting forever; their absence can't be what blocks expiry.
+
+    If nobody who was present at send time is still active, the message is
+    already permanently undecryptable to everyone remaining regardless of
+    ttl_seconds -- tombstoned immediately rather than waited out, since
+    keeping unreachable ciphertext around serves no purpose."""
+    now = timezone.now()
+    candidates = chat.messages.filter(ttl_seconds__isnull=False, tombstone_hash__isnull=True)
+
+    for msg in candidates:
+        required_ids = set(
+            chat.participants.filter(left_at__isnull=True, joined_at__lte=msg.timestamp)
+            .values_list("id", flat=True)
+        )
+        if not required_ids:
+            _tombstone(msg)
+            continue
+
+        read_at_by_participant = dict(
+            MessageReadReceipt.objects
+            .filter(message=msg, participant_id__in=required_ids)
+            .values_list("participant_id", "read_at")
+        )
+        if len(read_at_by_participant) < len(required_ids):
+            continue  # someone who's required to has not read it at all yet
+
+        cutoff = timedelta(seconds=msg.ttl_seconds)
+        if all(now - read_at >= cutoff for read_at in read_at_by_participant.values()):
+            _tombstone(msg)
 
 
 def issue_chain_key(chat_id, sender, wraps):

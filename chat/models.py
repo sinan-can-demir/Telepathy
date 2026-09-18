@@ -82,7 +82,10 @@ class Message(models.Model):
         related_name="sent_messages",
         db_index=True,
     )
-    encrypted_text = models.TextField()
+    # Nullable so a tombstoned (expired, see ttl_seconds below) message can
+    # have its actual content wiped while the row itself survives, keeping
+    # the chain intact -- see tombstone_hash.
+    encrypted_text = models.TextField(null=True, blank=True)
     aes_nonce = models.TextField(null=True, blank=True)
     aes_tag = models.TextField(null=True, blank=True)
     # HMAC-SHA256 tag (Base64) over seq|prev_hash|chat_id|plaintext, keyed by
@@ -91,6 +94,28 @@ class Message(models.Model):
     # participants), but not provable to a third party the way an RSA-PSS
     # signature would be. See docs/DENIABLE_AUTH.md (issue #61).
     mac = models.TextField(null=True, blank=True)
+
+    # Per-message disappearing-messages TTL (issue #64), in seconds from
+    # when a given reader first reads this message -- null means "never
+    # expires". "Read" is tracked per participant in MessageReadReceipt
+    # below; see services.sweep_expired_messages for when a message
+    # actually gets wiped. Deliberately per-message (Signal-style), not
+    # per-chat -- see docs/MESSAGE_EXPIRY.md for why that's a materially
+    # bigger design than it sounds, and how it interacts with the
+    # transcript tamper-evidence chain below.
+    ttl_seconds = models.PositiveIntegerField(null=True, blank=True)
+
+    # Set exactly once, the moment this message becomes eligible for
+    # content wipe (services.sweep_expired_messages) -- compute_chain_hash's
+    # result for this message AT THAT MOMENT, preserved so every later
+    # message's prev_hash (computed against this message before it was
+    # wiped) stays verifiable forever after. Without this, wiping
+    # encrypted_text/aes_nonce/aes_tag/mac below would change what
+    # compute_chain_hash(this message) returns, breaking the chain for
+    # every message that came after it -- a false tamper signal caused by
+    # expiry working as designed, not an attack. See docs/MESSAGE_EXPIRY.md.
+    tombstone_hash = models.CharField(max_length=64, null=True, blank=True)
+    tombstoned_at = models.DateTimeField(null=True, blank=True)
 
     # Transcript tamper-evidence: seq is assigned atomically per chat
     # (SendMessageView, under a row lock) so gaps/duplicates are impossible
@@ -125,6 +150,27 @@ class Message(models.Model):
 
     def __str__(self):
         return f"From {self.sender} at {self.timestamp}"
+
+
+class MessageReadReceipt(models.Model):
+    """Records that `participant` has fetched (and so, in this app's only
+    available signal -- the server never sees plaintext or a client-side
+    decrypt-success confirmation -- is treated as having read) `message`.
+    Exists purely to drive disappearing-messages expiry (issue #64):
+    `read_at + message.ttl_seconds` is when this specific participant's own
+    reading window on this message ends. See services.mark_messages_read
+    and services.sweep_expired_messages. Deleted once its message is
+    tombstoned -- a read receipt for content that no longer exists has no
+    further purpose."""
+    message = models.ForeignKey(Message, related_name="read_receipts", on_delete=models.CASCADE)
+    participant = models.ForeignKey(ChatParticipant, related_name="message_reads", on_delete=models.CASCADE)
+    read_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("message", "participant")]
+
+    def __str__(self):
+        return f"{self.participant} read {self.message_id} at {self.read_at}"
 
 
 class MessageKey(models.Model):

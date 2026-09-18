@@ -8,7 +8,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from chat.views import failed_join_attempts
-from chat.models import Chat, ChatParticipant, Message, MessageKey
+from chat.models import Chat, ChatParticipant, Message, MessageKey, MessageReadReceipt
 from chat.auth import hash_token, IDLE_TIMEOUT
 from chat.chain import GENESIS_HASH, compute_chain_hash
 from chat import services
@@ -713,3 +713,176 @@ class ChatServicesUnitTests(TestCase):
         self.assertTrue(services.is_valid_rsa_public_key_pem(_fake_public_key_pem()))
         self.assertFalse(services.is_valid_rsa_public_key_pem("not a pem"))
         self.assertFalse(services.is_valid_rsa_public_key_pem(None))
+
+
+class MessageExpiryUnitTests(TestCase):
+    """Disappearing messages (issue #64): per-message TTL, read-time
+    expiry, and the tombstoning that wipes content while keeping the
+    transcript hash chain intact. All against chat/services.py directly --
+    same rationale as ChatServicesUnitTests."""
+
+    def setUp(self):
+        self.chat, self.alice, _ = services.create_chat("alice", _fake_public_key_pem(), max_participants=3)
+        self.bob, _ = services.join_chat(self.chat, "bob", _fake_public_key_pem())
+        services.issue_chain_key(self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}])
+
+    def _send(self, ttl_seconds=None):
+        return services.send_message(
+            self.chat.pin, self.alice,
+            encrypted_text="ct", aes_nonce="n", aes_tag="t", mac="m",
+            wrapped_keys=[{"recipient_id": self.alice.pk, "encrypted_symmetric_key": "k"}],
+            prev_hash=GENESIS_HASH, sender_chain_epoch=0, ttl_seconds=ttl_seconds,
+        )
+
+    def test_send_message_without_ttl_creates_no_read_receipt(self):
+        msg = self._send(ttl_seconds=None)
+        self.assertEqual(MessageReadReceipt.objects.filter(message=msg).count(), 0)
+
+    def test_send_message_with_ttl_auto_reads_for_the_sender(self):
+        msg = self._send(ttl_seconds=60)
+        self.assertTrue(MessageReadReceipt.objects.filter(message=msg, participant=self.alice).exists())
+
+    def test_send_message_rejects_ttl_out_of_bounds(self):
+        with self.assertRaises(services.InvalidTTL):
+            self._send(ttl_seconds=services.MIN_TTL_SECONDS - 1)
+        with self.assertRaises(services.InvalidTTL):
+            self._send(ttl_seconds=services.MAX_TTL_SECONDS + 1)
+
+    def test_sweep_does_not_tombstone_until_everyone_required_has_read_it(self):
+        msg = self._send(ttl_seconds=60)
+        services.sweep_expired_messages(self.chat)
+        msg.refresh_from_db()
+        self.assertIsNone(msg.tombstone_hash)  # bob hasn't read it yet
+
+    def test_sweep_does_not_tombstone_before_ttl_elapses(self):
+        msg = self._send(ttl_seconds=60)
+        services.mark_messages_read(self.chat, self.bob, [msg])
+        services.sweep_expired_messages(self.chat)
+        msg.refresh_from_db()
+        self.assertIsNone(msg.tombstone_hash)  # read by everyone, but 60s hasn't passed
+
+    def test_sweep_tombstones_once_everyone_required_has_read_and_ttl_elapsed(self):
+        msg = self._send(ttl_seconds=60)
+        services.mark_messages_read(self.chat, self.bob, [msg])
+        stale = timezone.now() - timedelta(seconds=61)
+        MessageReadReceipt.objects.filter(message=msg).update(read_at=stale)
+
+        services.sweep_expired_messages(self.chat)
+        msg.refresh_from_db()
+        self.assertIsNotNone(msg.tombstone_hash)
+        self.assertIsNone(msg.encrypted_text)
+        self.assertIsNone(msg.aes_nonce)
+        self.assertIsNone(msg.aes_tag)
+        self.assertIsNone(msg.mac)
+        self.assertIsNotNone(msg.tombstoned_at)
+        self.assertEqual(MessageKey.objects.filter(message=msg).count(), 0)
+        self.assertEqual(MessageReadReceipt.objects.filter(message=msg).count(), 0)
+
+    def test_tombstoning_preserves_the_original_chain_hash(self):
+        msg = self._send(ttl_seconds=60)
+        original_hash = compute_chain_hash(msg)
+        services.mark_messages_read(self.chat, self.bob, [msg])
+        MessageReadReceipt.objects.filter(message=msg).update(read_at=timezone.now() - timedelta(seconds=61))
+
+        services.sweep_expired_messages(self.chat)
+        msg.refresh_from_db()
+        self.assertEqual(compute_chain_hash(msg), original_hash)
+
+    def test_a_later_joiner_cannot_block_expiry(self):
+        # Forward secrecy already means someone who joins after a message
+        # was sent can never decrypt it -- their never reading it can't be
+        # what's blocking expiry.
+        msg = self._send(ttl_seconds=60)
+        services.mark_messages_read(self.chat, self.bob, [msg])
+        MessageReadReceipt.objects.filter(message=msg).update(read_at=timezone.now() - timedelta(seconds=61))
+
+        services.join_chat(self.chat, "carol", _fake_public_key_pem())  # joined after msg, never reads it
+
+        services.sweep_expired_messages(self.chat)
+        msg.refresh_from_db()
+        self.assertIsNotNone(msg.tombstone_hash)
+
+    def test_expiry_unblocks_once_a_never_reading_participant_leaves(self):
+        msg = self._send(ttl_seconds=60)
+        services.leave_chat(self.bob, self.chat.pin)  # bob never read it, then left
+
+        services.sweep_expired_messages(self.chat)
+        msg.refresh_from_db()
+        self.assertIsNone(msg.tombstone_hash)  # alice's own read receipt isn't stale yet
+
+        MessageReadReceipt.objects.filter(message=msg).update(read_at=timezone.now() - timedelta(seconds=61))
+        services.sweep_expired_messages(self.chat)
+        msg.refresh_from_db()
+        self.assertIsNotNone(msg.tombstone_hash)
+
+    def test_mark_messages_read_is_idempotent(self):
+        msg = self._send(ttl_seconds=60)
+        services.mark_messages_read(self.chat, self.bob, [msg])
+        services.mark_messages_read(self.chat, self.bob, [msg])  # must not raise
+        self.assertEqual(MessageReadReceipt.objects.filter(message=msg, participant=self.bob).count(), 1)
+
+    def test_mark_messages_read_ignores_non_expiring_messages(self):
+        msg = self._send(ttl_seconds=None)
+        services.mark_messages_read(self.chat, self.bob, [msg])
+        self.assertEqual(MessageReadReceipt.objects.filter(message=msg).count(), 0)
+
+
+class MessageExpiryHTTPTests(TestCase):
+    """A couple of tests through the real send-message/get-messages
+    endpoints, to confirm the service-level behavior above is actually
+    wired up correctly -- not just correct in isolation."""
+
+    def setUp(self):
+        failed_join_attempts.clear()
+        self.alice = APIClient()
+        self.bob = APIClient()
+        create = _create_chat(self.alice, display_name="alice")
+        self.chat_id = create.data["chat_id"]
+        self.alice.credentials(HTTP_AUTHORIZATION=f"Token {create.data['participant_token']}")
+        self.alice_id = create.data["participant_id"]
+
+        join = _join_chat(self.bob, self.chat_id, display_name="bob")
+        self.bob.credentials(HTTP_AUTHORIZATION=f"Token {join.data['participant_token']}")
+        self.bob_id = join.data["participant_id"]
+
+        issued = _issue_chain_key(self.alice, self.chat_id, [self.bob_id])
+        self.epoch = issued.data["epoch"]
+
+    def _send(self, ttl_seconds):
+        return self.alice.post(
+            f"/chat/send-message/{self.chat_id}/",
+            {
+                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "m",
+                "prev_hash": GENESIS_HASH, "sender_chain_epoch": self.epoch, "ttl_seconds": ttl_seconds,
+                "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "k"}],
+            },
+            format="json",
+        )
+
+    def test_send_message_accepts_and_returns_ttl_seconds(self):
+        send = self._send(ttl_seconds=60)
+        self.assertEqual(send.status_code, 201, send.data)
+        self.assertEqual(send.data["ttl_seconds"], 60)
+        self.assertIsNone(send.data["tombstone_hash"])
+
+    def test_send_message_rejects_a_too_short_ttl(self):
+        send = self._send(ttl_seconds=1)
+        self.assertEqual(send.status_code, 400)
+
+    def test_get_messages_serves_an_already_tombstoned_message(self):
+        send = self._send(ttl_seconds=60)
+        msg_id = send.data["id"]
+
+        # bob fetches (marks his own read receipt), then both receipts get
+        # backdated so the sweep on the *next* fetch tombstones it.
+        fetch = self.bob.get(f"/chat/get-messages/{self.chat_id}/")
+        self.assertEqual(fetch.status_code, 200)
+        MessageReadReceipt.objects.filter(message_id=msg_id).update(
+            read_at=timezone.now() - timedelta(seconds=61)
+        )
+
+        second_fetch = self.bob.get(f"/chat/get-messages/{self.chat_id}/")
+        self.assertEqual(second_fetch.status_code, 200)
+        msg_data = next(m for m in second_fetch.data["messages"] if m["id"] == msg_id)
+        self.assertIsNotNone(msg_data["tombstone_hash"])
+        self.assertIsNone(msg_data["encrypted_text"])

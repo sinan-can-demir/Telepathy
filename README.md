@@ -39,7 +39,8 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 ```
 Telepathy/
 ├── chat/                       # Main Django application
-│   ├── models.py               # User (admin-only), Chat, ChatParticipant, Message, MessageKey, ChainKey, ChainKeyWrap
+│   ├── models.py               # User (admin-only), Chat, ChatParticipant, Message, MessageKey, MessageReadReceipt, ChainKey, ChainKeyWrap
+│   ├── services.py             # Domain logic (create/join/leave/send/expire), independent of DRF request/response
 │   ├── chain.py                 # Transcript hash-chain helper (compute_chain_hash)
 │   ├── views.py                # REST API views (create/join chat, send/get messages, etc.)
 │   ├── auth.py                 # ParticipantTokenAuthentication -- see docs/ACCOUNTLESS_IDENTITY.md
@@ -279,6 +280,17 @@ A participant's entire identity for exactly one chat — see [docs/ACCOUNTLESS_I
 | `mac` | `TextField` | HMAC-SHA256 tag (Base64), covering `seq\|prev_hash\|chat_id\|plaintext`, keyed from the sender's ratchet -- deniable, see [docs/DENIABLE_AUTH.md](docs/DENIABLE_AUTH.md) |
 | `seq` / `prev_hash` | `PositiveIntegerField` / `CharField` | Position in the chat's tamper-evident hash chain (see `chat/chain.py`) |
 | `sender_chain_epoch` | `PositiveIntegerField` | Which epoch of the sender's forward-secret ratchet this message's key came from (see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md)) |
+| `ttl_seconds` | `PositiveIntegerField`, nullable | Disappearing-messages TTL, set at send time; null (the default) means never expires -- see [docs/MESSAGE_EXPIRY.md](docs/MESSAGE_EXPIRY.md) |
+| `tombstone_hash` / `tombstoned_at` | `CharField` / `DateTimeField`, nullable | Set once, the moment `encrypted_text`/`aes_nonce`/`aes_tag`/`mac` above are wiped by expiry -- preserves the chain hash those fields used to determine, so later messages stay verifiable |
+
+### `MessageReadReceipt`
+Drives disappearing-messages expiry (`docs/MESSAGE_EXPIRY.md`): a fetch of `GET /chat/get-messages/` is this app's only available "read" signal, since the server never sees plaintext. Deleted once its message is tombstoned.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `message` | `FK(Message)` | The message this receipt is for |
+| `participant` | `FK(ChatParticipant)` | Who read it |
+| `read_at` | `DateTimeField` | When their TTL window on this message started |
 
 ### `MessageKey`
 As of forward secrecy, only ever holds the **sender's own** self-wrapped copy of a message's AES key (so they can always redisplay their own sent history). Other participants derive the key locally from their cached copy of the sender's chain instead of unwrapping a per-message key — see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md).
