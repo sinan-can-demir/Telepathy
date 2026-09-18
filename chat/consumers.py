@@ -1,5 +1,3 @@
-from urllib.parse import parse_qs
-
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 
@@ -16,15 +14,17 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
     purely additive.
 
     Auth: browsers can't set custom headers on `new WebSocket(...)`, so the
-    bearer token travels via query string (?token=...) instead of the
-    Authorization header ParticipantTokenAuthentication expects over HTTP --
-    same hash-and-lookup, different transport.
+    bearer token travels as a Sec-WebSocket-Protocol value (the second
+    argument to `new WebSocket(url, [token])`) instead of the Authorization
+    header ParticipantTokenAuthentication expects over HTTP -- same
+    hash-and-lookup, different transport. This deliberately avoids putting
+    the token in the URL (see issue #57): a query string ends up in access
+    logs, proxy logs, and browser history; a request header field doesn't.
     """
 
     async def connect(self):
         chat_id = self.scope["url_route"]["kwargs"]["chat_id"]
-        query = parse_qs(self.scope["query_string"].decode())
-        raw_token = (query.get("token") or [None])[0]
+        raw_token = (self.scope.get("subprotocols") or [None])[0]
 
         participant = await self._authenticate(chat_id, raw_token)
         if participant is None:
@@ -33,7 +33,10 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
         self.group_name = f"chat_{chat_id}"
         await self.channel_layer.group_add(self.group_name, self.channel_name)
-        await self.accept()
+        # Echoing the subprotocol back is required by the WebSocket spec for
+        # the client to consider one "selected" -- without it some clients
+        # treat the handshake as not having agreed on a subprotocol at all.
+        await self.accept(subprotocol=raw_token)
 
     async def disconnect(self, close_code):
         if getattr(self, "group_name", None):
