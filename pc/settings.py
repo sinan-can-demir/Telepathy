@@ -12,8 +12,19 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 from pathlib import Path
 import os
 
+from dotenv import load_dotenv
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Loads a local .env (see .env.example) for a plain `manage.py runserver`
+# run outside any container -- previously only podman-compose read this
+# file (via its own variable-substitution, not Django), so a bare local
+# run had no way to persist DJANGO_SECURE=false/DJANGO_DEBUG=true/DB_*/
+# REDIS_* across terminal sessions (see issue #66). override=False (the
+# default) means an already-set real environment variable -- e.g. inside
+# a container -- always wins over whatever's in .env.
+load_dotenv(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production
