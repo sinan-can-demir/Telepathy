@@ -215,6 +215,10 @@ class SendMessageView(APIView):
     transmitted or stored for them anymore. sender_chain_epoch records which
     epoch that derivation used, for recipients to know whether to keep
     advancing their cached state or fetch a newer epoch's seed first.
+
+    ttl_seconds (issue #64) is optional -- omitted or null means the
+    message never expires, matching every message before this feature
+    existed. See docs/MESSAGE_EXPIRY.md.
     """
     authentication_classes = [ParticipantTokenAuthentication]
     permission_classes = [permissions.IsAuthenticated]
@@ -229,16 +233,25 @@ class SendMessageView(APIView):
         wrapped_keys = request.data.get("wrapped_keys")
         prev_hash = request.data.get("prev_hash")
         sender_chain_epoch = request.data.get("sender_chain_epoch")
+        raw_ttl_seconds = request.data.get("ttl_seconds")
 
         if not all([encrypted_text, aes_nonce, aes_tag, mac, prev_hash]) or not wrapped_keys \
                 or sender_chain_epoch is None:
             return Response({"message": "Missing required encryption fields."}, status=400)
+
+        ttl_seconds = None
+        if raw_ttl_seconds is not None:
+            try:
+                ttl_seconds = int(raw_ttl_seconds)
+            except (TypeError, ValueError):
+                return Response({"message": "ttl_seconds must be an integer."}, status=400)
 
         try:
             msg = services.send_message(
                 chat_id, me,
                 encrypted_text=encrypted_text, aes_nonce=aes_nonce, aes_tag=aes_tag, mac=mac,
                 wrapped_keys=wrapped_keys, prev_hash=prev_hash, sender_chain_epoch=sender_chain_epoch,
+                ttl_seconds=ttl_seconds,
             )
         except services.ChatNotFound:
             return Response({"message": "Chat not found."}, status=404)
@@ -261,6 +274,14 @@ class SendMessageView(APIView):
             )
         except services.MissingSelfWrap:
             return Response({"message": "Missing self-wrapped key."}, status=400)
+        except services.InvalidTTL:
+            return Response(
+                {
+                    "message": f"ttl_seconds must be between {services.MIN_TTL_SECONDS} and "
+                               f"{services.MAX_TTL_SECONDS}.",
+                },
+                status=400,
+            )
 
         notify_chat(chat_id, "new_message")
         return Response(MessageSerializer(msg, context={"request": request}).data, status=201)
@@ -391,8 +412,14 @@ class GetMessagesView(APIView):
         others = [p for p in active_participants if p.pk != me.pk]
         partner = others[0] if len(others) == 1 else None
 
-        messages_qs = chat.messages.order_by("timestamp").prefetch_related("wrapped_keys")
-        serializer_data = MessageSerializer(messages_qs, many=True, context={'request': request}).data
+        # Disappearing messages (issue #64): sweep first so a message that
+        # just crossed its TTL for everyone is served already-tombstoned,
+        # then record this fetch as *this* participant having read whatever
+        # comes back -- see services.sweep_expired_messages/mark_messages_read.
+        services.sweep_expired_messages(chat)
+        messages = list(chat.messages.order_by("timestamp").prefetch_related("wrapped_keys"))
+        services.mark_messages_read(chat, me, messages)
+        serializer_data = MessageSerializer(messages, many=True, context={'request': request}).data
 
         return Response({
             "messages":                    serializer_data,

@@ -36,6 +36,16 @@ class MessageSerializer(serializers.ModelSerializer):
             "sender_id",
             "sender_public_key",
             "sender_username",
+            # Disappearing messages (issue #64): ttl_seconds is null for an
+            # ordinary, non-expiring message. tombstone_hash is only ever
+            # set once this message's content has been wiped (see
+            # services.sweep_expired_messages) -- its presence is what
+            # chatbox.html uses to render an "expired" placeholder instead
+            # of attempting to decrypt now-null encrypted_text/aes_nonce/
+            # aes_tag/mac, and to short-circuit its own chain-hash walk to
+            # this persisted value instead of recomputing from those nulls.
+            "ttl_seconds",
+            "tombstone_hash",
         ]
 
     def get_my_encrypted_symmetric_key(self, obj):
