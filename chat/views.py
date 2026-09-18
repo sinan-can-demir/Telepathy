@@ -2,23 +2,14 @@ import secrets
 from rest_framework.views import APIView
 from rest_framework import status, permissions
 from .serializers import MessageSerializer
-from .models import Message, MessageKey
 import logging
 from collections import defaultdict
-import re
-import random
 import time
-from .models import Chat, ChatParticipant, ChainKey, ChainKeyWrap
-from django.db import transaction
-from django.db.models import Max
-from django.utils import timezone
-from django.shortcuts import render, redirect, get_object_or_404
+from django.shortcuts import render, redirect
 from rest_framework.response import Response
-from .auth import ParticipantTokenAuthentication, hash_token
-from .chain import GENESIS_HASH, compute_chain_hash
+from .auth import ParticipantTokenAuthentication
 from .realtime import notify_chat
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from . import services
 
 
 # Track failed chat-join attempts per source IP, to slow brute-forcing the
@@ -34,49 +25,8 @@ failed_join_attempts = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fai
 logger = logging.getLogger(__name__)
 
 
-def _is_valid_display_name(name):
-    return bool(name) and re.match(r'^[a-zA-Z0-9_ -]{1,32}$', name) is not None
-
-
-# A 2048-bit RSA SPKI PEM is well under 1KB; capping length before ever
-# parsing it keeps a hostile/malformed value from being an amplification
-# vector (see issue #72) and gives load_pem_public_key a bounded input.
-_MAX_PUBLIC_KEY_PEM_LEN = 2000
-
-
-def _is_valid_rsa_public_key_pem(pem):
-    """Every client-side importKey call assumes a 2048-bit RSA SPKI PEM
-    (see generateFreshKeys in chatbox.html) -- this checks a submitted key
-    actually is one, rather than only checking it's non-empty. The server
-    still can't (and shouldn't try to) vouch for a key being honestly
-    generated in an E2EE design; this only rules out malformed/wrong-type/
-    oversized values that would otherwise silently break every other
-    participant's crypto calls against this one."""
-    if not pem or len(pem) > _MAX_PUBLIC_KEY_PEM_LEN:
-        return False
-    try:
-        key = serialization.load_pem_public_key(pem.encode())
-    except ValueError:
-        return False
-    return isinstance(key, rsa.RSAPublicKey) and key.key_size == 2048
-
-
 def _client_ip(request):
     return request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
-
-
-def _issue_participant(chat, display_name, public_key):
-    """Creates a ChatParticipant with a fresh bearer token and returns
-    (participant, raw_token). The raw token is never stored -- only its hash
-    is -- and this is the only place in the app it's ever computed."""
-    raw_token = secrets.token_urlsafe(32)
-    participant = ChatParticipant.objects.create(
-        chat=chat,
-        display_name=display_name,
-        public_key=public_key,
-        auth_token_hash=hash_token(raw_token),
-    )
-    return participant, raw_token
 
 
 # Home Page View - renders index.html
@@ -116,11 +66,11 @@ class CreateChatView(APIView):
 
     def post(self, request):
         public_key = request.data.get("public_key")
-        if not _is_valid_rsa_public_key_pem(public_key):
+        if not services.is_valid_rsa_public_key_pem(public_key):
             return Response({"message": "public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
 
         display_name = request.data.get("display_name") or f"Participant-{secrets.token_hex(2)}"
-        if not _is_valid_display_name(display_name):
+        if not services.is_valid_display_name(display_name):
             return Response({"message": "Invalid display name."}, status=400)
 
         raw_max_participants = request.data.get("max_participants", 2)
@@ -131,23 +81,11 @@ class CreateChatView(APIView):
         if not (2 <= max_participants <= 8):
             return Response({"message": "max_participants must be between 2 and 8."}, status=400)
 
-        while True:
-            pin = f"{random.randint(0, 9999):04d}"
-            if not Chat.objects.filter(pin=pin).exists():
-                break
-
-        chat = Chat.objects.create(
-            pin=pin,
-            max_participants=max_participants,
-            is_group=max_participants > 2,
-        )
-        participant, raw_token = _issue_participant(
-            chat, display_name, public_key
-        )
+        chat, participant, raw_token = services.create_chat(display_name, public_key, max_participants)
         logger.info(f"[CREATE-CHAT] Created chat {chat}, PIN: {chat.pin}")
 
         return Response(
-            {"chat_id": pin, "participant_token": raw_token, "participant_id": participant.pk},
+            {"chat_id": chat.pin, "participant_token": raw_token, "participant_id": participant.pk},
             status=201,
         )
 
@@ -168,11 +106,11 @@ class JoinChatView(APIView):
             return Response({"message": "Chat ID is required."}, status=400)
 
         public_key = request.data.get("public_key")
-        if not _is_valid_rsa_public_key_pem(public_key):
+        if not services.is_valid_rsa_public_key_pem(public_key):
             return Response({"message": "public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
 
         display_name = request.data.get("display_name") or f"Participant-{secrets.token_hex(2)}"
-        if not _is_valid_display_name(display_name):
+        if not services.is_valid_display_name(display_name):
             return Response({"message": "Invalid display name."}, status=400)
 
         # -- Rate limiting by source IP -- the only signal available before a
@@ -188,8 +126,8 @@ class JoinChatView(APIView):
             )
 
         try:
-            chat = Chat.objects.get(pin=chat_id)
-        except Chat.DoesNotExist:
+            chat = services.get_chat(chat_id)
+        except services.ChatNotFound:
             entry["fail_count"] += 1
             if entry["fail_count"] >= 5:
                 entry["wait_time"] = entry["wait_time"] * 2 if entry["wait_time"] else 10
@@ -202,13 +140,11 @@ class JoinChatView(APIView):
 
         failed_join_attempts.pop(ip, None)
 
-        active_participants = chat.participants.filter(left_at__isnull=True)
-        if active_participants.count() >= chat.max_participants:
+        try:
+            participant, raw_token = services.join_chat(chat, display_name, public_key)
+        except services.ChatFull:
             return Response({"message": "Chat is full."}, status=400)
 
-        participant, raw_token = _issue_participant(
-            chat, display_name, public_key
-        )
         logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat_id}'.")
         notify_chat(chat_id, "roster_changed")
         return Response(
@@ -225,28 +161,18 @@ class CheckChatView(APIView):
 
     def get(self, request, chat_id):
         try:
-            chat = Chat.objects.get(pin=chat_id)
-            participants = list(
-                chat.participants.filter(left_at__isnull=True)
-                .order_by("joined_at")
-                .values_list("display_name", flat=True)
-            )
-            return Response({"exists": True, "participants": participants}, status=status.HTTP_200_OK)
-        except Chat.DoesNotExist:
+            chat = services.get_chat(chat_id)
+        except services.ChatNotFound:
             return Response({"exists": False}, status=status.HTTP_404_NOT_FOUND)
+        participants = services.list_active_display_names(chat)
+        return Response({"exists": True, "participants": participants}, status=status.HTTP_200_OK)
 
 
 class LeaveChatView(APIView):
     """Marks the calling participant as left, hard-deleting the chat once it
     fully empties (cascades to its participants/messages/keys). request.user
     IS the participant (via ParticipantTokenAuthentication) -- no separate
-    lookup needed.
-
-    Deleting rather than soft-flagging the chat is what actually frees its
-    4-digit PIN for reuse (see #35) -- a permanently-retired-but-flagged row
-    would still make CreateChatView's pin=... uniqueness check treat that PIN
-    as taken forever, which is a hard ceiling on lifetime chats given there
-    are only 10,000 possible PINs."""
+    lookup needed."""
     authentication_classes = [ParticipantTokenAuthentication]
     permission_classes = [permissions.IsAuthenticated]
 
@@ -255,19 +181,13 @@ class LeaveChatView(APIView):
         participant = request.user
 
         try:
-            chat = Chat.objects.get(pin=chat_id)
-        except Chat.DoesNotExist:
+            chat_deleted, remaining = services.leave_chat(participant, chat_id)
+        except services.ChatNotFound:
             return Response({"message": "Chat not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        if participant.chat_id != chat.pk:
+        except services.NotAParticipant:
             return Response({"message": "Not in this chat."}, status=status.HTTP_400_BAD_REQUEST)
 
-        participant.left_at = timezone.now()
-        participant.save(update_fields=["left_at"])
-
-        remaining = chat.participants.filter(left_at__isnull=True).count()
-        if remaining == 0:
-            chat.delete()
+        if chat_deleted:
             logger.info(f"[LEAVE-CHAT] Chat '{chat_id}' emptied; deleted, freeing its PIN.")
         else:
             logger.info(f"[LEAVE-CHAT] A participant left chat '{chat_id}'; {remaining} remain.")
@@ -314,56 +234,33 @@ class SendMessageView(APIView):
                 or sender_chain_epoch is None:
             return Response({"message": "Missing required encryption fields."}, status=400)
 
-        with transaction.atomic():
-            chat = get_object_or_404(Chat.objects.select_for_update(), pin=chat_id)
-            if me.chat_id != chat.pk or me.left_at is not None:
-                return Response({"detail": "Forbidden"}, status=403)
-
-            # Must be the sender's CURRENT epoch, not merely one that once
-            # existed -- re-keying on roster change (see ChainKey's
-            # docstring) only bounds a leaver's exposure if the server
-            # actually refuses a stale epoch a departed participant could
-            # still hold the seed for. See issue #69.
-            latest_epoch = ChainKey.objects.filter(sender=me).aggregate(Max("epoch"))["epoch__max"]
-            if latest_epoch is None:
-                return Response({"message": "Unknown sender_chain_epoch; issue a chain key first."}, status=400)
-            if sender_chain_epoch != latest_epoch:
-                return Response(
-                    {"message": "sender_chain_epoch is stale; issue a fresh chain key and resend."},
-                    status=400,
-                )
-
-            tip = chat.messages.order_by("-seq").first()
-            expected_prev_hash = compute_chain_hash(tip) if tip else GENESIS_HASH
-            if prev_hash != expected_prev_hash:
-                return Response(
-                    {
-                        "message": "Stale transcript; refresh and resend.",
-                        "expected_prev_hash": expected_prev_hash,
-                    },
-                    status=409,
-                )
-
-            self_wrap = next(
-                (wk.get("encrypted_symmetric_key") for wk in wrapped_keys
-                 if wk.get("recipient_id") == me.pk and wk.get("encrypted_symmetric_key")),
-                None,
+        try:
+            msg = services.send_message(
+                chat_id, me,
+                encrypted_text=encrypted_text, aes_nonce=aes_nonce, aes_tag=aes_tag, mac=mac,
+                wrapped_keys=wrapped_keys, prev_hash=prev_hash, sender_chain_epoch=sender_chain_epoch,
             )
-            if not self_wrap:
-                return Response({"message": "Missing self-wrapped key."}, status=400)
-
-            msg = Message.objects.create(
-                chat=chat,
-                sender=me,
-                encrypted_text=encrypted_text,
-                aes_nonce=aes_nonce,
-                aes_tag=aes_tag,
-                mac=mac,
-                seq=(tip.seq + 1) if tip else 0,
-                prev_hash=prev_hash,
-                sender_chain_epoch=sender_chain_epoch,
+        except services.ChatNotFound:
+            return Response({"message": "Chat not found."}, status=404)
+        except services.NotAParticipant:
+            return Response({"detail": "Forbidden"}, status=403)
+        except services.UnknownChainEpoch:
+            return Response({"message": "Unknown sender_chain_epoch; issue a chain key first."}, status=400)
+        except services.StaleChainEpoch:
+            return Response(
+                {"message": "sender_chain_epoch is stale; issue a fresh chain key and resend."},
+                status=400,
             )
-            MessageKey.objects.create(message=msg, recipient=me, encrypted_symmetric_key=self_wrap)
+        except services.StaleTranscript as e:
+            return Response(
+                {
+                    "message": "Stale transcript; refresh and resend.",
+                    "expected_prev_hash": e.expected_prev_hash,
+                },
+                status=409,
+            )
+        except services.MissingSelfWrap:
+            return Response({"message": "Missing self-wrapped key."}, status=400)
 
         notify_chat(chat_id, "new_message")
         return Response(MessageSerializer(msg, context={"request": request}).data, status=201)
@@ -389,34 +286,17 @@ class IssueChainKeyView(APIView):
         if not wraps:
             return Response({"message": "wraps is required."}, status=400)
 
-        with transaction.atomic():
-            chat = get_object_or_404(Chat.objects.select_for_update(), pin=chat_id)
-            participant = ChatParticipant.objects.select_for_update().get(pk=me.pk)
-            if participant.chat_id != chat.pk or participant.left_at is not None:
-                return Response({"detail": "Forbidden"}, status=403)
-
-            active_other_ids = set(
-                chat.participants.filter(left_at__isnull=True).exclude(pk=participant.pk)
-                .values_list("id", flat=True)
+        try:
+            next_epoch = services.issue_chain_key(chat_id, me, wraps)
+        except services.ChatNotFound:
+            return Response({"message": "Chat not found."}, status=404)
+        except services.NotAParticipant:
+            return Response({"detail": "Forbidden"}, status=403)
+        except services.RosterMismatch:
+            return Response(
+                {"message": "wraps must cover exactly the chat's current other active participants."},
+                status=400,
             )
-            submitted = {
-                w.get("recipient_id"): w.get("encrypted_seed")
-                for w in wraps
-                if w.get("recipient_id") is not None and w.get("encrypted_seed")
-            }
-            if set(submitted.keys()) != active_other_ids:
-                return Response(
-                    {"message": "wraps must cover exactly the chat's current other active participants."},
-                    status=400,
-                )
-
-            last = ChainKey.objects.filter(sender=participant).order_by("-epoch").first()
-            next_epoch = (last.epoch + 1) if last else 0
-            chain_key = ChainKey.objects.create(chat=chat, sender=participant, epoch=next_epoch)
-            ChainKeyWrap.objects.bulk_create([
-                ChainKeyWrap(chain_key=chain_key, recipient_id=recipient_id, encrypted_seed=seed)
-                for recipient_id, seed in submitted.items()
-            ])
 
         return Response({"epoch": next_epoch}, status=201)
 
@@ -433,30 +313,17 @@ class GetChainKeysView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, chat_id):
-        chat = get_object_or_404(Chat, pin=chat_id)
         me = request.user
-        if me.chat_id != chat.pk:
+        try:
+            chat = services.get_chat(chat_id)
+            services.require_same_chat(chat, me)
+        except services.ChatNotFound:
+            return Response({"message": "Chat not found."}, status=404)
+        except services.NotAParticipant:
             return Response({"detail": "Forbidden"}, status=403)
 
-        wraps = (
-            ChainKeyWrap.objects
-            .filter(recipient=me, chain_key__chat=chat)
-            .select_related("chain_key")
-            .order_by("chain_key__sender_id", "-chain_key__epoch")
-        )
-        seen_senders = set()
-        result = []
-        for w in wraps:
-            sender_id = w.chain_key.sender_id
-            if sender_id in seen_senders:
-                continue
-            seen_senders.add(sender_id)
-            result.append({
-                "sender_id": sender_id,
-                "epoch": w.chain_key.epoch,
-                "encrypted_seed": w.encrypted_seed,
-            })
-        return Response({"chain_keys": result}, status=200)
+        chain_keys = services.get_latest_chain_keys_for_recipient(chat, me)
+        return Response({"chain_keys": chain_keys}, status=200)
 
 
 class GetChatParticipantsView(APIView):
@@ -470,11 +337,18 @@ class GetChatParticipantsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, chat_id):
-        chat = get_object_or_404(Chat, pin=chat_id)
         me = request.user
-        active = list(chat.participants.filter(left_at__isnull=True))
-        if not any(p.pk == me.pk for p in active):
+        try:
+            chat = services.get_chat(chat_id)
+        except services.ChatNotFound:
+            return Response({"message": "Chat not found."}, status=404)
+
+        active = services.get_active_participants(chat)
+        try:
+            services.require_active_participant(chat, me, active=active)
+        except services.NotAParticipant:
             return Response({"detail": "Forbidden"}, status=403)
+
         return Response({
             "participants": [
                 {
@@ -499,13 +373,19 @@ class GetMessagesView(APIView):
         GetChatParticipantsView (needed fresh right before every send anyway,
         to include last-second joiners) rather than duplicated here.
         """
-        chat = get_object_or_404(Chat, pin=chat_id)
         me = request.user
-        if me.chat_id != chat.pk:
+        try:
+            chat = services.get_chat(chat_id)
+            services.require_same_chat(chat, me)
+        except services.ChatNotFound:
+            return Response({"message": "Chat not found."}, status=404)
+        except services.NotAParticipant:
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
-        active_participants = list(chat.participants.filter(left_at__isnull=True))
-        if not any(p.pk == me.pk for p in active_participants):
+        active_participants = services.get_active_participants(chat)
+        try:
+            services.require_active_participant(chat, me, active=active_participants)
+        except services.NotAParticipant:
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
         others = [p for p in active_participants if p.pk != me.pk]
