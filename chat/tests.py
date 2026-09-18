@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
@@ -308,6 +308,20 @@ class MessageRoundTripTests(TestCase):
         # Bob has no server-stored wrapped key for alice's message -- he'd
         # derive it client-side from the chain seed she issued him.
         self.assertIsNone(bob_view.data["messages"][0]["my_encrypted_symmetric_key"])
+
+    def test_served_timestamp_is_bucketed_to_the_minute(self):
+        # Regression coverage for #59: the API-facing timestamp is bucketed
+        # to reduce timing-correlation exposure, but the stored value keeps
+        # full precision for internal ordering.
+        send = self._send(self.alice)
+        self.assertEqual(send.status_code, 201, send.data)
+
+        stored = Message.objects.get(seq=0).timestamp
+        self.assertEqual(send.data["timestamp"], stored.replace(second=0, microsecond=0).isoformat())
+
+        parsed = datetime.fromisoformat(send.data["timestamp"])
+        self.assertEqual(parsed.second, 0)
+        self.assertEqual(parsed.microsecond, 0)
 
     def test_send_rejects_missing_self_wrap(self):
         response = self._send(self.alice, key_for_self="")

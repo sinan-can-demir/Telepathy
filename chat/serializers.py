@@ -12,6 +12,14 @@ class MessageSerializer(serializers.ModelSerializer):
     sender_signing_public_key = serializers.CharField(source="sender.signing_public_key", read_only=True)
     sender_username = serializers.CharField(source="sender.display_name",       read_only=True)
     my_encrypted_symmetric_key = serializers.SerializerMethodField()
+    # Bucketed to the minute -- see issue #59: a full (microsecond-precision)
+    # timestamp lets anyone observing the API response correlate an exact
+    # send moment against other signals (network traffic timing, a
+    # participant's own out-of-band account of when they sent something).
+    # The stored value keeps full precision (ordering/indexing still uses
+    # it); only what's exposed here is coarsened. Nothing user-visible is
+    # lost -- chatbox.html's renderMsg only ever displays hour:minute anyway.
+    timestamp = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
@@ -41,3 +49,6 @@ class MessageSerializer(serializers.ModelSerializer):
             None,
         )
         return key.encrypted_symmetric_key if key else None
+
+    def get_timestamp(self, obj):
+        return obj.timestamp.replace(second=0, microsecond=0).isoformat()
