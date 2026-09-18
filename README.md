@@ -100,7 +100,7 @@ See [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md) for why the AES key comes
 
 ## 🚀 Quick Start
 
-> **Prerequisites:** Python 3.10+, PostgreSQL 13+, Git
+> **Prerequisites:** Python 3.10+, PostgreSQL 13+, Redis 6+, Git
 
 ### 1. Clone & enter the project
 
@@ -126,7 +126,26 @@ sudo service postgresql start
 #### Windows
 Download from [postgresql.org/download](https://www.postgresql.org/download/).
 
-### 3. Create the database
+### 3. Install & start Redis
+
+Required by the real-time (Django Channels) websocket transport -- the app won't start without it.
+
+#### macOS (Homebrew)
+```bash
+brew install redis
+brew services start redis
+```
+
+#### Linux/Ubuntu
+```bash
+sudo apt install redis-server
+sudo service redis-server start
+```
+
+#### Windows
+Redis doesn't officially support Windows; easiest is running it via [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) (follow the Linux/Ubuntu steps above inside it) or a container: `docker run -d -p 6379:6379 redis:7-alpine`.
+
+### 4. Create the database
 
 ```bash
 # Open a PostgreSQL shell
@@ -151,7 +170,7 @@ CREATE DATABASE my_database
 
 > **Tip (macOS):** If `psql` asks for a password and you don't know it, change `/opt/homebrew/var/postgresql@17/pg_hba.conf` — replace `md5` or `scram-sha-256` with `trust` in all local lines, then run `brew services restart postgresql@17`.
 
-### 4. Set up Python environment & install dependencies
+### 5. Set up Python environment & install dependencies
 
 ```bash
 python3 -m venv venv
@@ -162,7 +181,15 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 5. Apply migrations & start the server
+### 6. Configure local environment variables
+
+```bash
+cp .env.example .env
+```
+
+The defaults in `.env.example` already match steps 2–4 above (`DJANGO_SECURE=false`/`DJANGO_DEBUG=true` so the dev server doesn't 301-redirect to HTTPS, plus the DB/Redis host/port this setup uses) -- `pc/settings.py` loads `.env` automatically for a plain local run, so there's nothing else to set unless you changed a default above.
+
+### 7. Apply migrations & start the server
 
 ```bash
 python manage.py migrate
@@ -273,9 +300,9 @@ One epoch of a participant's own sending-chain seed (`ChainKey`), fanned out RSA
 
 ---
 
-## 🔧 Environment Variables (Production)
+## 🔧 Environment Variables
 
-When deploying to production, set these environment variables instead of editing source code:
+The same variables apply whether you're deploying to production or running locally via `.env` (see Quick Start step 6 -- `pc/settings.py` loads `.env` automatically, so these are also how you configure a plain local run, not just a production deployment):
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -287,6 +314,8 @@ When deploying to production, set these environment variables instead of editing
 | `DB_PASSWORD` | PostgreSQL password | `mysecretpassword` |
 | `DB_HOST` | Database host | `localhost` |
 | `DB_PORT` | Database port | `5432` |
+| `REDIS_HOST` | Redis host (Channels' websocket channel layer) | `localhost` |
+| `REDIS_PORT` | Redis port | `6379` |
 | `ONION_HOSTNAME` | Set once a Tor hidden-service `.onion` address exists (see below) | unset |
 
 ---

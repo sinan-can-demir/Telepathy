@@ -13,6 +13,7 @@ gunicorn==23.0.0
 idna==3.10
 psycopg2-binary==2.9.10
 pycparser==2.22
+python-dotenv==1.2.3
 # Pinned below channels_redis's tested range -- channels_redis==4.2.1 has no
 # upper bound on its own `redis` dependency, so an unpinned install pulls
 # redis>=8, which has real async timeout/connection-pool incompatibilities
