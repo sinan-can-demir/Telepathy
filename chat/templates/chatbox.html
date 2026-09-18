@@ -850,6 +850,29 @@
         ws = null;
     }
 
+    // updateChainState/appendNewMessages both read-then-later-write shared,
+    // non-reentrant state (chainTipHash/Seq, and per-sender ratchet chain
+    // keys in localStorage via deriveReceivedMessageKey) across `await`
+    // points. The app deliberately runs a WebSocket push and a polling
+    // fallback concurrently (see connectRealtime/fetchNewMessages below),
+    // so two fetches can easily land close enough together to overlap --
+    // without this queue, both could read the same pre-advance ratchet
+    // state and derive the same message key for two different messages,
+    // permanently desyncing the ratchet (see issue #68). Chaining every
+    // call onto one promise makes them run strictly one at a time,
+    // regardless of which caller (checkChatReady, fetchNewMessages, a WS
+    // push, or the 15s poll) triggered them. Errors are caught inside the
+    // chain itself so one failed call never poisons the ones queued after it.
+    let messageProcessingQueue = Promise.resolve();
+    function processMessages(msgs){
+        const run = messageProcessingQueue.then(async () => {
+            await updateChainState(msgs);
+            await appendNewMessages(msgs);
+        }).catch(e => console.error('processMessages:', e));
+        messageProcessingQueue = run;
+        return run;
+    }
+
     async function checkChatReady(){
         try{
             const r=await fetch(`/chat/get-messages/${chatId}/`,{headers:authHeaders()});
@@ -863,8 +886,7 @@
                 chatMain.style.display='flex';
                 updateHeader(data);
                 await refreshParticipantTrust();
-                await updateChainState(data.messages);
-                await appendNewMessages(data.messages);
+                await processMessages(data.messages);
                 clearInterval(pollInterval);
                 // The websocket (see connectRealtime) is now the primary way
                 // new messages/roster changes get noticed; this poll is just
@@ -884,8 +906,7 @@
             const data=await r.json();
             updateHeader(data);
             await refreshParticipantTrust();
-            await updateChainState(data.messages);
-            await appendNewMessages(data.messages);
+            await processMessages(data.messages);
         }catch(e){console.error('fetchNewMessages:',e);}
     }
 
@@ -897,6 +918,8 @@
     // since it's never cleared and a page reload starts a fresh in-memory
     // Set but relies on deriveReceivedMessageKey's own per-message cache
     // (keyed by msg.id, in localStorage) to avoid re-advancing on reload.
+    // Only ever called from processMessages, which serializes overlapping
+    // callers (see #68) -- never call this directly.
     async function appendNewMessages(msgs){
         chainKeysFetchedThisBatch = false;
         const sorted = [...msgs].sort((a,b)=>a.seq-b.seq);
@@ -1051,9 +1074,15 @@
             await ensureMyChainKey(recipients);
             const currentChainBytes = new Uint8Array(b642ab(localStorage.getItem(myChainKeyName(chatId))));
             const { messageKey, nextChainKey } = await ratchetStep(currentChainBytes);
-            // Advance-then-discard immediately: once this is overwritten, the
-            // key just derived can never be recovered from local state again.
-            localStorage.setItem(myChainKeyName(chatId), ab2b64(nextChainKey.buffer));
+            // Do NOT commit nextChainKey yet. A 409 (someone else's message
+            // landed first -- an ordinary outcome of concurrent sends, not
+            // an error) means this attempt was never actually stored, so
+            // nothing ever ratchets forward to match it on the receiving
+            // side. Committing here unconditionally used to burn a step
+            // that no receiver would ever advance past, permanently
+            // desyncing the ratchet on every retry (see issue #67). The
+            // advance is only ever safe to persist once the server has
+            // confirmed the message it belongs to was actually stored.
             const senderChainEpoch = Number(localStorage.getItem(myChainEpochName(chatId)));
             completeSendStep(0);
 
@@ -1086,6 +1115,10 @@
             completeSendStep(4,resp.ok);
 
             if(resp.ok){
+                // Only now is it safe to commit the ratchet advance -- the
+                // message this key belongs to is confirmed stored, so a
+                // receiver will advance to meet it.
+                localStorage.setItem(myChainKeyName(chatId), ab2b64(nextChainKey.buffer));
                 messageInput.value='';
                 closeSendModal(true);
                 await fetchNewMessages();
