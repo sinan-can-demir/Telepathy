@@ -79,6 +79,47 @@ class ChatCreationTests(TestCase):
         participant = ChatParticipant.objects.get(pk=response.data["participant_id"])
         self.assertTrue(participant.display_name)
 
+    def test_create_chat_rejects_malformed_or_wrong_size_public_key(self):
+        # Regression coverage for #72: every client-side importKey call
+        # assumes a 2048-bit RSA SPKI PEM (see generateFreshKeys in
+        # chatbox.html) -- presence alone used to be enough to pass here.
+        not_a_key = "not a pem at all"
+        response = self.client.post(
+            "/chat/create-chat/", {"display_name": "alice", "public_key": not_a_key}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+        wrong_size_key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+        wrong_size_pem = wrong_size_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+        response = self.client.post(
+            "/chat/create-chat/", {"display_name": "alice", "public_key": wrong_size_pem}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_create_chat_rejects_oversized_public_key(self):
+        response = self.client.post(
+            "/chat/create-chat/", {"display_name": "alice", "public_key": "A" * 5000}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_create_chat_accepts_valid_signing_public_key_and_rejects_invalid_one(self):
+        good = self.client.post(
+            "/chat/create-chat/",
+            {"display_name": "alice", "public_key": _fake_public_key_pem(), "signing_public_key": _fake_public_key_pem()},
+            format="json",
+        )
+        self.assertEqual(good.status_code, 201, good.data)
+
+        bad = self.client.post(
+            "/chat/create-chat/",
+            {"display_name": "alice", "public_key": _fake_public_key_pem(), "signing_public_key": "garbage"},
+            format="json",
+        )
+        self.assertEqual(bad.status_code, 400)
+
 
 class TokenAuthTests(TestCase):
     """Coverage for the accountless auth model: possession of a per-chat
@@ -168,6 +209,17 @@ class JoinChatRateLimitTests(TestCase):
         self.assertEqual(full.status_code, 400)
         self.assertIn("full", full.data["message"].lower())
 
+    def test_join_chat_rejects_malformed_public_key(self):
+        # Regression coverage for #72 -- same validation as CreateChatView,
+        # exercised through the other entry point.
+        chat_id = _create_chat(APIClient(), display_name="alice").data["chat_id"]
+        response = self.client.post(
+            "/chat/join-chat/",
+            {"chat_id": chat_id, "display_name": "bob", "public_key": "not a real key"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
 
 class MessageRoundTripTests(TestCase):
     """A 1:1 chat's full lifecycle: create, join, send (wrapping the AES key
@@ -237,6 +289,23 @@ class MessageRoundTripTests(TestCase):
     def test_send_rejects_unknown_chain_epoch(self):
         response = self._send(self.alice, epoch=99)
         self.assertEqual(response.status_code, 400)
+
+    def test_send_rejects_stale_epoch_after_rekey(self):
+        # Regression coverage for #69: re-keying on roster change only
+        # bounds a leaver's exposure if the server actually refuses a
+        # since-superseded epoch, not merely one that once existed.
+        send0 = self._send(self.alice, epoch=self.alice_epoch)
+        self.assertEqual(send0.status_code, 201, send0.data)
+
+        reissued = _issue_chain_key(self.alice, self.chat_id, [self.bob_id])
+        new_epoch = reissued.data["epoch"]
+        self.assertGreater(new_epoch, self.alice_epoch)
+
+        stale = self._send(self.alice, prev_hash=compute_chain_hash(Message.objects.get(seq=0)), epoch=self.alice_epoch)
+        self.assertEqual(stale.status_code, 400, stale.data)
+
+        current = self._send(self.alice, prev_hash=compute_chain_hash(Message.objects.get(seq=0)), epoch=new_epoch)
+        self.assertEqual(current.status_code, 201, current.data)
 
     def test_leave_only_deletes_chat_once_it_fully_empties(self):
         self._send(self.alice)
