@@ -1,13 +1,15 @@
+from datetime import timedelta
 from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from chat.views import failed_join_attempts
 from chat.models import Chat, ChatParticipant, Message, MessageKey
-from chat.auth import hash_token
+from chat.auth import hash_token, IDLE_TIMEOUT
 from chat.chain import GENESIS_HASH, compute_chain_hash
 
 
@@ -172,6 +174,31 @@ class TokenAuthTests(TestCase):
         # alice's token authenticates fine, but she isn't a participant of this chat.
         response = self.alice.get(f"/chat/get-messages/{other_chat_id}/")
         self.assertEqual(response.status_code, 403)
+
+    def test_idle_token_stops_working_and_is_marked_left(self):
+        # Regression coverage for #71: a tab that's actually closed stops
+        # re-authenticating entirely (no beforeunload hook can safely tell
+        # a real close apart from a page refresh), so idle time -- not an
+        # unload event -- is what reclaims an abandoned token.
+        stale = timezone.now() - IDLE_TIMEOUT - timedelta(seconds=1)
+        ChatParticipant.objects.filter(pk=self.bob_participant_id).update(last_seen=stale)
+
+        response = self.bob.get(f"/chat/get-messages/{self.chat_id}/")
+        self.assertEqual(response.status_code, 401)
+
+        bob = ChatParticipant.objects.get(pk=self.bob_participant_id)
+        self.assertIsNotNone(bob.left_at)
+
+    def test_active_use_keeps_last_seen_fresh(self):
+        stale_but_within_timeout = timezone.now() - timedelta(minutes=1)
+        ChatParticipant.objects.filter(pk=self.alice_participant_id).update(last_seen=stale_but_within_timeout)
+
+        response = self.alice.get(f"/chat/get-messages/{self.chat_id}/")
+        self.assertEqual(response.status_code, 200)
+
+        alice = ChatParticipant.objects.get(pk=self.alice_participant_id)
+        self.assertIsNone(alice.left_at)
+        self.assertGreater(alice.last_seen, stale_but_within_timeout)
 
 
 class JoinChatRateLimitTests(TestCase):

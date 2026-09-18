@@ -3,8 +3,7 @@ from urllib.parse import parse_qs
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
 
-from .auth import hash_token
-from .models import ChatParticipant
+from .auth import authenticate_participant
 
 
 class ChatConsumer(AsyncJsonWebsocketConsumer):
@@ -42,16 +41,7 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
     @database_sync_to_async
     def _authenticate(self, chat_id, raw_token):
-        if not raw_token:
-            return None
-        try:
-            return ChatParticipant.objects.select_related("chat").get(
-                auth_token_hash=hash_token(raw_token),
-                left_at__isnull=True,
-                chat__pin=chat_id,
-            )
-        except ChatParticipant.DoesNotExist:
-            return None
+        return authenticate_participant(raw_token, chat_pin=chat_id)
 
     # Group-sent event; "type": "chat.notify" maps to this method name.
     async def chat_notify(self, event):

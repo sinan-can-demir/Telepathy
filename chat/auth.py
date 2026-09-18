@@ -1,12 +1,62 @@
 import hashlib
+from datetime import timedelta
 
+from django.utils import timezone
 from rest_framework import authentication, exceptions
 
 from .models import ChatParticipant
 
+# How long a participant can go without a successful authentication before
+# they're treated as abandoned and reclaimed. This is the actual fix for "a
+# closed tab's token stays valid forever" (issue #71) -- there is no
+# reliable way to tell a genuine tab close apart from a page refresh from
+# beforeunload/sendBeacon (and this app deliberately supports resuming a
+# chat after a refresh, see ensureParticipation in chatbox.html), so acting
+# on that event at all risks ending a session the user never meant to end.
+# A tab that's actually still open re-authenticates at least every 15s via
+# its polling fallback (see fetchNewMessages in chatbox.html), so this
+# timeout is effectively "how long a closed tab's session survives," not a
+# limit on an active conversation.
+IDLE_TIMEOUT = timedelta(minutes=30)
+
 
 def hash_token(raw_token):
     return hashlib.sha256(raw_token.encode()).hexdigest()
+
+
+def authenticate_participant(raw_token, chat_pin=None):
+    """Shared lookup for both HTTP (ParticipantTokenAuthentication) and
+    WebSocket (chat.consumers.ChatConsumer) auth. Returns the matching
+    ChatParticipant, or None if the token is invalid/unknown, already
+    left, or has been idle past IDLE_TIMEOUT.
+
+    An idle-expired participant is marked left_at here, lazily, the same
+    "clean up on the next relevant request" pattern LeaveChatView already
+    uses for a chat that's emptied out -- there's no scheduled job in this
+    app, and this doesn't need one either.
+    """
+    if not raw_token:
+        return None
+
+    qs = ChatParticipant.objects.select_related("chat").filter(
+        auth_token_hash=hash_token(raw_token),
+        left_at__isnull=True,
+    )
+    if chat_pin is not None:
+        qs = qs.filter(chat__pin=chat_pin)
+    try:
+        participant = qs.get()
+    except ChatParticipant.DoesNotExist:
+        return None
+
+    now = timezone.now()
+    if participant.last_seen < now - IDLE_TIMEOUT:
+        participant.left_at = now
+        participant.save(update_fields=["left_at"])
+        return None
+
+    ChatParticipant.objects.filter(pk=participant.pk).update(last_seen=now)
+    return participant
 
 
 class ParticipantTokenAuthentication(authentication.BaseAuthentication):
@@ -19,8 +69,8 @@ class ParticipantTokenAuthentication(authentication.BaseAuthentication):
 
     The raw token is never stored; only its SHA-256 hash is compared against
     ChatParticipant.auth_token_hash. A token stops authenticating the moment
-    its participant leaves (left_at is set), which is the natural point a
-    chat-scoped identity should stop being usable.
+    its participant leaves (left_at is set) or goes idle past IDLE_TIMEOUT,
+    which are the two points a chat-scoped identity should stop being usable.
     """
 
     keyword = "Token"
@@ -32,13 +82,8 @@ class ParticipantTokenAuthentication(authentication.BaseAuthentication):
         if len(auth_header) != 2:
             raise exceptions.AuthenticationFailed("Invalid token header.")
 
-        raw_token = auth_header[1].decode()
-        try:
-            participant = ChatParticipant.objects.select_related("chat").get(
-                auth_token_hash=hash_token(raw_token),
-                left_at__isnull=True,
-            )
-        except ChatParticipant.DoesNotExist:
+        participant = authenticate_participant(auth_header[1].decode())
+        if participant is None:
             raise exceptions.AuthenticationFailed("Invalid or expired token.")
 
         return (participant, None)
