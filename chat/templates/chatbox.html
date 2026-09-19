@@ -44,9 +44,11 @@
         .msg-group.sent{align-items:flex-end}
         .msg-group.received{align-items:flex-start}
         .msg-sender{font-size:0.7rem;color:var(--text-dim);padding:0 0.5rem;margin-bottom:0.1rem}
-        .msg-bubble{max-width:65%;padding:0.65rem 0.9rem;font-size:0.88rem;line-height:1.5;border-radius:16px;word-wrap:break-word}
+        .msg-bubble{max-width:65%;padding:0.65rem 0.9rem;font-size:0.88rem;line-height:1.5;border-radius:16px;word-wrap:break-word;transition:opacity .6s ease}
         .msg-group.sent .msg-bubble{background:linear-gradient(135deg,var(--cyan),#06b6d4);color:#000;border-bottom-right-radius:4px}
         .msg-group.received .msg-bubble{background:rgba(255,255,255,0.06);border:1px solid var(--card-border);border-bottom-left-radius:4px}
+        .msg-bubble.msg-expired{background:rgba(255,255,255,0.03)!important;border:1px dashed var(--card-border)!important;
+            color:var(--text-muted)!important;font-style:italic}
         .msg-meta{display:flex;align-items:center;gap:0.5rem;padding:0 0.5rem;margin-top:0.15rem}
         .msg-time{font-size:0.65rem;color:var(--text-muted)}
         .msg-group.sent .msg-meta{justify-content:flex-end}
@@ -60,6 +62,7 @@
         .verify-badge.failed{color:var(--red);background:rgba(239,68,68,0.1)}
         .verify-badge.failed:hover{background:rgba(239,68,68,0.2)}
         .verify-badge.own{color:var(--text-muted);background:rgba(255,255,255,0.04)}
+        .verify-badge.expired{color:var(--text-muted);background:rgba(255,255,255,0.03);font-style:italic}
 
         /* ── Crypto details popover ── */
         .crypto-details{display:none;margin-top:0.3rem;padding:0.5rem 0.7rem;background:rgba(0,0,0,0.5);border:1px solid var(--card-border);
@@ -81,6 +84,9 @@
             display:flex;align-items:center;gap:0.4rem;font-family:'Inter',sans-serif}
         .send-btn:hover{transform:scale(1.03);box-shadow:0 0 20px rgba(0,229,255,0.3)}
         .send-btn:disabled{opacity:0.5;cursor:not-allowed;transform:none!important}
+        .ttl-select{padding:0.7rem 0.5rem;background:rgba(255,255,255,0.04);border:1px solid var(--card-border);
+            border-radius:12px;color:var(--text-dim);font-family:'Inter',sans-serif;font-size:0.78rem;cursor:pointer;flex-shrink:0}
+        .ttl-select:focus{outline:none;border-color:var(--cyan)}
 
         /* ── Send Modal ── */
         .send-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(6px);
@@ -181,6 +187,14 @@
     <div class="messages-area" id="messages"></div>
     <form class="input-bar" id="message-form">
         <input type="text" id="message-input" placeholder="Type a message…" required autocomplete="off" />
+        <select class="ttl-select" id="ttl-select" title="Disappearing message timer -- applies to the next message you send">
+            <option value="">Off</option>
+            <option value="30">⏳ 30s</option>
+            <option value="300">⏳ 5m</option>
+            <option value="3600">⏳ 1h</option>
+            <option value="86400">⏳ 1d</option>
+            <option value="604800">⏳ 1w</option>
+        </select>
         <button type="submit" class="send-btn" id="send-btn">Send ↗</button>
     </form>
 </div>
@@ -312,7 +326,14 @@
         return hex.slice(0, 16).toUpperCase().match(/.{1,4}/g).join('-');
     }
 
-    function computeChainHash(msg) {
+    // Mirrors chat/chain.py's compute_chain_hash exactly: a tombstoned
+    // (expired, see issue #64) message has null encrypted_text/aes_nonce/
+    // aes_tag/mac, so recomputing from those fields would produce a
+    // different hash than what the rest of the chain was actually built
+    // against. tombstone_hash is the one persisted value that keeps the
+    // chain verifiable through an expiry -- see docs/MESSAGE_EXPIRY.md.
+    async function computeChainHash(msg) {
+        if (msg.tombstone_hash) return msg.tombstone_hash;
         const parts = [msg.prev_hash, String(msg.seq), String(msg.sender_id),
             msg.encrypted_text, msg.aes_nonce || '', msg.aes_tag || '', msg.mac || ''];
         return sha256Hex(parts.join('|'));
@@ -683,6 +704,7 @@
     const partnerNameEl=document.getElementById('partner-name');
     const messageForm=document.getElementById('message-form');
     const messageInput=document.getElementById('message-input');
+    const ttlSelect=document.getElementById('ttl-select');
     const sendBtn=document.getElementById('send-btn');
     const waitingOverlay=document.getElementById('waitingOverlay');
     const chatHeader=document.getElementById('chatHeader');
@@ -1023,6 +1045,45 @@
         if(added) messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
 
+    // Local, cosmetic-only "fade after read" timer (issue #64) -- see
+    // docs/MESSAGE_EXPIRY.md's "What this deliberately does not do"
+    // section. The server's read-time expiry (services.sweep_expired_
+    // messages) is the actual, enforced boundary; this only hides an
+    // already-decrypted message from THIS browser tab's own view after
+    // ttl_seconds from when it was rendered here -- the closest local
+    // proxy this client has for "read", since there's no persisted
+    // per-message read timestamp on this side. A reload restarts the
+    // timer; that's an accepted imprecision of a purely cosmetic feature,
+    // not a security regression -- the real content is already gone from
+    // storage once the server-side condition is met regardless of what
+    // any single tab's timer is doing.
+    function scheduleLocalExpiry(group, bubble, badge, ttlSeconds){
+        if(!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) return;
+        setTimeout(() => {
+            if(!group.isConnected) return;
+            bubble.textContent = '🕳️ This message has expired';
+            bubble.className = 'msg-bubble msg-expired';
+            if(badge){ badge.className = 'verify-badge expired'; badge.textContent = '⏳ Expired'; }
+        }, ttlSeconds * 1000);
+    }
+
+    function renderExpiredMsg(group, sender, msg, isMine){
+        const bubble = document.createElement('div');
+        bubble.className = 'msg-bubble msg-expired';
+        bubble.textContent = '🕳️ This message has expired';
+
+        const meta = document.createElement('div');
+        meta.className = 'msg-meta';
+        const timeEl = document.createElement('span');
+        timeEl.className = 'msg-time';
+        timeEl.textContent = new Date(msg.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+        const badge = document.createElement('span');
+        badge.className = 'verify-badge expired';
+        badge.textContent = '⏳ Expired';
+        meta.append(timeEl, badge);
+        group.append(sender, bubble, meta);
+    }
+
     async function renderMsg(msg){
         const isMine = String(msg.sender_id) === String(myParticipantId);
         const group = document.createElement('div');
@@ -1031,6 +1092,17 @@
         const sender = document.createElement('div');
         sender.className = 'msg-sender';
         sender.textContent = isMine ? 'You' : msg.sender_username;
+
+        // Disappearing messages (issue #64): a tombstoned message has null
+        // encrypted_text/aes_nonce/aes_tag/mac by design (see
+        // services._tombstone) -- there's nothing left to decrypt, so skip
+        // straight to the placeholder rather than running the crypto steps
+        // below against nulls.
+        if(msg.tombstone_hash){
+            renderExpiredMsg(group, sender, msg, isMine);
+            messagesDiv.appendChild(group);
+            return;
+        }
 
         // Decrypt
         let text='';
@@ -1143,6 +1215,10 @@
         meta.append(timeEl, badge);
         group.append(sender, bubble, meta, details);
         messagesDiv.appendChild(group);
+
+        // See scheduleLocalExpiry above -- local-only, cosmetic countdown
+        // for a message that has a TTL but hasn't been tombstoned yet.
+        if(msg.ttl_seconds) scheduleLocalExpiry(group, bubble, badge, msg.ttl_seconds);
     }
 
     document.addEventListener('click',()=>{document.querySelectorAll('.crypto-details.show').forEach(d=>d.classList.remove('show'));});
@@ -1221,12 +1297,21 @@
             completeSendStep(3);
 
             advanceSendStep(4);
+            // Disappearing messages (issue #64): whatever's selected in the
+            // TTL picker applies to just this one message (per-message, not
+            // per-chat -- see docs/MESSAGE_EXPIRY.md's design fork). Empty
+            // selection ("Off") omits ttl_seconds entirely, matching every
+            // message before this feature existed -- never expires.
+            const rawTtl = ttlSelect.value;
+            const ttlSeconds = rawTtl ? Number(rawTtl) : null;
+            const body = {
+                encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,
+                mac:ab2b64(mac),prev_hash:prevHash,sender_chain_epoch:senderChainEpoch,
+            };
+            if(ttlSeconds) body.ttl_seconds = ttlSeconds;
             const resp=await fetch(`/chat/send-message/${chatId}/`,{
                 method:'POST',headers:authHeaders({'Content-Type':'application/json'}),
-                body:JSON.stringify({
-                    encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,
-                    mac:ab2b64(mac),prev_hash:prevHash,sender_chain_epoch:senderChainEpoch,
-                })
+                body:JSON.stringify(body)
             });
             completeSendStep(4,resp.ok);
 
