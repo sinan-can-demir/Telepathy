@@ -14,6 +14,11 @@ DataDirectory /var/lib/tor
 HiddenServiceDir /var/lib/tor/telepathy_hidden_service/
 HiddenServicePort 80 127.0.0.1:8000
 
+# Invite-only mode needs no directive here: Tor enforces client authorization
+# whenever HiddenServiceDir/authorized_clients/ holds at least one <name>.auth
+# file, and stays open when it's empty. Manage it with
+# deploy/tor-client-auth.sh -- see docs/INVITE_ONLY_ONION.md.
+
 # Tor's own connection-flood defense at the protocol level, before any request
 # reaches the app -- see ARCHITECTURE.md for why this replaces IP-based
 # throttling for the registration endpoint specifically.
