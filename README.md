@@ -355,6 +355,18 @@ This runs the whole stack — app, Postgres, and a Tor hidden service in front o
 
 The hidden service's private key lives in the `tor_data` named volume — **that's the one piece of state in this stack that must persist**; deleting it changes the `.onion` address. Everything else (`app`, `db`'s actual rows) can be recreated freely.
 
+### Optional: invite-only `.onion` (Tor Client Authorization)
+
+By default anyone with the `.onion` address can reach the app. To restrict it to clients you've issued a key to — enforced by Tor itself, before any connection reaches Django — authorize clients with:
+
+```
+deploy/tor-client-auth.sh add <name>      # prints that user's private key once
+deploy/tor-client-auth.sh remove <name>
+deploy/tor-client-auth.sh list
+```
+
+The service stays open until the first client is added, and opens again if the last is removed. See [docs/INVITE_ONLY_ONION.md](docs/INVITE_ONLY_ONION.md) for how it works, how it was verified, and what it doesn't cover.
+
 If your `podman-compose` version doesn't support the `network_mode: "service:app"` syntax used in `compose.yaml`, the fallback is a native Podman pod (`podman pod create`) with both containers attached to it instead — same effect, different plumbing.
 
 ---
