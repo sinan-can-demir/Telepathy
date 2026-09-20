@@ -193,7 +193,7 @@ def leave_chat(participant, chat_id):
 # ── Messaging / forward-secrecy ratchet ──────────────────────────────────
 
 def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
-                  wrapped_keys, prev_hash, sender_chain_epoch, ttl_seconds=None):
+                  wrapped_keys, prev_hash, sender_chain_epoch, chain_index, ttl_seconds=None):
     """Validates and appends one message under a row lock -- assigning seq
     here (not client-side) and rejecting a stale prev_hash both prevent two
     concurrent sends from landing on the same chain position. Raises
@@ -258,6 +258,7 @@ def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
             seq=(tip.seq + 1) if tip else 0,
             prev_hash=prev_hash,
             sender_chain_epoch=sender_chain_epoch,
+            chain_index=chain_index,
             ttl_seconds=ttl_seconds,
         )
         MessageKey.objects.create(message=msg, recipient=sender, encrypted_symmetric_key=self_wrap)

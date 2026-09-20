@@ -216,6 +216,10 @@ class SendMessageView(APIView):
     epoch that derivation used, for recipients to know whether to keep
     advancing their cached state or fetch a newer epoch's seed first.
 
+    chain_index is this message's position within the sender's current
+    epoch's chain (see Message.chain_index) -- required, so a receiver can
+    skip ahead over a message that never reached them.
+
     ttl_seconds (issue #64) is optional -- omitted or null means the
     message never expires, matching every message before this feature
     existed. See docs/MESSAGE_EXPIRY.md.
@@ -233,11 +237,19 @@ class SendMessageView(APIView):
         wrapped_keys = request.data.get("wrapped_keys")
         prev_hash = request.data.get("prev_hash")
         sender_chain_epoch = request.data.get("sender_chain_epoch")
+        chain_index = request.data.get("chain_index")
         raw_ttl_seconds = request.data.get("ttl_seconds")
 
         if not all([encrypted_text, aes_nonce, aes_tag, mac, prev_hash]) or not wrapped_keys \
-                or sender_chain_epoch is None:
+                or sender_chain_epoch is None or chain_index is None:
             return Response({"message": "Missing required encryption fields."}, status=400)
+
+        # bool is an int subclass; reject it explicitly so `true` isn't index 1.
+        # 2**31-1 is PositiveIntegerField's ceiling -- past it the DB write
+        # would 500 instead of this 400.
+        if isinstance(chain_index, bool) or not isinstance(chain_index, int) \
+                or not 0 <= chain_index <= 2**31 - 1:
+            return Response({"message": "chain_index must be a non-negative integer."}, status=400)
 
         ttl_seconds = None
         if raw_ttl_seconds is not None:
@@ -251,7 +263,7 @@ class SendMessageView(APIView):
                 chat_id, me,
                 encrypted_text=encrypted_text, aes_nonce=aes_nonce, aes_tag=aes_tag, mac=mac,
                 wrapped_keys=wrapped_keys, prev_hash=prev_hash, sender_chain_epoch=sender_chain_epoch,
-                ttl_seconds=ttl_seconds,
+                chain_index=chain_index, ttl_seconds=ttl_seconds,
             )
         except services.ChatNotFound:
             return Response({"message": "Chat not found."}, status=404)

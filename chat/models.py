@@ -133,6 +133,15 @@ class Message(models.Model):
     # of that chain rather than unwrapping a per-message key -- see
     # docs/FORWARD_SECRECY.md.
     sender_chain_epoch = models.PositiveIntegerField(default=0)
+    # This message's position within that epoch's chain (0 = the epoch's
+    # first message). A receiver advances its copy of the sender's ratchet
+    # to exactly this index before deriving the key, so a message that never
+    # arrived (dropped, or aged out of the relay -- see issue #90 /
+    # docs/EPHEMERAL_RELAY.md) costs only itself: later messages still
+    # decrypt, instead of every subsequent key being off by one forever.
+    # Not separately MAC'd: it selects which ratchet key decrypts the message,
+    # so a lie about it just fails AES-GCM decryption.
+    chain_index = models.PositiveIntegerField(default=0)
 
     timestamp = models.DateTimeField(
         auto_now_add=True,

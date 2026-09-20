@@ -280,6 +280,7 @@ A participant's entire identity for exactly one chat — see [docs/ACCOUNTLESS_I
 | `mac` | `TextField` | HMAC-SHA256 tag (Base64), covering `seq\|prev_hash\|chat_id\|plaintext`, keyed from the sender's ratchet -- deniable, see [docs/DENIABLE_AUTH.md](docs/DENIABLE_AUTH.md) |
 | `seq` / `prev_hash` | `PositiveIntegerField` / `CharField` | Position in the chat's tamper-evident hash chain (see `chat/chain.py`) |
 | `sender_chain_epoch` | `PositiveIntegerField` | Which epoch of the sender's forward-secret ratchet this message's key came from (see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md)) |
+| `chain_index` | `PositiveIntegerField` | This message's position within that epoch, so a receiver can skip ahead over a message that never arrived |
 | `ttl_seconds` | `PositiveIntegerField`, nullable | Disappearing-messages TTL, set at send time; null (the default) means never expires -- see [docs/MESSAGE_EXPIRY.md](docs/MESSAGE_EXPIRY.md) |
 | `tombstone_hash` / `tombstoned_at` | `CharField` / `DateTimeField`, nullable | Set once, the moment `encrypted_text`/`aes_nonce`/`aes_tag`/`mac` above are wiped by expiry -- preserves the chain hash those fields used to determine, so later messages stay verifiable |
 

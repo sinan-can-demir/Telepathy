@@ -342,6 +342,10 @@
     // What actually gets MAC'd/verified: binding seq+prev_hash+chat_id into
     // the tag means a message can't be replayed at a different position in
     // the chain -- its MAC simply won't match there anymore.
+    // chain_index is deliberately NOT in here: it's already authenticated
+    // implicitly, because it selects which ratchet key a message is decrypted
+    // with -- a server that lies about it makes AES-GCM decryption fail
+    // outright, before the MAC is ever reached.
     function signedPayloadBytes(seq, prevHash, cid, plaintext) {
         return new TextEncoder().encode(`${seq}|${prevHash}|${cid}|${plaintext}`);
     }
@@ -393,6 +397,33 @@
     const recvChainEpochName = (cid, sid) => `chain_recv_epoch_${cid}_${sid}`;
     const recvChainKeyName = (cid, sid) => `chain_recv_key_${cid}_${sid}`;
     const msgKeyName = (cid, msgId) => `msgkey_${cid}_${msgId}`;
+    // Keys for chain positions a receiver ratcheted *past* without a message
+    // to use them on (the message was dropped or aged out of the relay; see
+    // advanceChainTo). Kept so one that turns up late still decrypts.
+    const skippedKeyName = (cid, sid, epoch, idx) => `skipkey_${cid}_${sid}_${epoch}_${idx}`;
+    // Bounds how far a single message can make a receiver ratchet forward --
+    // without a cap, one message claiming chain_index 2^31 would pin the tab
+    // in a multi-billion-step HMAC loop.
+    const MAX_SKIP = 100;
+
+    // Advances a chain from `fromIndex` to `toIndex` (both positions in the
+    // same epoch). Every position strictly before toIndex is derived and
+    // returned in `skipped` rather than discarded, since the chain is
+    // one-way: a key not kept now can never be recovered. Returns the keys
+    // at toIndex plus the chain key for toIndex+1.
+    async function advanceChainTo(chainKey, fromIndex, toIndex) {
+        if (toIndex < fromIndex) throw new Error('Chain position already consumed');
+        if (toIndex - fromIndex > MAX_SKIP) throw new Error('Too many skipped messages');
+        const skipped = [];
+        let key = chainKey;
+        for (let i = fromIndex; i < toIndex; i++) {
+            const step = await ratchetStep(key);
+            skipped.push({ index: i, messageKeyBytes: step.messageKeyBytes, authKeyBytes: step.authKeyBytes });
+            key = step.nextChainKey;
+        }
+        const target = await ratchetStep(key);
+        return { skipped, messageKeyBytes: target.messageKeyBytes, authKeyBytes: target.authKeyBytes, nextChainKey: target.nextChainKey };
+    }
 
     async function destroyChainState(cid) {
         localStorage.removeItem(myChainEpochName(cid));
@@ -405,7 +436,7 @@
             if (key && prefixes.some(p => key.startsWith(p))) toRemove.push(key);
         }
         toRemove.forEach(k => localStorage.removeItem(k));
-        await idbDeleteByPrefix([`chain_recv_key_${cid}_`, `msgkey_${cid}_`]);
+        await idbDeleteByPrefix([`chain_recv_key_${cid}_`, `msgkey_${cid}_`, `skipkey_${cid}_`]);
     }
 
     // Issues a fresh chain-key epoch (wrapped RSA-OAEP per recipient) iff the
@@ -441,7 +472,7 @@
         // seed only ever exists as raw bytes transiently, here, to RSA-OAEP-
         // wrap it per recipient above -- what actually persists is this
         // non-extractable HMAC key, never the raw seed itself.
-        await idbSet(myChainKeyName(chatId), await importHmacKey(seed.buffer));
+        await idbSet(myChainKeyName(chatId), { chainKey: await importHmacKey(seed.buffer), index: 0 });
         localStorage.setItem(myChainEpochName(chatId), String(data.epoch));
         localStorage.setItem(myChainRosterName(chatId), JSON.stringify(sortedIds));
     }
@@ -477,29 +508,59 @@
         const cached = await idbGet(msgKeyName(chatId, msg.id));
         if (cached) return cached;
 
-        const senderId = msg.sender_id, msgEpoch = msg.sender_chain_epoch;
+        const senderId = msg.sender_id, msgEpoch = msg.sender_chain_epoch, target = msg.chain_index;
         let epoch = localStorage.getItem(recvChainEpochName(chatId, senderId));
         epoch = epoch === null ? null : Number(epoch);
-        let chainKey = epoch === null ? null : await idbGet(recvChainKeyName(chatId, senderId));
+        // { chainKey, index }: the chain key AT position `index` -- i.e. the
+        // next position this receiver expects. Stored as one record so the
+        // key and the position it belongs to can never be persisted out of
+        // step with each other.
+        let record = epoch === null ? null : await idbGet(recvChainKeyName(chatId, senderId));
 
         if (epoch === null || epoch < msgEpoch) {
             const remote = await fetchChainKeysOnce();
             const entry = remote.get(senderId);
             if (!entry || entry.epoch < msgEpoch) throw new Error('No chain key available for this sender/epoch');
             const seedBuf = await crypto.subtle.decrypt({name:'RSA-OAEP'}, myEncKeys.privateKey, b642ab(entry.encrypted_seed));
-            chainKey = await importHmacKey(seedBuf);
-            await idbSet(recvChainKeyName(chatId, senderId), chainKey);
+            record = { chainKey: await importHmacKey(seedBuf), index: 0 };
+            await idbSet(recvChainKeyName(chatId, senderId), record);
             localStorage.setItem(recvChainEpochName(chatId, senderId), String(entry.epoch));
             epoch = entry.epoch;
         }
         if (epoch !== msgEpoch) throw new Error('Chain epoch mismatch; cannot derive message key');
 
-        const { messageKeyBytes, authKeyBytes, nextChainKey } = await ratchetStep(chainKey);
-        await idbSet(recvChainKeyName(chatId, senderId), nextChainKey);
+        // A position we've already ratcheted past can only be served by a key
+        // set aside when it was skipped. Anything else is a replay of an index
+        // that's already been used (or a key we never kept), not something
+        // the one-way chain lets us recompute.
+        if (typeof target !== 'number' || target < record.index) {
+            const skipName = skippedKeyName(chatId, senderId, epoch, target);
+            const kept = typeof target === 'number' ? await idbGet(skipName) : null;
+            if (!kept) throw new Error('Message key already consumed');
+            await idbSet(msgKeyName(chatId, msg.id), kept);
+            await idbDelete(skipName);
+            return kept;
+        }
+
+        const { skipped, messageKeyBytes, authKeyBytes, nextChainKey } =
+            await advanceChainTo(record.chainKey, record.index, target);
+        for (const k of skipped) {
+            await idbSet(skippedKeyName(chatId, senderId, epoch, k.index), {
+                messageKey: await importAesKey(k.messageKeyBytes, ['decrypt']),
+                authKey: await importHmacKey(k.authKeyBytes, ['verify']),
+            });
+        }
         const messageKey = await importAesKey(messageKeyBytes, ['decrypt']);
         const authKey = await importHmacKey(authKeyBytes, ['verify']);
         const derived = { messageKey, authKey };
+        // Cache the message's own key BEFORE committing the advanced chain.
+        // If we're interrupted in between, the next call finds this cache and
+        // returns without advancing; the chain then catches up from `target`
+        // on the next message, re-deriving the gap as skipped keys -- the
+        // index makes that self-healing, where the old per-message
+        // advance-once scheme would have desynced for good.
         await idbSet(msgKeyName(chatId, msg.id), derived);
+        await idbSet(recvChainKeyName(chatId, senderId), { chainKey: nextChainKey, index: target + 1 });
         return derived;
     }
 
@@ -1255,7 +1316,7 @@
                 return;
             }
             await ensureMyChainKey(recipients);
-            const currentChainKey = await idbGet(myChainKeyName(chatId));
+            const { chainKey: currentChainKey, index: chainIndex } = await idbGet(myChainKeyName(chatId));
             // messageKeyBytes exists as raw bytes only transiently, here,
             // because the RSA-OAEP self-wrap below needs plaintext bytes to
             // encrypt -- it's never persisted anywhere in this form. See #55.
@@ -1306,7 +1367,7 @@
             const ttlSeconds = rawTtl ? Number(rawTtl) : null;
             const body = {
                 encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,
-                mac:ab2b64(mac),prev_hash:prevHash,sender_chain_epoch:senderChainEpoch,
+                mac:ab2b64(mac),prev_hash:prevHash,sender_chain_epoch:senderChainEpoch,chain_index:chainIndex,
             };
             if(ttlSeconds) body.ttl_seconds = ttlSeconds;
             const resp=await fetch(`/chat/send-message/${chatId}/`,{
@@ -1319,7 +1380,7 @@
                 // Only now is it safe to commit the ratchet advance -- the
                 // message this key belongs to is confirmed stored, so a
                 // receiver will advance to meet it.
-                await idbSet(myChainKeyName(chatId), nextChainKey);
+                await idbSet(myChainKeyName(chatId), { chainKey: nextChainKey, index: chainIndex + 1 });
                 messageInput.value='';
                 closeSendModal(true);
                 await fetchNewMessages();
