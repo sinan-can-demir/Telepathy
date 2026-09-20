@@ -23,6 +23,12 @@ AUTH_DIR="$HS_DIR/authorized_clients"
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# Key generation runs on the host, not in the container. base32 is GNU
+# coreutils and isn't on a stock macOS install (brew install coreutils).
+for tool in "$ENGINE" openssl base32; do
+    command -v "$tool" >/dev/null || die "required tool not found on this host: $tool"
+done
+
 find_container() {
     if [[ -n "${TOR_CONTAINER:-}" ]]; then
         echo "$TOR_CONTAINER"

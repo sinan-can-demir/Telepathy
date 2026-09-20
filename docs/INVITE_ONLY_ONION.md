@@ -6,13 +6,13 @@ The default Tor deployment (`compose.yaml` + `deploy/torrc`) is *open*: anyone w
 
 ## The mechanism
 
-Tor v3 **Client Authorization** makes the hidden service's descriptor unreadable to anyone without an authorized x25519 key. An unauthorized client can't even learn where to open a connection: it fails inside Tor's own protocol, before any byte reaches the app container, let alone Django. This is a much stronger gate than anything the app could enforce itself, and it composes with `HiddenServicePoWDefensesEnabled` (which still applies to *authorized* clients).
+Tor v3 **Client Authorization** makes the hidden service's descriptor unreadable to anyone without an authorized x25519 key. An unauthorized client can't even learn where to open a connection: it fails inside Tor's own protocol, before any byte reaches the app container, let alone Django. This is a much stronger gate than anything the app could enforce itself, and it is meant to sit alongside `HiddenServicePoWDefensesEnabled`, which stays enabled in `deploy/torrc` (the two were not tested together).
 
 It is **opt-in**. Nothing in `deploy/torrc` changes: Tor enforces client auth whenever `<HiddenServiceDir>/authorized_clients/` contains at least one `<name>.auth` file, and stays open when it's empty. So the default deployment is untouched, and going back to open is just revoking the last client.
 
 ## Usage
 
-`deploy/tor-client-auth.sh` (works with `podman`, or `CONTAINER_ENGINE=docker`; finds the compose `tor` service, or set `TOR_CONTAINER`):
+`deploy/tor-client-auth.sh` (works with `podman`, or `CONTAINER_ENGINE=docker`; needs `openssl` and `base32` on the host, and `base32` isn't on a stock macOS install; finds the compose `tor` service, or set `TOR_CONTAINER`):
 
 ```
 deploy/tor-client-auth.sh add alice      # generate a keypair, authorize it, print alice's key
