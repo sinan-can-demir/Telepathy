@@ -32,6 +32,7 @@ class MessageSerializer(serializers.ModelSerializer):
             "seq",
             "prev_hash",
             "sender_chain_epoch",
+            "chain_index",
             "timestamp",
             "sender_id",
             "sender_public_key",

@@ -268,11 +268,42 @@ class MessageRoundTripTests(TestCase):
             {
                 "encrypted_text": "ciphertext", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": prev_hash,
-                "sender_chain_epoch": epoch,
+                "sender_chain_epoch": epoch, "chain_index": 0,
                 "wrapped_keys": [{"recipient_id": sender_id, "encrypted_symmetric_key": key_for_self}],
             },
             format="json",
         )
+
+    def test_chain_index_is_stored_and_served(self):
+        resp = self.alice.post(
+            f"/chat/send-message/{self.chat_id}/",
+            {
+                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
+                "prev_hash": GENESIS_HASH, "sender_chain_epoch": self.alice_epoch, "chain_index": 7,
+                "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "k"}],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["chain_index"], 7)
+        self.assertEqual(Message.objects.get().chain_index, 7)
+        served = self.bob.get(f"/chat/get-messages/{self.chat_id}/").data["messages"][0]
+        self.assertEqual(served["chain_index"], 7)
+
+    def test_chain_index_is_required_and_validated(self):
+        def post(**extra):
+            body = {
+                "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
+                "prev_hash": GENESIS_HASH, "sender_chain_epoch": self.alice_epoch,
+                "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "k"}],
+            }
+            body.update(extra)
+            return self.alice.post(f"/chat/send-message/{self.chat_id}/", body, format="json")
+
+        self.assertEqual(post().status_code, 400)  # missing entirely
+        for bad in (-1, 2**31, "3", 1.5, True, None):
+            self.assertEqual(post(chain_index=bad).status_code, 400, bad)
+        self.assertEqual(Message.objects.count(), 0)
 
     def test_round_trip_creates_one_message_and_self_wrap_only(self):
         send = self._send(self.alice)
@@ -412,7 +443,7 @@ class GroupChatFeatureTests(TestCase):
             {
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": GENESIS_HASH,
-                "sender_chain_epoch": issued.data["epoch"],
+                "sender_chain_epoch": issued.data["epoch"], "chain_index": 0,
                 "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"}],
             },
             format="json",
@@ -508,7 +539,7 @@ class TranscriptChainTests(TestCase):
             {
                 "encrypted_text": text, "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": prev_hash,
-                "sender_chain_epoch": epoch,
+                "sender_chain_epoch": epoch, "chain_index": 0,
                 "wrapped_keys": [{"recipient_id": sender_id, "encrypted_symmetric_key": "key-self"}],
             },
             format="json",
@@ -586,7 +617,7 @@ class ChatServicesUnitTests(TestCase):
         kwargs = dict(
             encrypted_text="ct", aes_nonce="n", aes_tag="t", mac="m",
             wrapped_keys=[{"recipient_id": sender.pk, "encrypted_symmetric_key": "k"}],
-            prev_hash=GENESIS_HASH, sender_chain_epoch=0,
+            prev_hash=GENESIS_HASH, sender_chain_epoch=0, chain_index=0,
         )
         kwargs.update(overrides)
         return services.send_message(self.chat.pin, sender, **kwargs)
@@ -731,7 +762,7 @@ class MessageExpiryUnitTests(TestCase):
             self.chat.pin, self.alice,
             encrypted_text="ct", aes_nonce="n", aes_tag="t", mac="m",
             wrapped_keys=[{"recipient_id": self.alice.pk, "encrypted_symmetric_key": "k"}],
-            prev_hash=GENESIS_HASH, sender_chain_epoch=0, ttl_seconds=ttl_seconds,
+            prev_hash=GENESIS_HASH, sender_chain_epoch=0, chain_index=0, ttl_seconds=ttl_seconds,
         )
 
     def test_send_message_without_ttl_creates_no_read_receipt(self):
@@ -853,7 +884,8 @@ class MessageExpiryHTTPTests(TestCase):
             f"/chat/send-message/{self.chat_id}/",
             {
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "m",
-                "prev_hash": GENESIS_HASH, "sender_chain_epoch": self.epoch, "ttl_seconds": ttl_seconds,
+                "prev_hash": GENESIS_HASH, "sender_chain_epoch": self.epoch, "chain_index": 0,
+                "ttl_seconds": ttl_seconds,
                 "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "k"}],
             },
             format="json",

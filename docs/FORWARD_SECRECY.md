@@ -26,9 +26,19 @@ A forward-secret ratchet that's genuinely discarding old keys creates an obvious
 
 ## Where the keys actually live (issue #55)
 
-The sending chain key, each per-sender receiving chain key, and the per-message key cache (`chain_my_key_*`, `chain_recv_key_*`, `msgkey_*` in `chatbox.html`) are stored as non-extractable `CryptoKey` objects in the same IndexedDB store `docs/CLIENT_KEY_STORAGE.md` set up for the RSA keys and bearer token, not as raw base64 bytes in `localStorage`. `ratchetStep` takes a chain key `CryptoKey` and signs with it directly (`crypto.subtle.sign` accepts a `CryptoKey`, no export round-trip needed); an HMAC's *output* is unavoidably a raw buffer, so it's re-imported into a fresh non-extractable key immediately, rather than ever touching storage as raw bytes.
+The sending chain key, each per-sender receiving chain key, and the per-message key cache (`chain_my_key_*`, `chain_recv_key_*`, `msgkey_*`, `skipkey_*` in `chatbox.html`) are stored as non-extractable `CryptoKey` objects in the same IndexedDB store `docs/CLIENT_KEY_STORAGE.md` set up for the RSA keys and bearer token, not as raw base64 bytes in `localStorage`. `ratchetStep` takes a chain key `CryptoKey` and signs with it directly (`crypto.subtle.sign` accepts a `CryptoKey`, no export round-trip needed); an HMAC's *output* is unavoidably a raw buffer, so it's re-imported into a fresh non-extractable key immediately, rather than ever touching storage as raw bytes.
 
 One exception, and it's inherent to the design, not an oversight: on the *sending* side, the freshly-derived message key briefly exists as raw bytes in memory, because it needs to be RSA-OAEP-wrapped for the self-decrypt copy (see "What the server sees" above) — `crypto.subtle.encrypt` needs a plaintext buffer there, not a `CryptoKey`. Those raw bytes are never persisted anywhere; they exist for the duration of one `submit` handler call and are then only reachable as the non-extractable `CryptoKey` used for the AES-GCM encrypt itself. The *received*-message path has no such exception: `deriveReceivedMessageKey` only ever returns a non-extractable `CryptoKey`, never raw bytes, since a receiver never needs to wrap it for anyone.
+
+## Missing messages: chain index and skipped keys (issue #90)
+
+Advancing "once per message seen" only works if every message reaches every receiver. Once the server can lose messages (a Redis restart, an aged-out relay entry -- see `docs/EPHEMERAL_RELAY.md`), losing message *k* would leave every later key from that sender one step off, permanently, until a re-key.
+
+So each message carries `chain_index`: its position within the sender's current epoch (0 for the epoch's first message). A receiver keeps `{chainKey, index}` per sender (one IndexedDB record, so the key and its position can't be persisted out of step) and, on a message at index *n*, ratchets forward from `index` to *n*. The keys for the positions it stepped over are kept as `skipkey_*` entries, because the chain is one-way and a key not kept can never be recovered; if the missing message turns up late it is decrypted with its kept key, once. A message whose index is already behind the receiver and has no kept key is refused as a replay. A single message can make a receiver skip at most `MAX_SKIP` (100) positions, so a hostile index can't pin the tab in a huge HMAC loop.
+
+`chain_index` is not separately MAC'd: it selects which key decrypts the message, so a server that lies about it makes AES-GCM decryption fail before the MAC is reached. The receiver caches the message's own key *before* committing the advanced chain, so an interruption between the two self-heals on the next message (the gap is re-derived as skipped keys) instead of desyncing.
+
+This does not recover the *content* of a lost message -- that is gone -- it only stops one loss from taking the rest of the conversation with it.
 
 ## What this explicitly does not give
 
