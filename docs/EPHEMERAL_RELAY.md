@@ -29,8 +29,8 @@ delay messages.
    carry only `sender_chain_epoch`, not a position within the epoch. Losing
    message *k* makes every later key from that sender wrong until a new epoch.
    Today the server keeps everything so this can't happen; with a TTL or a Redis
-   restart it can. Hence the counter (`chain_index`), bound into the sender's MAC
-   so the server can't rewrite it undetected.
+   restart it can. Hence the counter (`chain_index`). It needs no MAC binding: it
+   selects the decryption key, so a server that lies about it fails AES-GCM first.
 2. **The server needs a durable chain tip.** `send_message` derives
    `expected_prev_hash` from the last stored `Message` for the 409 stale-transcript
    check. With messages gone from Postgres, `Chat` gains `tip_seq` and
