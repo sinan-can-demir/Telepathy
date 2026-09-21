@@ -5,6 +5,7 @@
 - **Code reviewed:** `main` at commit `123be67` (2026-09-21), including the per-chain message index from #92.
 - **Reviewer:** an AI assistant (Claude), working in a single session at the maintainer's request. This is a careful review with running evidence, **not** an independent audit, and it is not a substitute for one.
 - **Relationship to other docs:** `docs/SECURITY_AUDIT.md` (2026-09-18) hunted implementation bugs in the crypto/auth core, and those are fixed. This document asks a different question: *who could attack this system, what could each of them actually do, and is that acceptable for your use?* It also records findings that audit did not cover. `ARCHITECTURE.md` ("Accepted limitations") and the per-feature docs remain accurate; this pulls them together and adds what was missing.
+- **Revision 2 (2026-09-21):** widened the adversary catalogue from 10 to 15 (added coercive/legal pressure, a compromised counterpart, the Tor network, repository/release compromise, and abusive users; browser extensions are folded into A8), added a capability profile per adversary, and added two structured passes: STRIDE by component and LINDDUN for the anonymity claims. That added findings T-25 to T-31, extended T-15, and produced a list of things that held up under testing. Existing IDs T-01 to T-24 are unchanged.
 
 ---
 
@@ -27,8 +28,13 @@ Not audited by anyone independent. Not suitable for whistleblowing, source prote
 | A curious host who doesn't tamper | **Content safe, metadata exposed** | Sees who, when, how often, group membership (T-11). |
 | A malicious or compromised server | **Not protected** | Can MITM from message one and ship altered code (T-04). Only self-hosting plus out-of-band fingerprint checks helps. |
 | Someone who steals a DB dump or backup | **Content safe today; long tail of risk** | Ciphertext and wrapped keys are kept far longer than advertised (T-05, T-07, T-23). |
-| Someone who seizes or infects your device | **Not protected** | Full history, keys' *use*, and the session token are recoverable (T-15). |
+| Someone who seizes or infects your device, or a malicious browser extension | **Not protected** | Full history, keys' *use*, and the session token are recoverable (T-15). |
 | A state-level / global passive adversary | **Not protected** | Timing correlation, no cover traffic (T-11, accepted #63). |
+| Your chat partner, or your partner's device | **Not protected** | E2EE protects the endpoints from everyone *except each other*; a leak or a compromised partner device exposes everything (T-28). |
+| A court order or coercion aimed at the operator | **Metadata and retained data can be handed over; a targeted backdoored client could be ordered** | (T-25, T-04). Not legal advice. |
+| Someone who compromises the repo or a release | **Not protected** | Clients run whatever the server serves, so the repo is part of the trust base; its protections are thin (T-26). |
+| Attackers inside the Tor network (relays, directories) | **Mostly out of the app's hands** | Relies on Tor's guarantees; the app-side risk is how the onion identity and client keys are handled (T-27). |
+| Abusive users of a public instance | **Nothing built in** | No report, block or moderation, and deniability cuts both ways (T-29). |
 
 ---
 
@@ -36,7 +42,7 @@ Not audited by anyone independent. Not suitable for whistleblowing, source prote
 
 **Reviewed:** every Python module in `chat/` and `pc/`; the full client (`chatbox.html`, `usermenu.html`, `index.html`); the container, compose, Tor and CI configuration; every existing security doc; the pinned dependency set.
 
-**Method:** full read of server and client code; then *running* the riskiest suspicions rather than only asserting them. Each finding below carries one evidence tag:
+**Method:** full read of server and client code; adversary analysis (§5); a STRIDE pass per component and a LINDDUN privacy pass (§5); then *running* the riskiest suspicions rather than only asserting them. Each finding below carries one evidence tag:
 
 | Tag | Meaning |
 |---|---|
@@ -44,7 +50,7 @@ Not audited by anyone independent. Not suitable for whistleblowing, source prote
 | **Code-read** | Follows from reading the code; not run. Reasonably certain, but weaker evidence. |
 | **Documented** | Already recorded by the project in an existing doc; included here for completeness. |
 
-**Not assessed** (treat these as unknown, not as "fine"): behaviour in a real browser end-to-end (no click-through was done); the Tor network path, the `tor` container's runtime behaviour, or host/OS hardening; TLS termination for a clearnet deployment (nothing in the repo configures it); Postgres and Redis configuration; traffic captures; fuzzing; reachability of the dependency vulnerabilities in §T-13; any formal analysis of the hand-rolled protocol; social engineering, legal, or physical threats beyond what is noted. Django, DRF, Channels and the browser's WebCrypto were assumed correct.
+**Not assessed** (treat these as unknown, not as "fine"): behaviour in a real browser end-to-end (no click-through was done); the Tor network path, the `tor` container's runtime behaviour, or host/OS hardening; TLS termination for a clearnet deployment (nothing in the repo configures it); Postgres and Redis configuration; traffic captures; fuzzing; reachability of the dependency vulnerabilities in §T-13; any formal analysis of the hand-rolled protocol; social engineering, physical threats, and legal advice (T-25 and T-31 flag legal exposure but do not assess it); the maintainer's account-level security (2FA, key storage), which the GitHub API does not expose. Django, DRF, Channels and the browser's WebCrypto were assumed correct.
 
 ---
 
@@ -86,20 +92,51 @@ Two trust facts follow from the picture and drive most findings:
 
 ## 5. Adversaries considered
 
-| ID | Adversary | Capabilities assumed |
+An adversary is defined here by **position** (where they stand relative to the system), **resources**, and **motivation**, because "botnet scanning for open servers" and "someone targeting one person" need different defences.
+
+### 5.1 Catalogue
+
+| ID | Adversary | Position and capabilities |
 |---|---|---|
-| **A1** | Passive network observer | Sees traffic to/from the server or the Tor entry. |
+| **A1** | Passive network observer | Sees traffic to and from the server or the Tor entry. |
 | **A2** | Global passive adversary | Correlates traffic timing across the network. |
 | **A3** | Anonymous outsider | Can send HTTP(S)/Tor requests to the server; knows nothing else. |
-| **A4** | Malicious chat participant | Holds a valid PIN and token; may be a group member. |
-| **A5** | Curious operator | Runs the server honestly but reads DB, logs, network metadata. |
-| **A6** | Malicious / compromised server | Can alter any response, drop messages, ship modified JS. |
-| **A7** | Data thief | Gets a copy of DB / backups / logs, offline, once or over time. |
-| **A8** | Device attacker | (a) runs code in the victim's browser (XSS, malware); (b) seizes or images the device. |
-| **A9** | Supply-chain attacker | Compromises a dependency or base image. |
+| **A4** | Malicious chat participant | Holds a valid PIN and token; may be a group member or an ex-member. |
+| **A5** | Curious operator | Runs the server honestly but reads the DB, logs, and network metadata. |
+| **A6** | Malicious or compromised server | Can alter any response, drop messages, ship modified JS. |
+| **A7** | Data thief | Gets a copy of the DB, backups, or logs, offline, once or over time. |
+| **A8** | Device attacker | (a) runs code in the victim's browser: XSS, **a malicious browser extension**, malware; (b) seizes or images the device. |
+| **A9** | Dependency / image supply chain | Compromises a package or base image. |
 | **A10** | Future cryptanalyst | Stores today's ciphertext; breaks RSA-2048 later. |
+| **A11** | Coercive or legal pressure | Compels the operator (or a participant) to hand over data, keys, or to change what is served. |
+| **A12** | Compromised or careless counterpart | Is a legitimate member, but leaks, screenshots, or has a compromised device. |
+| **A13** | Tor network adversary | Runs relays or directory nodes; attempts guard discovery, onion-service deanonymisation, traffic confirmation. |
+| **A14** | Repository / release compromise | Controls a maintainer account, a merged PR, or a CI action. |
+| **A15** | Abusive user | Uses an open instance for spam, harassment, or content the operator would refuse. |
 
-### Exposure matrix
+### 5.2 Capability profiles
+
+"Realistic for a small deployment" is my judgement, not a measurement. It says how much attention each adversary deserves at this project's scale.
+
+| ID | Resources | Motivation | Realistic for a small deployment? |
+|---|---|---|---|
+| A1 | Low | Opportunistic | **High**: always present on any network. |
+| A2 | Very high | Targeted | Low; a state-level concern. |
+| A3 | Low to moderate | Opportunistic, griefing | **High**: internet-wide scanners find open servers. |
+| A4 | Low | Targeted (an insider) | Medium |
+| A5 | n/a | Curiosity or commercial | Medium; depends entirely on who hosts. |
+| A6 | Moderate | Targeted or financial | Low to medium; a hobby server with known-vulnerable dependencies (T-13) is a plausible target. |
+| A7 | Moderate | Financial | Medium; backups and breaches are routine. |
+| A8 | Low to moderate | Opportunistic (malware, extensions) or targeted (seizure) | Medium |
+| A9 | Moderate to high | Opportunistic or targeted | Low to medium |
+| A10 | Very high | Long-term | Low |
+| A11 | Authority | Targeted | Low to medium; rises with the deployment's profile. |
+| A12 | Low | Varied, often carelessness | **High**: the most common real-world leak in any E2EE tool. |
+| A13 | High | Targeted deanonymisation | Low |
+| A14 | Moderate | Targeted or opportunistic | Low to medium; single maintainer, public repo. |
+| A15 | Low | Opportunistic | Medium on a public instance; low on an invite-only one. |
+
+### 5.3 Exposure matrix
 
 `●` protected · `◐` partially / with caveats · `○` not protected · `—` not applicable
 
@@ -108,13 +145,49 @@ Two trust facts follow from the picture and drive most findings:
 | A1 Network observer | ● (TLS/Tor) | ● | ◐ IP visible on clearnet; sizes bucketed | — |
 | A2 Global passive | ● | ● | ○ timing correlation (#63) | — |
 | A3 Outsider | ◐ can join open chats (T-01–03) | ◐ | ◐ enumerates live chats + names | ○ T-06, T-08, T-16 |
-| A4 Malicious member | ● past epochs / ◐ future | ◐ can send garbage, forge in collusion (T-24) | ◐ | ◐ |
+| A4 Malicious member | ● past epochs / ◐ future | ◐ can send garbage, forge in collusion (T-24) | ◐ | ◐ T-30 |
 | A5 Curious operator | ● | — | ○ full metadata (T-11, T-12) | — |
 | A6 Malicious server | ○ MITM + code (T-04) | ○ silent censorship (T-09/10) | ○ | ○ |
 | A7 Data thief | ● now / ◐ over time (T-05, T-23) | — | ○ | — |
 | A8 Device attacker | ○ (T-15) | ○ | ○ | — |
 | A9 Supply chain | ○ (T-13) | ○ | ○ | ○ |
 | A10 Future cryptanalyst | ○ if ciphertext retained (T-23) | — | — | — |
+| A11 Coercive / legal | ◐ safe unless a backdoored client is ordered (T-04, T-25) | ◐ | ○ retained data and logs can be produced (T-25) | ○ service can be ordered down |
+| A12 Counterpart | ○ they hold the plaintext (T-28) | ◐ deniable, can lie | ◐ they know your name and timing | — |
+| A13 Tor network | ● | ● | ◐ Tor's guarantees; timing (#63); onion key handling (T-27) | ◐ |
+| A14 Repo / release | ○ (T-26) | ○ | ○ | ○ |
+| A15 Abusive user | — | ◐ | ◐ | ○ T-06, T-16, T-29, T-30 |
+
+### 5.4 STRIDE pass by component
+
+Each component was checked for Spoofing, Tampering, Repudiation, Information disclosure, Denial of service and Elevation of privilege. Cells give the finding that covers the threat. **holds** means the check was run and the defence worked. `—` means no relevant threat found.
+
+| Component | S | T | R | I | D | E |
+|---|---|---|---|---|---|---|
+| Browser client | T-03 names; T-27 lookalike server | T-09; T-15 (pins editable by any script) | deniable by design (T-29) | T-05, T-14, T-15 | — | T-14 no CSP |
+| HTTP API | T-01 | T-16 no field validation | T-29 | T-02, T-11 | T-06, T-08, T-16, **T-30** | **holds**: cross-chat authorization (probe 10); T-18 admin |
+| Bearer token / sessions | T-15 replay | — | — | T-15 | T-08 | **holds**: 256-bit, hashed at rest; T-07 idle path |
+| WebSocket + Redis | T-21 unauthenticated Redis could forge signals | T-21 | — | T-19 | T-19 | **holds**: cross-chat socket refused |
+| Postgres + logs | — | T-10 tail | no tamper-evident operator audit trail (minor) | T-05, T-07, T-11, T-12 | T-06, T-07 | — |
+| Tor sidecar + keys | **T-27** | T-27 | — | T-11 | T-27 silent reopen | T-21 shared netns |
+| Containers + deps | T-13 | T-13, T-20 | — | T-12 | — | T-13, T-21 |
+| Repo + CI | **T-26** | T-26 | — | T-26 | — | T-26 |
+
+What the pass turned up beyond the findings I already had: the fetch-cost amplification (**T-30**, from the DoS column), the lookalike-server problem and onion key handling (**T-27**, from Spoofing), repository trust (**T-26**, from the Repo + CI row), and one clean positive (Elevation of privilege on the API).
+
+### 5.5 Privacy pass (LINDDUN)
+
+Because Telepathy's pitch is anonymity, its privacy properties were checked against the LINDDUN categories.
+
+| Category | Assessment | Where |
+|---|---|---|
+| **L**inkability | Within a chat, by design. Across chats the app does well: keys and ids are per chat. But on clearnet, IP and timing still link a person's chats; display names are free text and easily reused; participant ids are global and sequential. | T-11, T-22 |
+| **I**dentifiability | Names are self-chosen; IPs appear in logs on clearnet; a partner learns your name and timing. | T-12, T-28 |
+| **N**on-repudiation (a *good* property here) | Deniable MAC: no third-party proof of authorship. Caveats: the operator's own records attribute each send to a token, and in groups a member colluding with a server could forge (T-24). Deniability also means a harassment victim can't prove abuse. | T-24, T-29 |
+| **D**etectability | Anyone can enumerate which chats exist and who is in them. On Tor, use of the network is visible but use of Telepathy is not. | T-02 |
+| **D**isclosure of information | Retained wrapped seeds and ciphertext; rich server-side metadata; device contents. | T-05, T-11, T-15 |
+| **U**nawareness | Users are never told what the server keeps, for how long, or that logs exist; the README says "guaranteed". | T-31 |
+| **N**on-compliance | No retention policy or user-initiated deletion beyond Leave; personal data in logs on clearnet. Regulatory exposure was not assessed. | T-31, T-25 |
 
 ---
 
@@ -150,6 +223,15 @@ Two trust facts follow from the picture and drive most findings:
 | T-22 | Low | Minor identifier and validation leaks | A3 | Verified |
 | T-23 | Low | Crypto limits: RSA-2048, hand-rolled and unreviewed, no post-compromise security | A10 | Documented + Code-read |
 | T-24 | Low | Powers of a malicious member; deniability caveat in groups | A4 | Code-read |
+| T-25 | Med | A compelled operator can hand over a lot, or be ordered to backdoor the client | A11 | Code-read |
+| T-26 | Med | Thin protection of the repository and release process | A14 | Verified |
+| T-27 | Med | Onion identity and client-auth key handling; lookalike servers | A13, A6 | Code-read + Documented |
+| T-28 | Med | A compromised or careless counterpart defeats everything | A12 | Code-read |
+| T-29 | Low | No abuse controls; deniability cuts both ways | A15 | Code-read |
+| T-30 | Med | One fetch costs O(transcript), and a member controls the transcript | A4 | Verified |
+| T-31 | Low | Users aren't told what is kept; no retention or deletion policy | A11, LINDDUN | Code-read |
+
+T-25 to T-31 were added in revision 2. IDs are stable identifiers, not a severity ranking; sort by the **Sev** column.
 
 ---
 
@@ -324,11 +406,12 @@ Timing correlation by a global observer (sender's POST, receivers' immediate ref
 
 ### T-15 · Medium · What a seized or infected device yields
 
-**Adversary:** A8. **Evidence:** Code-read.
+**Adversary:** A8, including malicious browser extensions. **Evidence:** Code-read.
 
 - **Non-extractable is not encrypted at rest.** It stops JavaScript from *reading* the key; it does not stop code in the page from *using* it, and (untested here) the browser must persist it in the profile to survive restarts, so disk access should be treated as key access unless the OS encrypts the profile.
 - IndexedDB holds the RSA key, the bearer token (a plain string), chain keys, **and a cached key for every message ever received** (`msgkey_*`). With the server's ciphertext (or an A7 copy) those decrypt the whole history of that chat on that device.
 - `localStorage` holds the chat PIN, participant id, pinned keys and chain epoch in the clear.
+- **TOFU pins are ordinary `localStorage` entries.** Any script or extension running on the origin can overwrite them, after which a key swap passes the check silently. Extensions can also read the rendered chat directly. Tor Browser's defaults blunt this; a general-purpose browser with extensions installed does not.
 - The create/join URL carries the PIN and display name in its query string. It is replaced with `replaceState`, but the browser may have already recorded the original URL (not tested).
 - Nothing locks the app; there is no PIN, timeout, or panic-wipe. Leave destroys keys; closing the tab does not.
 
@@ -407,6 +490,109 @@ Cannot: read messages from before they joined, post as someone else through the 
 
 **Deniability caveat:** the MAC is derived from the ratchet, so any member who holds a sender's seed can compute valid MACs for that sender. That is the point of deniability and safe against outsiders. In a group, a malicious member *colluding with a malicious server* (which controls the recorded `sender_id`) could inject a message that verifies as another member's.
 
+### T-25 · Medium · A compelled operator can hand over a lot, or be ordered to backdoor the client
+
+**Adversary:** A11. **Evidence:** Code-read, built on the data inventory verified in T-11 and T-12. This is a technical description of exposure, not legal advice.
+
+- **What can be produced without any user's cooperation:** everything in the T-11 table, the logs (T-12), and retained ciphertext and wrapped seeds (T-07). Not plaintext.
+- **What a targeted order could add:** the operator controls the JavaScript (T-04), so an operator compelled or coerced to do so could serve a modified client to one specific chat (the PIN is in every request) or one client-authorization holder. Users cannot detect this.
+- **The onion identity** (`tor_data`, see T-27) can be compelled too, which lets a third party *be* the server.
+- **Participants** can be compelled to unlock a device (T-15). Deniability helps against third-party proof of authorship; it does nothing about what the device already holds.
+- Because the design retains more than it needs to (T-07, T-11), there is little the operator could truthfully say "we don't have". There is no retention policy or transparency statement.
+
+**Fix direction:** keep less. Fix T-07 and T-12, then relay-only mode (#90); write down a retention policy; choose hosting jurisdiction deliberately.
+
+### T-26 · Medium · The repository and release process are thinly protected
+
+**Adversary:** A14. **Evidence:** Verified (GitHub API for branch protection, Actions and security settings; the workflow file).
+
+Because browsers run whatever the server serves, the source repository is effectively part of every deployment's trusted base: a malicious commit becomes client code for every operator who deploys it.
+
+| Observed on `main` | |
+|---|---|
+| Pull request required | yes, but **0 approving reviews required** |
+| Admin bypass | `enforce_admins` is **off** (admins can bypass; the early license commits went straight to `main` this way) |
+| Required status checks | **none**, so the secret scan is advisory |
+| Signed commits, CODEOWNERS | **none** |
+| Force-push and branch deletion | blocked |
+| Actions | `actions/checkout@v4` and `gitleaks/gitleaks-action@v2` use **floating tags**; default token is read-only |
+| Dependabot security updates | **disabled** |
+| Secret scanning + push protection | **enabled** |
+| `SECURITY.md` / vulnerability reporting route | **none** |
+
+There is a single maintainer, and the repository is public. Account-level security (2FA, hardware keys) cannot be seen through the API and was not assessed.
+
+**Fix direction:** require status checks; pin Actions by commit SHA; enable Dependabot; add `SECURITY.md`; enforce rules for admins; require a review as soon as there is a second maintainer (a solo maintainer cannot self-approve, which is why 0 may be a deliberate trade-off); tag releases and advise operators to deploy a reviewed tag, not whatever is on `main`.
+
+### T-27 · Medium · Onion identity and client-auth key handling
+
+**Adversary:** A13, A6, A3. **Evidence:** Code-read + Documented (`docs/INVITE_ONLY_ONION.md`).
+
+- **The `tor_data` volume is the server's identity.** It holds the hidden-service private key and the `authorized_clients/` directory. README calls it "the one piece of state that must persist", which means it gets backed up, and backups are targets. Whoever holds a copy *is* the server: they can run a byte-identical lookalike at the same address serving modified JavaScript (T-04). The key cannot be rotated without changing the address.
+- **Users can't check they're at the right server.** The only identity signal is the 56-character address. Lookalike ("vanity prefix") onion addresses are a known phishing technique, and the app shows no server identity.
+- **Client-authorization keys** are printed once to the operator's terminal (scrollback, shell logging) and delivered by hand; they never expire; a leaked key is a leaked invitation until revoked.
+- **Revoking the last authorized client silently reopens the service to everyone.** The script prints a warning, but nothing prevents it.
+- The interaction of client auth with the PoW defence is untested (the project's own doc says so).
+
+Tor-network attacks proper (A13: guard discovery, directory nodes, traffic confirmation) are outside the app's control. Beyond the `Server: daphne` banner (T-14) and timing patterns (T-11) I found no app-specific leak that helps them.
+
+**Fix direction:** treat the hidden-service key like a signing key (encrypted, minimal-copy backups); tell users to verify the full address; make removing the last client require an explicit flag.
+
+### T-28 · Medium · A compromised or careless counterpart defeats everything
+
+**Adversary:** A12. **Evidence:** Code-read.
+
+End-to-end encryption protects the conversation from everyone except its endpoints. Nothing stops a partner from screenshotting, copying, forwarding, sharing the PIN, or having a compromised device, and their device holds every key for the chats they're in plus all future messages (T-15). "✓ Verified" means "sent by whoever holds this chat's key", not "trustworthy". In groups the weakest member sets the security level, and members can't see or limit who was added (T-03) or evict anyone (T-24). Disappearing messages are unenforceable against them (T-17). Deniability protects against third-party *proof*, not against a partner leaking content.
+
+**Fix direction:** none that is purely technical. Be honest about it in user-facing docs; keep groups small; verify identities out-of-band.
+
+### T-29 · Low · No abuse controls, and deniability cuts both ways
+
+**Adversary:** A15. **Evidence:** Code-read.
+
+There is no report, block, mute, kick or moderation. Anyone with a PIN can post. An operator can delete a chat in the admin but cannot see what it contained. Because messages are deniable (#61), a harassed user cannot prove to a third party who sent what, and the operator cannot verify a claim. Flooding is possible via T-06, T-16 and T-30. As with any E2EE tool, a public instance can be used for things its operator would never permit and cannot see; anyone hosting for strangers should decide their position on that before they host.
+
+**Fix direction:** client-side block/mute; rate limits; an operator policy. Invite-only Tor (T-27's caveats aside) removes most of this by not being open.
+
+### T-30 · Medium · One fetch costs O(transcript), and a member controls the transcript
+
+**Adversary:** A4. **Evidence:** Verified (probe 11).
+
+`GET /chat/get-messages/` returns the whole transcript with no pagination, and it runs the expiry sweep on every call (about three SQL queries per expiring message). Measured in-process against a local database:
+
+| Transcript | SQL queries | Response | Time |
+|---|---|---|---|
+| 10 messages | 38 | 12 KiB | 0.16 s |
+| 500 messages | 1,508 | 570 KiB | 6.0 s |
+| 2,000 messages | 6,008 | 2.3 MiB | 21.6 s |
+
+Every member's client refetches on each websocket push and every 15 s, so one member posting a few thousand messages (cheap: no size or rate limit, T-16) makes every fetch by every member expensive, and can saturate a worker. The figures are an order-of-magnitude guide, not a benchmark of a real deployment. Also, this GET **has side effects** (it writes read receipts and tombstones messages), so any retried or prefetched GET changes state; that interacts with T-17.
+
+**Fix direction:** delta fetches (`since` a sequence number, as relay-only mode would need anyway); batch or background the sweep (the T-07 reaper is the natural home); per-chat message rate and quota.
+
+### T-31 · Low · Users aren't told what is kept, and there's no retention or deletion policy
+
+**Adversary:** A11 / LINDDUN (Unawareness, Non-compliance). **Evidence:** Code-read.
+
+Nothing in the UI or docs tells a user what the server retains (T-11), for how long (T-07), or that logs exist (T-12); the README says "guaranteed by design". Users can't request deletion except by leaving. There is no operator-facing retention policy. Where a deployment stores personal data (IP addresses on clearnet, display names), regulatory duties such as GDPR may apply to the operator. This was not assessed.
+
+**Fix direction:** a short user-facing "what the server keeps" statement derived from the T-11 table; an operator retention policy; soften "guaranteed".
+
+### What held up under testing
+
+A threat model that only lists failures misleads in the other direction. These were checked and worked:
+
+| Area | Result | Evidence |
+|---|---|---|
+| Cross-chat authorization | A token for chat A was refused on every chat B endpoint (403, or 400 for leave); unauthenticated calls got 401; a left participant's token got 401 | Verified (probe 10) |
+| WebSocket isolation | A token for one chat cannot open a socket on another (close code 4001) | Verified (probe 8) |
+| Bearer tokens | 256-bit random; only the SHA-256 hash is stored | Code-read |
+| Public-key intake | Validated as a 2048-bit RSA SPKI PEM with a length cap | Code-read |
+| DOM rendering | All untrusted strings go through `textContent`; no third-party requests | Code-read |
+| Transcript ordering | `seq` assigned under a row lock; stale `prev_hash` rejected with 409 | Code-read |
+| Identity | Keys and ids are per chat; the private key is generated non-extractable | Code-read |
+| Deployment defaults | `DEBUG` off, HTTPS on by default, no published ports, non-root app, secret scanning with push protection | Code-read + Verified (T-26) |
+
 ---
 
 ## 7. Is Telepathy right for you?
@@ -416,6 +602,7 @@ Cannot: read messages from before they joined, post as someone else through the 
 | Learning how E2EE chat, ratchets, TOFU and Tor services fit together | ✅ Good fit; the docs are a real asset. |
 | Casual private chat with friends on a server **you** run, over Tor with client authorization, fingerprints compared out-of-band | 🟡 Reasonable, with the checklist below. |
 | Chat on someone else's server, or a public instance | 🟡 Content is protected from casual snooping; the operator can see metadata and could, if malicious, defeat the crypto (T-04). |
+| Operating a public instance for strangers | 🔴 Not advisable: open to abuse and floods (T-06, T-29, T-30), and you may hold data you cannot inspect or easily delete (T-25, T-31). |
 | Sensitive business, legal, medical, or regulated conversations | 🔴 No: unaudited, retention behaviour differs from the promise (T-07). |
 | Journalist/source, dissident, or any adversary with state resources | 🔴 No. Use an audited tool (Signal, or Briar/Tor-based options). |
 | You need guaranteed deletion, non-repudiation, multi-device, or offline delivery | 🔴 Not provided. |
@@ -429,7 +616,10 @@ Cannot: read messages from before they joined, post as someone else through the 
 5. **Click Leave** when done; don't just close the tab (T-07).
 6. Don't rely on disappearing messages (T-17).
 7. Use a **dedicated browser profile on an encrypted disk**; log out of the OS when unattended (T-15).
-8. Operators: set `DJANGO_SECRET_KEY`; disable the admin (T-18); stop logging PINs/names and rotate logs (T-12); update dependencies (T-13); cap request sizes (T-16); reap idle chats (T-07); don't publish extra ports.
+8. Remember the weakest link is often the other person: choose who you chat with, and expect anything they can read to be copyable (T-28).
+9. If you deploy on Tor: protect the `tor_data` volume like a signing key, tell users to check the **entire** `.onion` address, and don't revoke your last client authorization unless you mean to reopen the service (T-27).
+10. Deploy from a reviewed release tag, not whatever is on `main` (T-26).
+11. Operators: set `DJANGO_SECRET_KEY`; disable the admin (T-18); stop logging PINs/names and rotate logs (T-12); update dependencies (T-13); cap request sizes (T-16); reap idle chats (T-07); don't publish extra ports.
 
 ---
 
@@ -442,6 +632,7 @@ Suggested order by value per effort. Nothing here has been filed or implemented.
 - Bounded `create_chat` retries plus a create throttle (T-06).
 - Stop logging PINs and names; stdout only; rotate (T-12).
 - Bump dependencies; add `pip-audit`/Dependabot; hash-pin (T-13).
+- Require the secret-scan check on `main`, pin Actions by SHA, enable Dependabot, add `SECURITY.md` (T-26).
 - Fail closed on the default secret key; drop the inherited host (T-20).
 - Remove or isolate the admin (T-18).
 
@@ -452,6 +643,9 @@ Suggested order by value per effort. Nothing here has been filed or implemented.
 - Join approval or chat lock, unique names, fingerprint acknowledgement before first send (T-03).
 - CSP with nonces and `Cache-Control: no-store` (T-14).
 - Close sockets on leave/expiry (T-19).
+- Delta fetches and a batched or background expiry sweep; per-chat message quota (T-30).
+- Guard against revoking the last Tor client by accident; document onion-key handling (T-27).
+- A short "what the server keeps" statement and a retention policy (T-25, T-31).
 
 **Structural (already decided or larger)**
 - Fix T-05: one-time seed delivery, drop per-message self-wraps, ephemeral seed-transport keys. Relay-only mode (#90) reduces retention (T-05/T-07/T-11) once completed; note that only stage 1 (#92) has landed, so it is not yet in effect.
@@ -468,13 +662,14 @@ The probes live in `docs/threat-model-probes/`. They document behaviour *at the 
 | File | Backs | How |
 |---|---|---|
 | `crypto_probe.js` | T-05, T-09 | `node docs/threat-model-probes/crypto_probe.js`. Extracts the real functions from `chatbox.html`; needs no dependencies. |
-| `probe_server.py` | T-01, T-02, T-06, T-07, T-08, T-16, T-19, T-22 | Needs Postgres and Redis as for the normal suite; uses a throwaway test database. See the file's header. |
+| `probe_server.py` | T-01, T-02, T-06, T-07, T-08, T-16, T-19, T-22, T-30, and the authorization results under "What held up" | Needs Postgres and Redis as for the normal suite; uses a throwaway test database. See the file's header. |
 
 Others were checked directly:
 - Headers: `curl -sI http://127.0.0.1:8000/chat/usermenu/` on a local dev server (T-14).
 - Admin reachability: `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/admin/login/` (T-18).
 - Dependencies: `pip-audit -r requirements.txt --no-deps` (T-13).
 - Request size: a 30 MB JSON POST to `/chat/create-chat/` on a running server (T-16).
+- Repository settings (T-26): `gh api repos/<owner>/<repo>/branches/main/protection`, `.../actions/permissions/workflow`, and the repository's `security_and_analysis` field; plus `.github/workflows/`.
 - Log content: run the app, create/join a chat, inspect `chat_debug.log` (T-12).
 
 Timings from the in-process probes are lower bounds on real-world cost.

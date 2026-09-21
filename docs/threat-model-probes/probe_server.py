@@ -1,5 +1,5 @@
 """Server-side probes backing docs/THREAT_MODEL.md (findings T-01, T-02, T-06, T-07,
-T-08, T-16, T-19). Each test prints what it observed; assertions only guard the
+T-08, T-16, T-19, T-30, and the positive authorization control in STRIDE). Each test prints what it observed; assertions only guard the
 probe's own preconditions -- these DOCUMENT current behaviour, they are not
 regression tests, and they are deliberately not named test_*.py so the normal
 suite does not collect them.
@@ -193,6 +193,12 @@ class WsProbes(TransactionTestCase):
             except asyncio.TimeoutError:
                 say("old socket received nothing after PIN recycling")
             await comm.disconnect()
+            # positive control: a token for THIS chat must not open a socket on another chat
+            other, _, _ = await dbasync(services.create_chat)("other", PUB, 2)
+            cross = WebsocketCommunicator(app, f"/ws/chat/{other.pin}/", subprotocols=[tok_a])
+            ok, code = await cross.connect()
+            say(f"token for chat {pin} opening a socket on chat {other.pin}: accepted={ok} (close code {code})")
+            await cross.disconnect()
         asyncio.run(run())
 
 
@@ -210,3 +216,63 @@ class FormatProbes(TestCase):
                 "wrapped_keys": [{"recipient_id": a["participant_id"], "encrypted_symmetric_key": "x"}]}
         r = c.post(f"/chat/send-message/{a['chat_id']}/", body, format="json", **h)
         say(f"send-message with a 5 MB non-base64 'ciphertext', junk nonce/tag/mac -> {r.status_code}; stored length {len(Message.objects.get().encrypted_text)}")
+
+
+class AuthzProbes(TestCase):
+    """STRIDE 'Elevation of privilege': can a token for chat A act on chat B?
+    Expected (and observed): no. Kept as a positive control for the threat model."""
+
+    def test_10_cross_chat_authorization(self):
+        print("\n[10] Cross-chat authorization (token from chat A used against chat B)")
+        c = APIClient()
+        a = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "a1"}, format="json").data
+        b = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "b1"}, format="json").data
+        APIClient().post("/chat/join-chat/", {"chat_id": b["chat_id"], "public_key": PUB, "display_name": "b2"}, format="json")
+        h = {"HTTP_AUTHORIZATION": f"Token {a['participant_token']}"}
+        B = b["chat_id"]
+        body = {"encrypted_text": "x", "aes_nonce": "x", "aes_tag": "x", "mac": "x", "prev_hash": "0" * 64, "sender_chain_epoch": 0,
+                "chain_index": 0, "wrapped_keys": [{"recipient_id": a["participant_id"], "encrypted_symmetric_key": "x"}]}
+        rows = [
+            ("GET  get-messages", c.get(f"/chat/get-messages/{B}/", **h)),
+            ("POST send-message", c.post(f"/chat/send-message/{B}/", body, format="json", **h)),
+            ("POST issue-chain-key", c.post(f"/chat/issue-chain-key/{B}/", {"wraps": [{"recipient_id": 1, "encrypted_seed": "x"}]}, format="json", **h)),
+            ("GET  get-chain-keys", c.get(f"/chat/get-chain-keys/{B}/", **h)),
+            ("GET  get-chat-participants", c.get(f"/chat/get-chat-participants/{B}/", **h)),
+            ("POST leave-chat (chat_id=B)", c.post("/chat/leave-chat/", {"chat_id": B}, format="json", **h)),
+            ("GET  get-messages, no token", APIClient().get(f"/chat/get-messages/{B}/")),
+        ]
+        for name, r in rows:
+            say(f"{name:32s} -> {r.status_code}")
+        say("B's roster untouched:", Chat.objects.get(pin=B).participants.filter(left_at__isnull=True).count(), "active")
+        # a token whose participant has left must stop working
+        ChatParticipant.objects.filter(pk=a["participant_id"]).update(left_at=timezone.now())
+        r = c.get(f"/chat/get-messages/{a['chat_id']}/", **h)
+        say("token of a participant who has left, on their own chat ->", r.status_code)
+
+
+class LoadProbes(TestCase):
+    """STRIDE 'Denial of service' from an authenticated member: get-messages is
+    unpaginated and sweeps every expiring message on every fetch."""
+
+    def test_11_fetch_cost_grows_with_transcript(self):
+        print("\n[11] Cost of one GET /get-messages/ as the transcript grows (expiring messages)")
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        c = APIClient()
+        a = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "a"}, format="json").data
+        APIClient().post("/chat/join-chat/", {"chat_id": a["chat_id"], "public_key": PUB, "display_name": "b"}, format="json")
+        chat = Chat.objects.get(pin=a["chat_id"])
+        alice = chat.participants.order_by("joined_at").first()
+        h = {"HTTP_AUTHORIZATION": f"Token {a['participant_token']}"}
+        made = 0
+        for target in (10, 500, 2000):
+            Message.objects.bulk_create([
+                Message(chat=chat, sender=alice, encrypted_text="x" * 300, aes_nonce="n", aes_tag="t", mac="m",
+                        seq=i, ttl_seconds=3600) for i in range(made, target)])
+            made = target
+            with CaptureQueriesContext(connection) as q:
+                t0 = time.time()
+                r = c.get(f"/chat/get-messages/{a['chat_id']}/", **h)
+                dt = time.time() - t0
+            say(f"{target:5d} messages: {len(q):5d} SQL queries, {len(r.content) / 1024:8.0f} KiB response, {dt * 1000:7.0f} ms")
+        say("every member's client repeats this on each websocket push and every 15 s; the sender pays nothing extra")
