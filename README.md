@@ -11,6 +11,8 @@
 
 Two parties join a chat room via a shared 4-digit PIN. Once both connect, they exchange messages secured by **hybrid RSA + AES-GCM encryption** and authenticated with a **deniable, ratchet-derived MAC** — verifiable by the chat's other participants, but not provable to anyone outside it. Every encryption step is visible to the user in real-time through a send progress modal and per-message verification badges.
 
+> ⚠️ **Before you rely on this:** Telepathy is an unaudited learning project. [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) lays out who could attack it, what each attacker can actually do, which claims above hold only conditionally, and who it is (and isn't) suitable for.
+
 ---
 
 ## ✨ Key Features
