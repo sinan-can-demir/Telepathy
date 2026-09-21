@@ -35,33 +35,33 @@ Split the PIN into three identifiers with different lifetimes.
 |---|---|---|
 | **Chat id** (`Chat.public_id`) | Opaque, random, 96 bits (`secrets.token_urlsafe(12)`). Used for routing: API paths, websocket group, `localStorage.chat_id`, the MAC's `chat_id`. | Not a secret. **Never reused.** Nobody types it. |
 | **Invite handle** | Short numeric, 6 digits, that finds an open invite. | Unique among *open* invites only; released when the invite is consumed, expires, or is burned. |
-| **Invite code** | The secret: random, generated with `secrets`, 6 Crockford-base32 chars (30 bits). | Stored **keyed-hashed**, never plaintext; single use; **one wrong attempt burns the invite**; expires after 15 minutes. |
+| **Invite code** | The secret: random, generated with `secrets`, 6 Crockford-base32 chars (30 bits). | Stored **keyed-hashed**, never plaintext; single use; **at most 3 wrong attempts *per invite*, then burned**; expires after 15 minutes. |
 
-An invitee types `handle` + `code` plus a trailing **check character** computed over the whole string (displayed as one string, e.g. `482913-7KQ2MX-V`; Crockford's mod-37 check symbol is one option). The check character is mandatory, not a nicety: with a one-attempt burn, a single typo would otherwise kill an invite, and a mistyped *handle* could burn someone else's. One invite admits **one** person; adding another person means issuing another invite. No standing "join by PIN" path exists once a chat has started, and a seat vacated by a leaver reopens only through a fresh invite.
+An invitee types `handle` + `code` plus a trailing **check character** computed over the whole string (displayed as one string, e.g. `482913-7KQ2MX-V`; Crockford's mod-37 check symbol is one option). The check character is included because typos still spend the 3-attempt budget, and a mistyped *handle* could put a strike on someone else's live invite. It is not needed for the security argument, so it can be dropped if the extra character proves annoying. One invite admits **one** person; adding another person means issuing another invite. No standing "join by PIN" path exists once a chat has started, and a seat vacated by a leaver reopens only through a fresh invite.
 
 ### How a join is checked
 
 `POST /chat/join-chat/` takes `handle`, `code`, `public_key`, `display_name`. In one transaction, with the invite row locked (`select_for_update`):
 
-0. **Validate the check character first.** A malformed or mistyped string is rejected with the same generic error and **charges no strike to any invite**. The check character is derived from public data, so this gives an attacker nothing; it exists to protect honest typos.
+0. **Validate the check character first.** A malformed or mistyped string is rejected with the same generic error and **charges no strike to any invite**. The check character is derived from public data, so this gives an attacker nothing; it exists to protect honest typos and other people's invites.
 1. Look up the open invite by handle. Missing, expired, burned, consumed, wrong code: **all return the same generic error**, with comparable timing, so a probe can't tell a live handle from a dead one.
-2. Compare with `hmac.compare_digest`. On a wrong code, mark the invite **burned** *inside the same locked transaction*; one wrong attempt is enough. The creator's waiting screen shows that an invite was burned, so they know to issue a new one (and that someone, or a typo, hit it).
+2. Compare with `hmac.compare_digest`. On a wrong code, increment the invite's failed counter *inside the same locked transaction*; at 3, mark it **burned**. The creator's waiting screen shows that an invite was burned, so they know to issue a new one (and that someone, or a typo, hit it).
 3. On success, mark the invite consumed, create the participant, notify the roster.
 
 A wrong attempt is charged **to the invite, regardless of source address**. This replaces the per-IP limiter entirely (#95): nothing depends on `X-Forwarded-For`, and nothing collapses under Tor's shared address. A coarse global throttle may remain for *load* protection, but no security property depends on it.
 
 ### Why the locking matters
 
-If the compare and the burn aren't atomic, an attacker can fire many guesses in parallel before the first burn lands and get far more than the one allowed. The check-and-burn must be atomic. This needs a concurrency test (see below), not just a unit test.
+If the compare and the counter increment aren't atomic, an attacker can fire many guesses in parallel before any increment lands and get far more than 3. The check-and-increment must be atomic. This needs a concurrency test (see below), not just a unit test.
 
 ### Guessing odds
 
-One guess per invite against a 30-bit code:
+3 guesses per invite against a 30-bit code:
 
 | Code | Bits | Success per invite | Across 10,000 simultaneously open invites |
 |---|---|---|---|
-| 4 base32 chars | 20 | ~1 in a million | ~1% |
-| **6 base32 chars (chosen)** | **30** | **~1 in a billion** | **~0.001%** |
+| 4 base32 chars | 20 | ~3 in a million | ~3% |
+| **6 base32 chars (chosen)** | **30** | **~3 in a billion** | **~0.003%** |
 | 3 words (7,776-word list) | ~39 | negligible | negligible |
 
 ## Threat analysis: what if someone hijacks the locator?
@@ -70,8 +70,8 @@ One guess per invite against a 30-bit code:
 
 | Attack | What the attacker gets | Defence |
 |---|---|---|
-| **Enumerate live handles**, then guess codes | A single wrong guess burns that invite; success is ~10⁻⁹ per invite. **No access.** But see the burn-DoS row. | One-attempt burn; generic errors so live and dead handles look the same; longer handle raises sweep cost. |
-| **Burn invites** (one wrong guess per handle) | Denial of service on *unjoined* invites: the creator has to issue another. **No confidentiality loss; fails safe.** Cost to burn every open invite: sweep the handle space once (~1 million requests for 6 digits). | Longer handle; global load throttle; Tor Client Authorization (#62) so strangers can't reach the app at all. Accepted residual (see Decisions). |
+| **Enumerate live handles**, then guess codes | A guess costs a strike against that invite; 3 strikes burn it. Success is ~10⁻⁹ per invite. **No access.** But see the burn-DoS row. | Per-invite cap; generic errors so live and dead handles look the same; longer handle raises sweep cost. |
+| **Burn invites** (3 wrong guesses per handle) | Denial of service on *unjoined* invites: the creator has to issue another. **No confidentiality loss; fails safe.** Cost to burn every open invite: sweep the handle space three times (~3 million requests for 6 digits). | Longer handle; global load throttle; Tor Client Authorization (#62) so strangers can't reach the app at all. Accepted residual (see Decisions). |
 | **Squat or predict a handle** (get the one the creator was given, or reuse it after it lapses) | Nothing on its own: without the code the attacker can't join, and a friend arriving late with the old code fails against the attacker's different code. | Handles are assigned server-side, unpredictably, never chosen by the client, released on use. The code is what admits. |
 | **Overhear or leak both handle and code** | Can join first. This is the leaked-secret case; nothing in a code-based design prevents it. | Single use, short expiry, roster notice, and the **fingerprint gate** (#100). The intended friend is refused or notices a wrong roster. |
 | **Malicious server redirects the friend** to another chat under the same handle | The server learns the typed code and can admit the friend to an attacker-controlled chat. **Not prevented.** | Only comparing key fingerprints (made mandatory by #100) catches it; a PAKE would prevent it. This is T-04 and stays an accepted limitation. |
@@ -86,7 +86,7 @@ An earlier discussion said storing "a hash of the code" is sound because the cod
 ## Stages (one PR each)
 
 1. **Opaque chat id, and `secrets` everywhere.** Add `Chat.public_id`; route on it (API paths, websocket group `chat_<public_id>`); return it as `chat_id` from create/join so the client barely changes; switch the remaining `random` use to `secrets`. Still no invites: the 4-digit PIN stays as the join mechanism for now. Fixes the recycled-PIN websocket cross-talk (T-19, the PIN-reuse half), takes the PIN out of every request path after the join (it still appears in the join request itself and in the `[JOIN-CHAT]` log line until Stage 2; T-12's logging fix is separate), and separates address from secret. **Breaking:** in-flight chats end on deploy (their stored `chat_id` no longer resolves). There is precedent: migration 0021 wiped pre-forward-secrecy messages.
-2. **Invites.** `ChatInvite` model; `POST /chat/create-invite/<chat_id>/` (any member); `create-chat` issues the first invite; join takes handle+code; atomic one-attempt burn; check character; single use; expiry; generic errors; keyed-hashed code. UI: two-part input in `usermenu.html`, invite display with expiry and "new invite" in the waiting overlay. Removes `Chat.pin`, the per-IP limiter (#95) and `check-chat` (#96, which has no first-party caller). Bounds the resource at the source: handles exist only while an invite is open.
+2. **Invites.** `ChatInvite` model; `POST /chat/create-invite/<chat_id>/` (any member); `create-chat` issues the first invite; join takes handle+code; per-invite atomic attempt cap; check character; single use; expiry; generic errors; keyed-hashed code. UI: two-part input in `usermenu.html`, invite display with expiry and "new invite" in the waiting overlay. Removes `Chat.pin`, the per-IP limiter (#95) and `check-chat` (#96, which has no first-party caller). Bounds the resource at the source: handles exist only while an invite is open.
 3. **Companion (issue #100).** Roster-change notices, unique display names per chat, and the **fingerprint gate** before the first message to a new participant. Stage 2 makes admission deliberate; this makes a wrongly admitted person visible.
 4. **Optional, later.** A PAKE, if a vetted implementation exists (see above).
 
@@ -95,29 +95,29 @@ An earlier discussion said storing "a hash of the code" is sound because the cod
 | # | Question | Decision | Consequence to carry |
 |---|---|---|---|
 | 1 | Code shape | **6 Crockford-base32 characters** (30 bits) | No wordlist to vendor or license. Harder to read aloud than words; the check character catches typos. |
-| 2 | Wrong attempts before burn | **1** | Strictest option (as magic-wormhole). Makes the check character mandatory and makes burn-DoS cheaper (see below). |
+| 2 | Wrong attempts before burn | **3** | Forgiving of honest typos while keeping the odds at ~3 in a billion per invite. Typos still spend the budget, so the client validates the check character first. (Set to 1 earlier the same day, then raised to 3 as too strict.) |
 | 3 | Who may issue invites | **Any current member**, every issuance announced to the roster | A group isn't stranded if the creator leaves. |
 | 4 | Burn vs timed lockout | **Permanent burn** | Fails safe, no timer state. A burned invite is replaced, not revived. |
 | 5 | Invite lifetime | **15 minutes** | A slow friend means regenerating. |
 | 6 | Handle length | **6 digits** | ~1 million handles. |
 
-Consequences of choosing a one-attempt burn that the implementation must respect:
+Consequences of the 3-attempt cap that the implementation must respect:
 
-- **Typos are the main honest failure mode.** The check character over the *whole* `handle-code` string is mandatory, validated in the client *and* the server, and a bad checksum charges no strike to any invite.
-- **A mistyped handle can hit another live invite.** Without the check character it would burn a stranger's invite with one honest error. With it, the residual chance is the chance of a typo that still passes the checksum.
-- **Burn-DoS is cheaper:** one request per handle instead of three, so about 1 million requests to burn every open invite. Accepted, on the reasoning that it fails safe (no confidentiality loss) and Tor Client Authorization (#62) is the real gate against strangers reaching the app. Revisit the handle length (decision 6) if this is ever a public instance.
+- **Typos still spend the budget.** The check character over the whole `handle-code` string is validated in the client *and* the server, and a bad checksum charges no strike to any invite. It is included but not essential; see the note above.
+- **A mistyped handle can hit another live invite.** That costs a stranger's invite one strike of three. With the check character the residual chance is a typo that still passes the checksum.
+- **Burn-DoS costs about 3 million requests** (three sweeps of the ~1 million handles) to burn every open invite. Accepted: it fails safe (no confidentiality loss) and Tor Client Authorization (#62) is the real gate against strangers reaching the app. Revisit the handle length (decision 6) if this is ever a public instance.
 - **The creator must be told** when an invite burns, so a burn is a visible event, not a silent failure.
 
 ## What this does not fix
 
 - **The server still sees the code** (it verifies it), so a malicious server can join or intercept: T-04.
 - **A leaked code** is a leaked invitation until used or expired. Single use, expiry and the fingerprint gate limit it; nothing removes it.
-- **Burning invites** remains possible and is now a single request per handle (DoS, not compromise).
+- **Burning invites** remains possible (DoS, not compromise).
 - **Typing cost:** 13 characters (6-digit handle, 6-character code, check character) instead of 4 digits. That is the price of moving from 13 bits to a secret worth having.
 
 ## Tests the implementation must carry
 
-- **Concurrent guesses:** N simultaneous wrong codes on one invite result in exactly one evaluated attempt, then burned.
+- **Concurrent guesses:** N simultaneous wrong codes on one invite result in at most 3 evaluated attempts, then burned.
 - **Check character:** a one-character typo in the handle or the code is rejected before any invite is touched, on both client and server, and burns nothing.
 - **Creator notification:** a burned invite is reported to the issuing member.
 - **Uniformity:** nonexistent, expired, burned, consumed and wrong-code responses are byte-identical in status and body.
