@@ -13,14 +13,13 @@ be unit-tested directly against the test database in milliseconds, with no
 request/response plumbing involved.
 """
 
-import random
 import re
 import secrets
 from datetime import timedelta
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Max
 from django.utils import timezone
 
@@ -67,6 +66,10 @@ class MissingSelfWrap(ChatServiceError):
 
 class RosterMismatch(ChatServiceError):
     """A chain-key issuance's wraps don't cover exactly the current roster."""
+
+
+class NoFreePin(ChatServiceError):
+    """Every one of the PIN_SPACE PINs is held by a live chat."""
 
 
 class InvalidTTL(ChatServiceError):
@@ -128,21 +131,51 @@ def issue_participant(chat, display_name, public_key):
 
 # ── Chat creation / joining / leaving ────────────────────────────────────
 
-def create_chat(display_name, public_key, max_participants):
-    """Generates a unique 4-digit PIN and creates a new Chat plus its first
-    participant. Returns (chat, participant, raw_token)."""
-    while True:
-        pin = f"{random.randint(0, 9999):04d}"
-        if not Chat.objects.filter(pin=pin).exists():
-            break
+PIN_SPACE = 10_000
+# Random draws before falling back to picking from the free PINs directly.
+# While the space is mostly empty the first draw almost always hits; the
+# fallback only runs when it's nearly full.
+_PIN_RANDOM_DRAWS = 20
 
-    chat = Chat.objects.create(
-        pin=pin,
-        max_participants=max_participants,
-        is_group=max_participants > 2,
-    )
-    participant, raw_token = issue_participant(chat, display_name, public_key)
-    return chat, participant, raw_token
+
+def _pick_free_pin():
+    """Returns a PIN no live chat holds, drawn with `secrets` -- the PIN is
+    a join secret, so a predictable generator (it used to be
+    random.randint, threat-model T-32) has no place here. Raises NoFreePin.
+
+    This used to be an unbounded `while True` loop: once every PIN was
+    taken (anyone can create chats anonymously), every create request
+    spun forever and pinned a worker (issue #98)."""
+    for _ in range(_PIN_RANDOM_DRAWS):
+        pin = f"{secrets.randbelow(PIN_SPACE):04d}"
+        if not Chat.objects.filter(pin=pin).exists():
+            return pin
+    used = set(Chat.objects.values_list("pin", flat=True))
+    free = [pin for pin in (f"{i:04d}" for i in range(PIN_SPACE)) if pin not in used]
+    if not free:
+        raise NoFreePin()
+    return secrets.choice(free)
+
+
+def create_chat(display_name, public_key, max_participants):
+    """Picks a free 4-digit PIN and creates a new Chat plus its first
+    participant. Returns (chat, participant, raw_token). Raises NoFreePin."""
+    for _ in range(3):
+        pin = _pick_free_pin()
+        try:
+            with transaction.atomic():
+                chat = Chat.objects.create(
+                    pin=pin,
+                    max_participants=max_participants,
+                    is_group=max_participants > 2,
+                )
+                participant, raw_token = issue_participant(chat, display_name, public_key)
+            return chat, participant, raw_token
+        except IntegrityError:
+            # A concurrent create took the same PIN between the check and
+            # the insert (Chat.pin is unique); pick again.
+            continue
+    raise NoFreePin()
 
 
 def get_chat(chat_id):
