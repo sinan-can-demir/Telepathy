@@ -30,10 +30,10 @@ def authenticate_participant(raw_token, chat_pin=None):
     ChatParticipant, or None if the token is invalid/unknown, already
     left, or has been idle past IDLE_TIMEOUT.
 
-    An idle-expired participant is marked left_at here, lazily, the same
-    "clean up on the next relevant request" pattern LeaveChatView already
-    uses for a chat that's emptied out -- there's no scheduled job in this
-    app, and this doesn't need one either.
+    An idle-expired participant is marked left here, lazily, through the
+    same services.mark_left an explicit leave uses, so a chat this empties
+    is deleted too. The reaper (services.reap_idle_chats) does the same for
+    participants who never come back at all (#97).
     """
     if not raw_token:
         return None
@@ -51,8 +51,8 @@ def authenticate_participant(raw_token, chat_pin=None):
 
     now = timezone.now()
     if participant.last_seen < now - IDLE_TIMEOUT:
-        participant.left_at = now
-        participant.save(update_fields=["left_at"])
+        from .services import mark_left  # services imports this module
+        mark_left(participant, now)
         return None
 
     ChatParticipant.objects.filter(pk=participant.pk).update(last_seen=now)
