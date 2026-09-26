@@ -6,8 +6,9 @@
 //   B. forward secrecy vs. (retained wrapped seed + recipient RSA private key) (T-05)
 //
 // Run:  node docs/threat-model-probes/crypto_probe.js      (Node 20+, no dependencies)
-// Once T-05/T-09 are fixed the expected output changes -- these probes document the
-// behaviour at the commit the threat model was written against (123be67).
+// Probe A documented T-09 at 123be67 (a lied-about chain_index destroyed the
+// message for good); since the #94 fix it shows the message surviving the lie.
+// Probe B still documents T-05 until #99 lands.
 const fs = require('fs');
 const path = require('path');
 const src = fs.readFileSync(path.join(__dirname, '..', '..', 'chat', 'templates', 'chatbox.html'), 'utf8');
@@ -73,7 +74,8 @@ async function makeReceiver(myPriv, chainKeysFromServer) {
 
   // ── Probe A: control (honest server) ──
   const tryDecrypt = async (R, msg) => {
-    try { const { messageKey } = await R.deriveReceivedKeys(msg); return await R.decryptWithAES(messageKey, { ciphertext: msg.encrypted_text, nonce: msg.aes_nonce, tag: msg.aes_tag }); }
+    // Mirrors renderMsg: derive, decrypt, and only then commit (#94).
+    try { const { messageKey, commit } = await R.deriveReceivedKeys(msg); const pt = await R.decryptWithAES(messageKey, { ciphertext: msg.encrypted_text, nonce: msg.aes_nonce, tag: msg.aes_tag }); await commit(); return pt; }
     catch (e) { return `FAILED (${e.constructor.name}: ${e.message || 'decrypt error'})`; }
   };
   console.log('== Probe A: server tampers with chain_index (not covered by the hash chain) ==');
@@ -83,9 +85,9 @@ async function makeReceiver(myPriv, chainKeysFromServer) {
   const R1 = await makeReceiver(rsa.privateKey, serverChainKeys);
   const lie = { ...sent[0], chain_index: 50 };                 // server rewrites one field in the JSON it serves
   console.log('m0 served with chain_index=50 :', await tryDecrypt(R1, lie));
-  console.log('m0 re-served HONESTLY later   :', await tryDecrypt(R1, sent[0]), '  <- permanently lost (wrong key was cached under msg id)');
-  console.log('m1 honest, arrives afterwards :', await tryDecrypt(R1, sent[1]), '  <- later messages are fine (skipped-key store)');
-  console.log('skipkey_* entries now stored  :', [...R1.idb.keys()].filter(k => k.startsWith('skipkey_')).length, '(one per skipped index, never expire)');
+  console.log('skipkey_* after the lie       :', [...R1.idb.keys()].filter(k => k.startsWith('skipkey_')).length, '(fixed in #94: a failed decrypt commits nothing)');
+  console.log('m0 re-served HONESTLY later   :', await tryDecrypt(R1, sent[0]), '  <- before #94 this was permanently lost');
+  console.log('m1 honest, arrives afterwards :', await tryDecrypt(R1, sent[1]));
 
   // ── Probe B: forward secrecy vs. wrapped seed retained on the server + recipient RSA key ──
   console.log('\n== Probe B: receiver has ratcheted past m0..m3; attacker later gets RSA key + DB dump ==');
