@@ -31,15 +31,28 @@ load_dotenv(BASE_DIR / '.env')
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get(
-    'DJANGO_SECRET_KEY',
-    'django-insecure-dev-key-do-not-use-in-production-change-me'
-)
+_DEV_SECRET_KEY = 'django-insecure-dev-key-do-not-use-in-production-change-me'
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', _DEV_SECRET_KEY)
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # Fails closed: DEBUG is off unless explicitly enabled, so a missing env var
 # in a production deployment doesn't silently turn debug mode on.
 DEBUG = os.environ.get('DJANGO_DEBUG', 'false').lower() == 'true'
+
+# The fallback key is published in this file, so anything keyed from it
+# (sessions, and the invite-code HMAC key derived from it, see
+# docs/DESIGN_JOIN_SECRET.md) would be forgeable by anyone. Refuse to run
+# with it outside debug mode instead of failing open (threat-model T-20).
+# `manage.py test` is exempt: the test runner forces DEBUG off but never
+# serves anyone.
+import sys
+if not DEBUG and SECRET_KEY in ('', _DEV_SECRET_KEY) and sys.argv[1:2] != ['test']:
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY is unset or the published development default. "
+        "Set a random value (python -c 'import secrets; print(secrets.token_urlsafe(50))') "
+        "or set DJANGO_DEBUG=true for local development."
+    )
 
 
 ALLOWED_HOSTS = [
