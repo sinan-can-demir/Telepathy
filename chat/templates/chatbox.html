@@ -139,6 +139,8 @@
         .key-warning-trust{font-size:0.72rem;padding:0.2rem 0.55rem;border-radius:6px;border:1px solid rgba(239,68,68,0.4);
             background:rgba(239,68,68,0.1);color:var(--red);cursor:pointer;font-family:'Inter',sans-serif}
         .key-warning-trust:hover{background:rgba(239,68,68,0.2)}
+        .fp-gate{background:rgba(234,179,8,0.08);border-bottom-color:rgba(234,179,8,0.3);color:var(--text)}
+        .fp-gate code{font-family:'JetBrains Mono',monospace;font-size:0.75rem}
         .verify-badge.key-mismatch{color:var(--red);background:rgba(239,68,68,0.15);font-weight:600}
         .verify-badge.key-mismatch:hover{background:rgba(239,68,68,0.25)}
 
@@ -182,6 +184,7 @@
 
 <div class="transcript-warning" id="transcriptWarning">⚠ This chat's history may be incomplete or tampered with — a message link in the transcript chain doesn't match.</div>
 <div class="key-warning" id="keyMismatchWarning"></div>
+<div class="key-warning fp-gate" id="fingerprintGate"></div>
 
 <!-- Chat -->
 <div class="chat-main" id="chatMain" style="display:none">
@@ -297,6 +300,10 @@
     // Last roster this browser saw, {participantId: displayName}, so a join
     // or leave is announced even if it happened while the tab was closed.
     const rosterName = cid => `roster_${cid}`;
+    // The fingerprint this user confirmed they compared out of band for a
+    // participant (#100). Stored as the fingerprint itself, so a later
+    // re-trusted key needs a fresh comparison.
+    const fpAckName = (cid, pid) => `fp_ack_${cid}_${pid}`;
 
     // ── Crypto helpers ──────────────────────────────────────────────────────
     function derToPem(buf, label) {
@@ -657,6 +664,7 @@
     const transcriptFingerprintEl = document.getElementById('transcript-fingerprint');
     const keyFingerprintEl = document.getElementById('key-fingerprint');
     const keyMismatchWarningEl = document.getElementById('keyMismatchWarning');
+    const fingerprintGateEl = document.getElementById('fingerprintGate');
 
     // TOFU key mismatches currently unresolved, keyed by participant id.
     // Populated/cleared by verifyAndPinKey(); drives the warning banner,
@@ -758,7 +766,70 @@
         const others = participants.filter(p => String(p.id) !== String(myParticipantId));
         for(const p of others) await verifyAndPinKey(p);
         announceRosterChanges(others);
+        await updateFingerprintGate(others);
         return others;
+    }
+
+    // Fingerprint gate (#100): nothing is sent to a participant until this
+    // user confirms they compared that participant's key fingerprint with
+    // them out of band. Joining needs no approval and a hostile server can
+    // swap keys from message one (T-04), so pinning alone can't tell the
+    // intended friend from an intruder or a MITM; the comparison can, and
+    // this makes it a step instead of an option. Participants whose key
+    // changed are left to the mismatch banner, which blocks sending first.
+    let unconfirmedFingerprints = new Map(); // participantId -> {displayName, fp}
+    async function updateFingerprintGate(others){
+        const pending = new Map();
+        for(const p of others){
+            if(keyMismatches.has(p.id)) continue;
+            const fp = await computeKeyFingerprint(p.public_key);
+            if(localStorage.getItem(fpAckName(chatId, p.id)) !== fp){
+                pending.set(p.id, {displayName: p.display_name, fp});
+            }
+        }
+        unconfirmedFingerprints = pending;
+        await renderFingerprintGate();
+    }
+
+    function confirmFingerprint(participantId){
+        const entry = unconfirmedFingerprints.get(participantId);
+        if(!entry) return;
+        localStorage.setItem(fpAckName(chatId, participantId), entry.fp);
+        unconfirmedFingerprints.delete(participantId);
+        renderFingerprintGate();
+    }
+
+    async function renderFingerprintGate(){
+        fingerprintGateEl.innerHTML = '';
+        if(unconfirmedFingerprints.size === 0){
+            fingerprintGateEl.classList.remove('show');
+            return;
+        }
+        const mine = await computeKeyFingerprint(localStorage.getItem(pubKeyName(chatId)));
+        const intro = document.createElement('div');
+        intro.className = 'key-warning-row';
+        intro.textContent = 'Before you send, compare fingerprints with each person over a channel you trust (in person, a call). Yours is ';
+        const mineEl = document.createElement('code');
+        mineEl.textContent = mine;
+        intro.appendChild(mineEl);
+        fingerprintGateEl.appendChild(intro);
+        for(const [pid, entry] of unconfirmedFingerprints){
+            const row = document.createElement('div');
+            row.className = 'key-warning-row';
+            const text = document.createElement('span');
+            text.textContent = `${entry.displayName} should read theirs as `;
+            const fpEl = document.createElement('code');
+            fpEl.textContent = entry.fp;
+            text.appendChild(fpEl);
+            const btn = document.createElement('button');
+            btn.className = 'key-warning-trust';
+            btn.type = 'button';
+            btn.textContent = 'They match';
+            btn.addEventListener('click', () => confirmFingerprint(pid));
+            row.append(text, btn);
+            fingerprintGateEl.appendChild(row);
+        }
+        fingerprintGateEl.classList.add('show');
     }
 
     // Joining needs no approval from existing members, and a group re-keys
@@ -921,7 +992,7 @@
     // TOFU pins are chat-scoped burner state too -- they should die with the
     // rest of this chat's identity rather than outliving it.
     function destroyPinnedKeys(cid){
-        const prefixes = [`pinned_enc_${cid}_`];
+        const prefixes = [`pinned_enc_${cid}_`, `fp_ack_${cid}_`];
         const toRemove = [];
         for(let i = 0; i < localStorage.length; i++){
             const key = localStorage.key(i);
@@ -1399,6 +1470,10 @@
             renderKeyMismatchWarning();
             if(recipients.some(r => keyMismatches.has(r.id))){
                 closeSendModal(false, 'A participant\'s key changed unexpectedly -- review the warning above and trust the new key before sending.');
+                return;
+            }
+            if(recipients.some(r => unconfirmedFingerprints.has(r.id))){
+                closeSendModal(false, 'Compare key fingerprints with the people listed above and confirm them before sending.');
                 return;
             }
             await ensureMyChainKey(recipients);
