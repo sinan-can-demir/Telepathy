@@ -29,7 +29,7 @@ services:
     depends_on:
       - db
       - redis
-    environment:
+    environment: &app-env
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
       DJANGO_DEBUG: "false"
       DJANGO_SECURE: "false" # Tor's onion transport provides E2E encryption/auth already; see README.
@@ -42,6 +42,23 @@ services:
       REDIS_PORT: "6379"
       ONION_HOSTNAME: ${ONION_HOSTNAME:-}
     # No `ports:` entry on purpose -- not reachable except via the tor container.
+    restart: unless-stopped
+
+  # Deletes chats nobody has touched for IDLE_TIMEOUT (30 min), with their
+  # messages and keys, every 5 minutes -- without it an abandoned chat is
+  # kept forever, since idle expiry otherwise only runs when that same
+  # participant comes back (issue #97). Same image and settings as `app`;
+  # it only needs the database and Redis, never a port.
+  reaper:
+    build:
+      context: .
+      dockerfile: Containerfile
+    command: ["python", "manage.py", "reap_idle_chats", "--every", "300"]
+    depends_on:
+      - db
+      - redis
+      - app
+    environment: *app-env
     restart: unless-stopped
 
   tor:

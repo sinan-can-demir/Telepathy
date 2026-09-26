@@ -23,7 +23,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Max
 from django.utils import timezone
 
-from .auth import hash_token
+from .auth import IDLE_TIMEOUT, hash_token
 from .chain import GENESIS_HASH, compute_chain_hash
 from .models import Chat, ChainKey, ChainKeyWrap, ChatParticipant, Message, MessageKey, MessageReadReceipt
 
@@ -194,25 +194,71 @@ def join_chat(chat, display_name, public_key):
     return issue_participant(chat, display_name, public_key)
 
 
-def leave_chat(participant, chat_id):
-    """Marks participant as left; hard-deletes the chat if that empties it
-    -- see #35, this is what actually frees the PIN for reuse (a
+def mark_left(participant, now=None):
+    """Marks participant as left and hard-deletes their chat if that empties
+    it -- see #35, this is what actually frees the PIN for reuse (a
     permanently-retired-but-flagged row would make the PIN unavailable
     forever, a hard ceiling given there are only 10,000 possible PINs).
-    Returns (chat_deleted: bool, remaining_count: int). Raises
-    ChatNotFound, NotAParticipant."""
-    chat = get_chat(chat_id)
-    if participant.chat_id != chat.pk:
-        raise NotAParticipant()
-
-    participant.left_at = timezone.now()
+    Every way out of a chat goes through here: an explicit leave, idle
+    expiry on the participant's own next request (chat/auth.py) and the
+    reaper (reap_idle_chats). Idle expiry used to only set left_at, so a
+    chat emptied that way kept its row, ciphertext and PIN forever (#97).
+    Returns (chat_deleted: bool, remaining_count: int)."""
+    participant.left_at = now or timezone.now()
     participant.save(update_fields=["left_at"])
 
+    chat = participant.chat
     remaining = chat.participants.filter(left_at__isnull=True).count()
     if remaining == 0:
         chat.delete()
         return True, 0
     return False, remaining
+
+
+def leave_chat(participant, chat_id):
+    """Explicit leave. Returns (chat_deleted: bool, remaining_count: int).
+    Raises ChatNotFound, NotAParticipant."""
+    chat = get_chat(chat_id)
+    if participant.chat_id != chat.pk:
+        raise NotAParticipant()
+    return mark_left(participant)
+
+
+def reap_idle_chats(now=None):
+    """Expires every participant idle past IDLE_TIMEOUT and deletes every
+    chat left with no active participant, without waiting for anyone to
+    come back. Idle expiry otherwise only happens lazily, when that same
+    participant next authenticates, which an abandoned chat never does
+    (#97). Run on a schedule by `manage.py reap_idle_chats` (the `reaper`
+    service in compose.yaml).
+
+    Returns (participants_expired, chats_deleted, pins_of_chats_still_live
+    whose roster changed) -- the caller notifies those so remaining members
+    see the departure and re-key on their next send."""
+    now = now or timezone.now()
+    expired = 0
+    deleted = 0
+    changed_pins = set()
+    idle = (ChatParticipant.objects.select_related("chat")
+            .filter(left_at__isnull=True, last_seen__lt=now - IDLE_TIMEOUT))
+    for participant in idle:
+        pin = participant.chat.pin
+        chat_deleted, _ = mark_left(participant, now)
+        expired += 1
+        if chat_deleted:
+            deleted += 1
+            changed_pins.discard(pin)
+        else:
+            changed_pins.add(pin)
+
+    # Chats already emptied before idle expiry deleted them (anything
+    # idle-expired before #97), or by any other path that set left_at alone.
+    orphaned = Chat.objects.exclude(
+        pk__in=ChatParticipant.objects.filter(left_at__isnull=True).values("chat_id")
+    )
+    deleted += orphaned.count()
+    orphaned.delete()
+    return expired, deleted, changed_pins
 
 
 # ── Messaging / forward-secrecy ratchet ──────────────────────────────────
@@ -331,9 +377,9 @@ def _tombstone(msg):
 def sweep_expired_messages(chat):
     """Tombstones every message in chat whose TTL has fully elapsed for
     everyone who could still legitimately need to read it. Called lazily on
-    every message fetch (see views.GetMessagesView) -- this app has no
-    scheduled/cron job anywhere, consistent with how idle-token reclaim
-    (chat/auth.py) and empty-chat deletion (leave_chat above) already work.
+    every message fetch (see views.GetMessagesView). It only matters while
+    someone is still fetching: once a chat is abandoned, reap_idle_chats
+    deletes it, messages included.
 
     "Could still legitimately need to read it" means: currently active
     (not left) AND was already in the chat when the message was sent. The

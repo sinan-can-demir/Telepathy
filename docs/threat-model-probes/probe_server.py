@@ -150,7 +150,13 @@ class HttpProbes(TestCase):
         say("after BOTH were idle-expired: Chat rows:", Chat.objects.filter(pin=pin).count(),
             " Message rows:", Message.objects.filter(chat=chat).count(),
             " active participants:", ChatParticipant.objects.filter(chat=chat, left_at__isnull=True).count())
-        say("-> idle expiry sets left_at but never deletes the emptied chat (only leave_chat() does); PIN stays taken")
+        # At 123be67 the chat row and its messages survived this (T-07); since
+        # #97 idle expiry deletes an emptied chat like an explicit leave does.
+        # The reaper does it without anyone returning:
+        r2 = self.c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "zoe"}, format="json")
+        ChatParticipant.objects.filter(chat__pin=r2.data["chat_id"]).update(last_seen=timezone.now() - timedelta(days=30))
+        say("second abandoned chat, nobody returns; one reaper pass ->", services.reap_idle_chats(),
+            " Chat rows left:", Chat.objects.filter(pin=r2.data["chat_id"]).count())
 
     def test_6_display_names_not_unique(self):
         print("\n[6] Display names are not unique within a chat")

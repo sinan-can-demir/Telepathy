@@ -31,7 +31,7 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 | 💾 **Encrypted-at-Rest** | Only ciphertext is stored in the database — decryption happens exclusively in the browser |
 | 🚫 **No Accounts** | No registration, no password, no persistent identity — a bearer token scoped to one chat is the only credential. See [docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md) for why |
 | 📌 **PIN-Based Chat Rooms** | Create or join a room using a 4-digit PIN, freed for reuse once the chat ends |
-| 🚫 **Ephemeral History** | Message history is automatically deleted once every participant has left a chat |
+| 🚫 **Ephemeral History** | Message history is automatically deleted once every participant has left a chat, or after 30 minutes with nobody active in it |
 | 🎨 **Premium UI** | Dark glassmorphism theme with animated gradients, floating particles, and smooth transitions |
 
 ---
@@ -347,7 +347,7 @@ This runs the whole stack — app, Postgres, and a Tor hidden service in front o
 ### Steps
 
 1. Copy `.env.example` to `.env` and fill in `DJANGO_SECRET_KEY`/`DB_PASSWORD` (leave `ONION_HOSTNAME` blank for now).
-2. `podman-compose up --build` — starts `db`, `redis` (Channels' websocket layer), `app` (migrates + collects static + daphne on `127.0.0.1:8000`, not published), and `tor` (which shares `app`'s network namespace and proxies port 80 on the hidden service to it).
+2. `podman-compose up --build` — starts `db`, `redis` (Channels' websocket layer), `app` (migrates + collects static + daphne on `127.0.0.1:8000`, not published), `reaper` (every 5 minutes, deletes chats nobody has used for 30 minutes; outside compose, run `python manage.py reap_idle_chats` from cron), and `tor` (which shares `app`'s network namespace and proxies port 80 on the hidden service to it).
 3. Wait for the `tor` container's logs to show `Bootstrapped 100%`, then read the generated address:
    ```
    podman exec <tor-container-name> cat /var/lib/tor/telepathy_hidden_service/hostname

@@ -185,6 +185,16 @@ class TokenAuthTests(TestCase):
         bob = ChatParticipant.objects.get(pk=self.bob_participant_id)
         self.assertIsNotNone(bob.left_at)
 
+    def test_idle_expiry_that_empties_a_chat_deletes_it(self):
+        # #97: idle expiry used to only set left_at, so a chat emptied that
+        # way kept its row, messages and PIN forever.
+        stale = timezone.now() - IDLE_TIMEOUT - timedelta(seconds=1)
+        ChatParticipant.objects.filter(chat__pin=self.chat_id).update(last_seen=stale)
+        self.assertEqual(self.alice.get(f"/chat/get-messages/{self.chat_id}/").status_code, 401)
+        self.assertTrue(Chat.objects.filter(pin=self.chat_id).exists())  # bob still counts
+        self.assertEqual(self.bob.get(f"/chat/get-messages/{self.chat_id}/").status_code, 401)
+        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+
     def test_active_use_keeps_last_seen_fresh(self):
         stale_but_within_timeout = timezone.now() - timedelta(minutes=1)
         ChatParticipant.objects.filter(pk=self.alice_participant_id).update(last_seen=stale_but_within_timeout)
@@ -195,6 +205,56 @@ class TokenAuthTests(TestCase):
         alice = ChatParticipant.objects.get(pk=self.alice_participant_id)
         self.assertIsNone(alice.left_at)
         self.assertGreater(alice.last_seen, stale_but_within_timeout)
+
+
+class IdleReaperTests(TestCase):
+    """#97: an abandoned chat is reclaimed without anyone coming back."""
+
+    def setUp(self):
+        failed_join_attempts.clear()
+        self.alice = APIClient()
+        create = _create_chat(self.alice, display_name="alice", max_participants=3)
+        self.chat_id = create.data["chat_id"]
+        self.alice.credentials(HTTP_AUTHORIZATION=f"Token {create.data['participant_token']}")
+        self.bob_id = _join_chat(APIClient(), self.chat_id, display_name="bob").data["participant_id"]
+        self.chat = Chat.objects.get(pin=self.chat_id)
+        alice = self.chat.participants.get(display_name="alice")
+        Message.objects.create(chat=self.chat, sender=alice, encrypted_text="x", aes_nonce="x",
+                               aes_tag="x", mac="x", seq=0)
+        self.stale = timezone.now() - IDLE_TIMEOUT - timedelta(seconds=1)
+
+    def test_abandoned_chat_is_fully_deleted_and_its_pin_freed(self):
+        ChatParticipant.objects.filter(chat=self.chat).update(last_seen=self.stale)
+        expired, deleted, changed = services.reap_idle_chats()
+        self.assertEqual((expired, deleted, changed), (2, 1, set()))
+        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+        self.assertEqual(Message.objects.count(), 0)
+        self.assertEqual(ChatParticipant.objects.count(), 0)
+        with patch("chat.services.secrets.randbelow", return_value=int(self.chat_id)):
+            self.assertEqual(_create_chat(APIClient()).data["chat_id"], self.chat_id)
+
+    def test_only_idle_participants_are_expired(self):
+        ChatParticipant.objects.filter(pk=self.bob_id).update(last_seen=self.stale)
+        expired, deleted, changed = services.reap_idle_chats()
+        self.assertEqual((expired, deleted, changed), (1, 0, {self.chat_id}))
+        self.assertIsNotNone(ChatParticipant.objects.get(pk=self.bob_id).left_at)
+        self.assertEqual(self.alice.get(f"/chat/get-messages/{self.chat_id}/").status_code, 200)
+        # The freed seat is usable again: ghosts no longer hold it.
+        self.assertEqual(_join_chat(APIClient(), self.chat_id, display_name="carol").status_code, 200)
+
+    def test_chat_emptied_before_the_fix_is_cleaned_up(self):
+        # Rows left behind by pre-#97 idle expiry: every participant left,
+        # chat still present.
+        ChatParticipant.objects.filter(chat=self.chat).update(left_at=timezone.now())
+        self.assertEqual(services.reap_idle_chats(), (0, 1, set()))
+        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+
+    def test_management_command_notifies_chats_that_lost_a_member(self):
+        from django.core.management import call_command
+        ChatParticipant.objects.filter(pk=self.bob_id).update(last_seen=self.stale)
+        with patch("chat.management.commands.reap_idle_chats.notify_chat") as notify:
+            call_command("reap_idle_chats")
+        notify.assert_called_once_with(self.chat_id, "roster_changed")
 
 
 class JoinChatRateLimitTests(TestCase):
