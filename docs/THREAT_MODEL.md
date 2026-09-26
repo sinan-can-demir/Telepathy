@@ -6,6 +6,7 @@
 - **Reviewer:** an AI assistant (Claude), working in a single session at the maintainer's request. This is a careful review with running evidence, **not** an independent audit, and it is not a substitute for one.
 - **Relationship to other docs:** `docs/SECURITY_AUDIT.md` (2026-09-18) hunted implementation bugs in the crypto/auth core, and those are fixed. This document asks a different question: *who could attack this system, what could each of them actually do, and is that acceptable for your use?* It also records findings that audit did not cover. `ARCHITECTURE.md` ("Accepted limitations") and the per-feature docs remain accurate; this pulls them together and adds what was missing.
 - **Revision 2 (2026-09-21):** widened the adversary catalogue from 10 to 15 (added coercive/legal pressure, a compromised counterpart, the Tor network, repository/release compromise, and abusive users; browser extensions are folded into A8), added a capability profile per adversary, and added two structured passes: STRIDE by component and LINDDUN for the anonymity claims. That added findings T-25 to T-31, extended T-15, and produced a list of things that held up under testing. Existing IDs T-01 to T-24 are unchanged.
+- **Revision 3 (2026-09-21):** added T-32 (non-cryptographic PIN generation), tracking-issue cross-references (#94 to #100), and the join-secret design and its settled decisions (#101).
 
 ---
 
@@ -230,8 +231,9 @@ Because Telepathy's pitch is anonymity, its privacy properties were checked agai
 | T-29 | Low | No abuse controls; deniability cuts both ways | A15 | Code-read |
 | T-30 | Med | One fetch costs O(transcript), and a member controls the transcript | A4 | Verified |
 | T-31 | Low | Users aren't told what is kept; no retention or deletion policy | A11, LINDDUN | Code-read |
+| T-32 | Low | PINs are drawn from a non-cryptographic generator | A3 | Code-read |
 
-T-25 to T-31 were added in revision 2. IDs are stable identifiers, not a severity ranking; sort by the **Sev** column.
+T-25 to T-31 were added in revision 2, and T-32 in revision 3. IDs are stable identifiers, not a severity ranking; sort by the **Sev** column.
 
 ---
 
@@ -249,6 +251,8 @@ A chat is joined with a 4-digit PIN: 10,000 possibilities. `JoinChatView` limits
 
 **Fix direction:** never trust `X-Forwarded-For` unless set by a proxy you control; count failures per *target PIN* and globally, not per claimed address; cap or slow all joins to a PIN; lengthen the join secret (more digits, or PIN plus a passphrase) since 13 bits cannot be made safe by throttling alone; evict stale limiter entries.
 
+**Tracking and decision:** #95. The chosen direction is the invite design in #101 (`docs/DESIGN_JOIN_SECRET.md`): an opaque chat id, a short-lived invite handle, and a single-use 30-bit code with a per-invite cap of 3 wrong attempts. It replaces the per-address limiter, so nothing depends on `X-Forwarded-For` or Tor's shared address.
+
 ### T-02 · High · Anyone can list every live chat and who is in it
 
 **Adversary:** A3. **Evidence:** Verified (probe 3).
@@ -260,6 +264,8 @@ A chat is joined with a 4-digit PIN: 10,000 possibilities. `JoinChatView` limits
 **Impact:** converts blind PIN guessing into a targeted attack; leaks participant names; reveals chat activity to anyone.
 
 **Fix direction:** return only `exists` and free-slot count (or nothing until a join attempt), throttle it like joins, and never return names to non-members.
+
+**Tracking:** #96. Nothing in the first-party client calls this endpoint (only the README and tests reference it), so it can simply be removed; the invite stage of #101 removes it.
 
 ### T-03 · High · Admission is silent, and names can't be trusted
 
@@ -273,6 +279,8 @@ A chat is joined with a 4-digit PIN: 10,000 possibilities. `JoinChatView` limits
 **Detectability:** in a 1:1 chat, if the intruder wins the race, the intended friend gets "Chat is full". Members who notice can tell; the app does not tell them.
 
 **Fix direction:** creator-approval or "lock chat" once the expected people have joined; require a fingerprint acknowledgement before the first send; show a persistent "N people are in this chat" indicator and a notice on every roster change; enforce unique display names per chat (and reject the trailing-newline case, T-22).
+
+**Tracking:** #100 (design fork still undecided). #101's one-invite-per-person model makes admission deliberate; #100 adds the roster notice, unique names and the fingerprint gate.
 
 ### T-04 · High · The server can MITM from message one and rewrite the client
 
@@ -303,6 +311,8 @@ The ratchet is one-way, so stealing the *current chain key* does not reveal past
 
 **Fix direction:** deliver seeds once and delete them server-side after fetch; stop storing per-message self-wraps (keep the sender's message keys locally, as receivers already do); ideally transport seeds under per-epoch ephemeral keys that are destroyed after use. Relay-only mode (#90) also shrinks what is retained.
 
+**Tracking:** #99 (design fork still undecided).
+
 ### T-06 · High · Anyone can permanently exhaust the PIN space, and `create_chat` then hangs
 
 **Adversary:** A3. **Evidence:** Verified (probe 4).
@@ -312,6 +322,8 @@ The ratchet is one-way, so stealing the *current chain key* does not reveal past
 **Impact:** a single anonymous client can take out chat creation for everyone, indefinitely, until the operator intervenes. On the order of minutes of requests.
 
 **Fix direction:** bounded retries returning `503`; per-source create throttle; reap idle chats (T-07); consider a larger identifier space.
+
+**Tracking:** #98. #101 also removes the ceiling at its root, since handles exist only while an invite is open.
 
 ### T-07 · High · Abandoned chats, ciphertext and PINs are never reclaimed
 
@@ -326,6 +338,8 @@ The README promises "Message history is automatically deleted once every partici
 **Impact:** ciphertext, wrapped seeds, roster and timestamps are retained indefinitely for the common exit path (feeds T-05, T-11, T-23); PINs leak permanently (feeds T-06); a participant who loses their local state can never rejoin (their seat is held by a token they no longer have); disappearing messages can't expire (T-17).
 
 **Fix direction:** a scheduled reaper (management command/cron) that expires idle participants and deletes empty or long-idle chats; make the idle path delete an emptied chat like `leave_chat` does; consider relay-only mode (#90).
+
+**Tracking:** #97.
 
 ### T-08 · Medium · One client's failures lock out everyone behind the same address
 
@@ -348,6 +362,8 @@ With no forwarded header the limiter buckets by `REMOTE_ADDR`. Under the Tor dep
 **Impact:** the very feature meant to reveal a server dropping a message (the hash chain) is blind to this stealthier way of doing it. A tampering server can also make a client store up to `MAX_SKIP=100` skipped keys per message, never expiring.
 
 **Fix direction:** derive-then-verify-then-commit (only cache and advance after a successful decrypt); don't cache a failed derivation; bind `chain_index` into the hashed or MAC'd fields; surface decrypt failures in the UI (T-10).
+
+**Tracking:** #94.
 
 ### T-10 · Medium · Transcript tamper-evidence has gaps
 
@@ -578,6 +594,14 @@ Nothing in the UI or docs tells a user what the server retains (T-11), for how l
 
 **Fix direction:** a short user-facing "what the server keeps" statement derived from the T-11 table; an operator retention policy; soften "guaranteed".
 
+### T-32 · Low · Chat PINs come from a non-cryptographic generator
+
+**Adversary:** A3. **Evidence:** Code-read (`chat/services.py`, `create_chat`). Exploitability was **not tested**.
+
+`create_chat` draws each PIN with `random.randint(0, 9999)`, Python's general-purpose Mersenne Twister, although `secrets` is imported in the same file and already used for bearer tokens. An attacker who can observe many PINs (T-02 lets them see every live one) might be able to recover the generator's state and predict the PINs of chats not yet created, which would let them target a chat the moment it appears. Whether that is practical was not tested, and truncation to about 13 bits plus rejection sampling makes it harder than for raw generator outputs. It is wrong regardless: anything generated for a security purpose should come from `secrets`.
+
+**Fix direction:** use `secrets` for every generated identifier. This is the first change in Stage 1 of #101. It has no separate issue; it could also be noted on #98.
+
 ### What held up under testing
 
 A threat model that only lists failures misleads in the other direction. These were checked and worked:
@@ -625,10 +649,26 @@ A threat model that only lists failures misleads in the other direction. These w
 
 ## 8. Remediation roadmap
 
-Suggested order by value per effort. Nothing here has been filed or implemented.
+Suggested order by value per effort. Issues #94 to #100 track the highest-value items and the join path has a settled design (#101); everything else is not filed. Nothing here is implemented.
+
+| Finding | Issue | Status |
+|---|---|---|
+| T-09 | #94 | Open |
+| T-01, T-08 | #95 | Open; direction settled in #101 |
+| T-02 | #96 | Open; removal planned in #101 |
+| T-07 | #97 | Open |
+| T-06 | #98 | Open |
+| T-05 | #99 | Open; design fork undecided |
+| T-03 | #100 | Open; design fork undecided |
+| T-01, T-02, T-03, T-06, T-08, T-19, T-32 (join path) | #101 | Design proposal; decisions settled 2026-09-21 |
+| T-13, T-26 | not filed | |
+| T-04 | not filed | Accepted limitation |
+
+**Decisions settled in #101 (2026-09-21):** a 6-character code (30 bits) and a 6-digit handle; **3 wrong attempts per invite, then burned** (charged to the invite, not the source address); any current member may issue invites, announced to the roster; permanent burn rather than timed lockout; 15-minute invite lifetime.
 
 **Quick wins (hours to a day)**
-- Stop trusting `X-Forwarded-For`; per-PIN failure accounting; throttle and slim down `check-chat` (T-01, T-02, T-08).
+- Stop trusting `X-Forwarded-For`; per-PIN failure accounting; throttle and slim down `check-chat` (T-01, T-02, T-08). The settled direction in #101 replaces these with a per-invite attempt cap and removes `check-chat`.
+- Draw every generated identifier from `secrets`, not `random` (T-32).
 - Bounded `create_chat` retries plus a create throttle (T-06).
 - Stop logging PINs and names; stdout only; rotate (T-12).
 - Bump dependencies; add `pip-audit`/Dependabot; hash-pin (T-13).
