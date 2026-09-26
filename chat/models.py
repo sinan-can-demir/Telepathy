@@ -182,23 +182,6 @@ class MessageReadReceipt(models.Model):
         return f"{self.participant} read {self.message_id} at {self.read_at}"
 
 
-class MessageKey(models.Model):
-    """As of forward secrecy (Phase 2), only ever holds the SENDER's own
-    self-wrapped copy of a message's AES key (so they can always redisplay
-    their own sent history) -- other participants derive the key locally
-    from their cached copy of the sender's chain instead of unwrapping a
-    per-message key. See docs/FORWARD_SECRECY.md."""
-    message = models.ForeignKey(Message, related_name="wrapped_keys", on_delete=models.CASCADE)
-    recipient = models.ForeignKey(
-        ChatParticipant,
-        related_name="message_keys",
-        on_delete=models.CASCADE,
-    )
-    encrypted_symmetric_key = models.TextField()
-
-    class Meta:
-        unique_together = [("message", "recipient")]
-
     def __str__(self):
         return f"Key for {self.recipient} on {self.message_id}"
 

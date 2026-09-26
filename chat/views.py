@@ -198,11 +198,11 @@ class SendMessageView(APIView):
 
     Forward secrecy (see docs/FORWARD_SECRECY.md): the AES key for this
     message comes from the sender's own sending-chain ratchet, seeded via
-    IssueChainKeyView/ChainKey. wrapped_keys now only ever needs to contain
-    the sender's own self-wrapped copy (so they can redisplay their own sent
-    history) -- other participants derive the same key locally by advancing
-    their cached copy of the sender's chain, so no per-recipient wrap is
-    transmitted or stored for them anymore. sender_chain_epoch records which
+    IssueChainKeyView/ChainKey. No per-message key is sent or stored at all:
+    other participants derive it by advancing their cached copy of the
+    sender's chain, and the sender keeps its own copy locally to redisplay
+    its sent history (issue #99 removed the RSA self-wrap the server used to
+    keep for that, since it outlived the ratchet). sender_chain_epoch records which
     epoch that derivation used, for recipients to know whether to keep
     advancing their cached state or fetch a newer epoch's seed first.
 
@@ -224,13 +224,12 @@ class SendMessageView(APIView):
         aes_nonce = request.data.get("aes_nonce")
         aes_tag = request.data.get("aes_tag")
         mac = request.data.get("mac")
-        wrapped_keys = request.data.get("wrapped_keys")
         prev_hash = request.data.get("prev_hash")
         sender_chain_epoch = request.data.get("sender_chain_epoch")
         chain_index = request.data.get("chain_index")
         raw_ttl_seconds = request.data.get("ttl_seconds")
 
-        if not all([encrypted_text, aes_nonce, aes_tag, mac, prev_hash]) or not wrapped_keys \
+        if not all([encrypted_text, aes_nonce, aes_tag, mac, prev_hash]) \
                 or sender_chain_epoch is None or chain_index is None:
             return Response({"message": "Missing required encryption fields."}, status=400)
 
@@ -252,7 +251,7 @@ class SendMessageView(APIView):
             msg = services.send_message(
                 chat_id, me,
                 encrypted_text=encrypted_text, aes_nonce=aes_nonce, aes_tag=aes_tag, mac=mac,
-                wrapped_keys=wrapped_keys, prev_hash=prev_hash, sender_chain_epoch=sender_chain_epoch,
+                prev_hash=prev_hash, sender_chain_epoch=sender_chain_epoch,
                 chain_index=chain_index, ttl_seconds=ttl_seconds,
             )
         except services.ChatNotFound:
@@ -274,8 +273,6 @@ class SendMessageView(APIView):
                 },
                 status=409,
             )
-        except services.MissingSelfWrap:
-            return Response({"message": "Missing self-wrapped key."}, status=400)
         except services.InvalidTTL:
             return Response(
                 {
@@ -349,6 +346,34 @@ class GetChainKeysView(APIView):
         return Response({"chain_keys": chain_keys}, status=200)
 
 
+class AckChainKeyView(APIView):
+    """
+    POST /chat/ack-chain-key/<chat_id>/  {"sender_id": <int>, "epoch": <int>}
+    The caller has stored sender_id's chain seed for `epoch` locally, so the
+    server deletes its wrapped copy (and any older epoch's) -- see
+    services.ack_chain_key and issue #99.
+    """
+    authentication_classes = [ParticipantTokenAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        me = request.user
+        sender_id = request.data.get("sender_id")
+        epoch = request.data.get("epoch")
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (sender_id, epoch)):
+            return Response({"message": "sender_id and epoch must be non-negative integers."}, status=400)
+        try:
+            chat = services.get_chat(chat_id)
+            services.require_same_chat(chat, me)
+        except services.ChatNotFound:
+            return Response({"message": "Chat not found."}, status=404)
+        except services.NotAParticipant:
+            return Response({"detail": "Forbidden"}, status=403)
+
+        deleted = services.ack_chain_key(chat, me, sender_id, epoch)
+        return Response({"deleted": deleted}, status=200)
+
+
 class GetChatParticipantsView(APIView):
     """
     GET /chat/get-chat-participants/<chat_id>/
@@ -419,7 +444,7 @@ class GetMessagesView(APIView):
         # then record this fetch as *this* participant having read whatever
         # comes back -- see services.sweep_expired_messages/mark_messages_read.
         services.sweep_expired_messages(chat)
-        messages = list(chat.messages.order_by("timestamp").prefetch_related("wrapped_keys"))
+        messages = list(chat.messages.order_by("timestamp"))
         services.mark_messages_read(chat, me, messages)
         serializer_data = MessageSerializer(messages, many=True, context={'request': request}).data
 

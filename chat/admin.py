@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from .models import (
-    User, Chat, ChatParticipant, Message, MessageKey, MessageReadReceipt, ChainKey, ChainKeyWrap,
+    User, Chat, ChatParticipant, Message, MessageReadReceipt, ChainKey, ChainKeyWrap,
 )
 
 
@@ -36,12 +36,6 @@ class MessageAdmin(admin.ModelAdmin):
     list_filter = ('timestamp', 'tombstoned_at')
     search_fields = ('sender__display_name', 'chat__pin')
     readonly_fields = ('id', 'timestamp', 'tombstone_hash', 'tombstoned_at')
-
-
-@admin.register(MessageKey)
-class MessageKeyAdmin(admin.ModelAdmin):
-    list_display = ('message', 'recipient')
-    search_fields = ('recipient__display_name', 'message__id')
 
 
 @admin.register(MessageReadReceipt)

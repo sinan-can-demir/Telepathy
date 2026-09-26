@@ -25,7 +25,7 @@ from django.utils import timezone
 
 from .auth import IDLE_TIMEOUT, hash_token
 from .chain import GENESIS_HASH, compute_chain_hash
-from .models import Chat, ChainKey, ChainKeyWrap, ChatParticipant, Message, MessageKey, MessageReadReceipt
+from .models import Chat, ChainKey, ChainKeyWrap, ChatParticipant, Message, MessageReadReceipt
 
 
 class ChatServiceError(Exception):
@@ -62,10 +62,6 @@ class StaleTranscript(ChatServiceError):
     def __init__(self, expected_prev_hash):
         super().__init__("prev_hash does not match the chat's current tip")
         self.expected_prev_hash = expected_prev_hash
-
-
-class MissingSelfWrap(ChatServiceError):
-    """wrapped_keys didn't include the sender's own self-wrapped copy."""
 
 
 class RosterMismatch(ChatServiceError):
@@ -288,12 +284,12 @@ def reap_idle_chats(now=None):
 # ── Messaging / forward-secrecy ratchet ──────────────────────────────────
 
 def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
-                  wrapped_keys, prev_hash, sender_chain_epoch, chain_index, ttl_seconds=None):
+                  prev_hash, sender_chain_epoch, chain_index, ttl_seconds=None):
     """Validates and appends one message under a row lock -- assigning seq
     here (not client-side) and rejecting a stale prev_hash both prevent two
     concurrent sends from landing on the same chain position. Raises
     ChatNotFound, NotAParticipant, UnknownChainEpoch, StaleChainEpoch,
-    StaleTranscript, MissingSelfWrap, InvalidTTL. Returns the created
+    StaleTranscript, InvalidTTL. Returns the created
     Message.
 
     The `sender.left_at is not None` check below can never actually trigger
@@ -335,14 +331,6 @@ def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
         if prev_hash != expected_prev_hash:
             raise StaleTranscript(expected_prev_hash)
 
-        self_wrap = next(
-            (wk.get("encrypted_symmetric_key") for wk in wrapped_keys
-             if wk.get("recipient_id") == sender.pk and wk.get("encrypted_symmetric_key")),
-            None,
-        )
-        if not self_wrap:
-            raise MissingSelfWrap()
-
         msg = Message.objects.create(
             chat=chat,
             sender=sender,
@@ -356,7 +344,6 @@ def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
             chain_index=chain_index,
             ttl_seconds=ttl_seconds,
         )
-        MessageKey.objects.create(message=msg, recipient=sender, encrypted_symmetric_key=self_wrap)
         if ttl_seconds is not None:
             MessageReadReceipt.objects.create(message=msg, participant=sender)
 
@@ -384,9 +371,8 @@ def mark_messages_read(chat, participant, messages):
 def _tombstone(msg):
     """Wipes msg's actual content, preserving compute_chain_hash's result
     from the moment before the wipe so later messages' prev_hash stays
-    verifiable -- see Message.tombstone_hash. Both the sender's self-wrap
-    and everyone's read receipts are deleted along with it; neither has any
-    remaining purpose once the content they refer to is gone."""
+    verifiable -- see Message.tombstone_hash. Everyone's read receipts are
+    deleted along with it; they have no purpose once the content is gone."""
     msg.tombstone_hash = compute_chain_hash(msg)
     msg.encrypted_text = None
     msg.aes_nonce = None
@@ -394,7 +380,6 @@ def _tombstone(msg):
     msg.mac = None
     msg.tombstoned_at = timezone.now()
     msg.save(update_fields=["tombstone_hash", "encrypted_text", "aes_nonce", "aes_tag", "mac", "tombstoned_at"])
-    MessageKey.objects.filter(message=msg).delete()
     MessageReadReceipt.objects.filter(message=msg).delete()
 
 
@@ -476,6 +461,26 @@ def issue_chain_key(chat_id, sender, wraps):
         ])
 
     return next_epoch
+
+
+def ack_chain_key(chat, recipient, sender_id, epoch):
+    """Deletes the wrapped seeds of sender_id's chain addressed to recipient,
+    for `epoch` and every earlier epoch, once recipient has stored the seed
+    locally (issue #99, option A). A wrapped seed kept on the server lets
+    anyone who later gets both a copy of the database and recipient's RSA
+    key re-derive every message key of that chain from index 0, no matter
+    how far recipient's own ratchet has moved on -- which is exactly the
+    compromise forward secrecy is meant to survive. Deleting on fetch
+    would be simpler but unsafe: the client only commits a seed after a
+    message under it decrypts (#94), so a fetch that doesn't end in a
+    commit must be repeatable. Returns the number of wraps deleted."""
+    deleted, _ = ChainKeyWrap.objects.filter(
+        recipient=recipient,
+        chain_key__chat=chat,
+        chain_key__sender_id=sender_id,
+        chain_key__epoch__lte=epoch,
+    ).delete()
+    return deleted
 
 
 def get_latest_chain_keys_for_recipient(chat, recipient):
