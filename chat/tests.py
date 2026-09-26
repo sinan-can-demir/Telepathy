@@ -4,6 +4,7 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from django.test import TestCase
+from django.urls import Resolver404, resolve
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -65,6 +66,15 @@ class ChatCreationTests(TestCase):
         self.assertIn("chat_id", response.data)
         self.assertIn("participant_token", response.data)
         self.assertIn("participant_id", response.data)
+
+    def test_check_chat_endpoint_is_gone(self):
+        # It let anyone list every live chat and its members' names without
+        # authenticating, and nothing in the client used it (issue #96).
+        # Checked by URL resolution rather than a test-client GET: rendering
+        # the 404 page trips a Django 5.1 / Python 3.14 template bug locally.
+        chat_id = _create_chat(self.client).data["chat_id"]
+        with self.assertRaises(Resolver404):
+            resolve(f"/chat/check-chat/{chat_id}/")
 
     def test_create_chat_rejects_out_of_range_max_participants(self):
         for bad in (0, 1, 9):
