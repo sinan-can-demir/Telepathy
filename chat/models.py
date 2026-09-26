@@ -1,6 +1,7 @@
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django.utils import timezone
+import secrets
 import uuid
 
 
@@ -13,7 +14,19 @@ class User(AbstractUser):
     pass
 
 
+def new_chat_public_id():
+    # 96 random bits: not guessable, and in practice never issued twice, so a
+    # new chat can never inherit a deleted one's address (websocket group,
+    # API paths, stored client state) the way a recycled PIN could (T-19).
+    return secrets.token_urlsafe(12)
+
+
 class Chat(models.Model):
+    # The chat's address (#101 stage 1): API paths, the websocket group, the
+    # client's stored chat_id and the MAC's chat_id input all use this, never
+    # the PIN. The PIN is only the join secret now; it appears in the join
+    # request and nowhere after it, and is gone entirely once invites land.
+    public_id = models.CharField(max_length=16, unique=True, default=new_chat_public_id, editable=False)
     # A Chat row's existence *is* its "active" flag now (see #35):
     # LeaveChatView hard-deletes the row once every participant has left,
     # which is what actually frees the PIN for reuse -- a soft is_active=False
@@ -25,7 +38,7 @@ class Chat(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"Chat {self.pin}"
+        return f"Chat {self.public_id}"
 
 
 class ChatParticipant(models.Model):

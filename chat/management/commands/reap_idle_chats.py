@@ -36,12 +36,12 @@ class Command(BaseCommand):
             time.sleep(every)
 
     def reap_once(self):
-        expired, deleted, changed_pins = services.reap_idle_chats()
-        for pin in changed_pins:
+        expired, deleted, changed_ids = services.reap_idle_chats()
+        for chat_id in changed_ids:
             try:
-                notify_chat(pin, "roster_changed")
+                notify_chat(chat_id, "roster_changed")
             except Exception:
                 # Only a nudge; remaining members' 15s poll catches it anyway.
-                logger.warning("[REAPER] could not notify chat %s", pin)
+                logger.warning("[REAPER] could not notify chat %s", chat_id)
         if expired or deleted:
             logger.info(f"[REAPER] expired {expired} idle participant(s), deleted {deleted} empty chat(s).")

@@ -85,10 +85,14 @@ class CreateChatView(APIView):
             chat, participant, raw_token = services.create_chat(display_name, public_key, max_participants)
         except services.NoFreePin:
             return Response({"message": "No chat PINs are free right now. Try again later."}, status=503)
-        logger.info(f"[CREATE-CHAT] Created chat {chat}, PIN: {chat.pin}")
+        # Logged by public id only: the PIN is the join secret (T-12).
+        logger.info(f"[CREATE-CHAT] Created {chat}.")
 
+        # chat_id is the address the client uses from here on; the PIN is
+        # only for sharing with whoever should join (#101 stage 1).
         return Response(
-            {"chat_id": chat.pin, "participant_token": raw_token, "participant_id": participant.pk},
+            {"chat_id": chat.public_id, "pin": chat.pin, "participant_token": raw_token,
+             "participant_id": participant.pk},
             status=201,
         )
 
@@ -96,17 +100,18 @@ class CreateChatView(APIView):
 class JoinChatView(APIView):
     """
     POST /chat/join-chat/
-    No account needed. Expects JSON: { "chat_id": "<4-digit-PIN>",
+    No account needed. Expects JSON: { "pin": "<4-digit PIN>",
     "display_name": "...", "public_key": "..." }
-    Returns: { "participant_token": "<raw token>", "participant_id": <int> }
+    Returns: { "chat_id": "<public id>", "participant_token": "<raw token>",
+    "participant_id": <int> } -- chat_id is the chat's address from then on.
     """
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        chat_id = request.data.get("chat_id")
-        if not chat_id:
-            return Response({"message": "Chat ID is required."}, status=400)
+        pin = request.data.get("pin")
+        if not pin:
+            return Response({"message": "PIN is required."}, status=400)
 
         public_key = request.data.get("public_key")
         if not services.is_valid_rsa_public_key_pem(public_key):
@@ -129,7 +134,7 @@ class JoinChatView(APIView):
             )
 
         try:
-            chat = services.get_chat(chat_id)
+            chat = services.get_chat_by_pin(pin)
         except services.ChatNotFound:
             entry["fail_count"] += 1
             if entry["fail_count"] >= 5:
@@ -150,10 +155,10 @@ class JoinChatView(APIView):
         except services.DisplayNameTaken:
             return Response({"message": "Someone in this chat already uses that name. Pick another."}, status=409)
 
-        logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat_id}'.")
-        notify_chat(chat_id, "roster_changed")
+        logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat.public_id}'.")
+        notify_chat(chat.public_id, "roster_changed")
         return Response(
-            {"participant_token": raw_token, "participant_id": participant.pk},
+            {"chat_id": chat.public_id, "participant_token": raw_token, "participant_id": participant.pk},
             status=200,
         )
 
@@ -458,4 +463,6 @@ class GetMessagesView(APIView):
             "both_joined":                 len(active_participants) >= 2,
             "is_group":                    chat.is_group,
             "max_participants":            chat.max_participants,
+            # Only for showing members what to share with someone joining.
+            "pin":                         chat.pin,
         }, status=status.HTTP_200_OK)
