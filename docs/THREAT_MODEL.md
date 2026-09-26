@@ -7,6 +7,7 @@
 - **Relationship to other docs:** `docs/SECURITY_AUDIT.md` (2026-09-18) hunted implementation bugs in the crypto/auth core, and those are fixed. This document asks a different question: *who could attack this system, what could each of them actually do, and is that acceptable for your use?* It also records findings that audit did not cover. `ARCHITECTURE.md` ("Accepted limitations") and the per-feature docs remain accurate; this pulls them together and adds what was missing.
 - **Revision 2 (2026-09-21):** widened the adversary catalogue from 10 to 15 (added coercive/legal pressure, a compromised counterpart, the Tor network, repository/release compromise, and abusive users; browser extensions are folded into A8), added a capability profile per adversary, and added two structured passes: STRIDE by component and LINDDUN for the anonymity claims. That added findings T-25 to T-31, extended T-15, and produced a list of things that held up under testing. Existing IDs T-01 to T-24 are unchanged.
 - **Revision 3 (2026-09-21):** added T-32 (non-cryptographic PIN generation), tracking-issue cross-references (#94 to #100), and the join-secret design and its settled decisions (#101).
+- **Revision 4 (2026-09-26):** status only. Most findings tracked in #94 to #101 were fixed in PRs #103 to #112; section 8 records which PR fixed what and what is left. The finding texts below are unchanged and describe the code as reviewed (123be67); the probes in `docs/threat-model-probes/` were updated to show current behaviour.
 
 ---
 
@@ -649,22 +650,28 @@ A threat model that only lists failures misleads in the other direction. These w
 
 ## 8. Remediation roadmap
 
-Suggested order by value per effort. Issues #94 to #100 track the highest-value items and the join path has a settled design (#101); everything else is not filed. Nothing here is implemented.
+Suggested order by value per effort. Status as of revision 4 (2026-09-26):
 
 | Finding | Issue | Status |
 |---|---|---|
-| T-09 | #94 | Open |
-| T-01, T-08 | #95 | Open; direction settled in #101 |
-| T-02 | #96 | Open; removal planned in #101 |
-| T-07 | #97 | Open |
-| T-06 | #98 | Open |
-| T-05 | #99 | Open; design fork undecided |
-| T-03 | #100 | Open; design fork undecided |
-| T-01, T-02, T-03, T-06, T-08, T-19, T-32 (join path) | #101 | Design proposal; decisions settled 2026-09-21 |
-| T-13, T-26 | not filed | |
-| T-04 | not filed | Accepted limitation |
+| T-09 | #94 | **Fixed** in #103: derive, verify, then commit; undecryptable messages are shown and retried. (Folding `chain_index` into the hash chain was not done.) |
+| T-01, T-08 | #95 | **Fixed** in #112: the PIN and the per-address limiter are gone; single-use invites with a per-invite 3-strike burn. |
+| T-02 | #96 | **Fixed** in #104: `check-chat` removed. |
+| T-07 | #97 | **Fixed** in #106: shared exit path deletes emptied chats; `reaper` service every 5 minutes. |
+| T-06 | #98 | **Fixed** in #105 (bounded allocation, 503) and #112 (no fixed identifier space). Chat creation itself is still unthrottled. |
+| T-05 | #99 | **Mitigated** in #109 (options A+B, chosen with the maintainer): wrapped seeds deleted on the recipient's ack; per-message self-wraps removed. A copy taken before the ack still works; see `docs/FORWARD_SECRECY.md`. |
+| T-03 | #100 | **Fixed** in #107 (unique names, join/leave notices) and #108 (fingerprint gate before the first send, chosen with the maintainer). |
+| T-19 | (#101) | **Half fixed** in #110: opaque, never-reused chat ids end the recycled-PIN cross-talk. A socket still outlives its participant's membership. |
+| T-32 | (#98) | **Fixed** in #105; moot since #112 (identifiers come from `secrets`). |
+| T-22 | (#100) | **Fixed** in #107 (trailing newline). |
+| T-20 | none | **Partly fixed** in #111: refuses the published `SECRET_KEY` outside debug. `ALLOWED_HOSTS`, the proxy header and cookie settings are unchanged. |
+| T-12 | none | **Partly fixed** in #110/#112: log lines no longer carry the join secret. Logging still isn't rotated and still records request paths. |
+| T-30 | not filed | Open: probe 11 still shows one `get-messages` costing O(transcript) queries (about 6,000 SQL queries for 2,000 expiring messages). |
+| T-13, T-26 | not filed | Open. |
+| T-04 | not filed | Accepted limitation. The fingerprint gate (#108) makes the check explicit, not automatic. |
+| (retention) | #90 | Open: relay-only mode, stages 2-3. |
 
-**Decisions settled in #101 (2026-09-21):** a 6-character code (30 bits) and a 6-digit handle; **3 wrong attempts per invite, then burned** (charged to the invite, not the source address); any current member may issue invites, announced to the roster; permanent burn rather than timed lockout; 15-minute invite lifetime.
+**Decisions settled in #101 (2026-09-21), now built:** a 6-character code (30 bits) and a 6-digit handle; **3 wrong attempts per invite, then burned** (charged to the invite, not the source address); any current member may issue invites, announced to the roster; permanent burn rather than timed lockout; 15-minute invite lifetime.
 
 **Quick wins (hours to a day)**
 - Stop trusting `X-Forwarded-For`; per-PIN failure accounting; throttle and slim down `check-chat` (T-01, T-02, T-08). The settled direction in #101 replaces these with a per-invite attempt cap and removes `check-chat`.
