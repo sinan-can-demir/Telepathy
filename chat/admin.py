@@ -24,9 +24,9 @@ class ChatParticipantInline(admin.TabularInline):
 class ChatAdmin(admin.ModelAdmin):
     # No is_active column -- a Chat row's existence is its active flag now;
     # ended chats are hard-deleted (see LeaveChatView) to free their PIN.
-    list_display = ('pin', 'is_group', 'max_participants', 'created_at')
+    list_display = ('public_id', 'is_group', 'max_participants', 'created_at')
     list_filter = ('is_group',)
-    search_fields = ('pin', 'participants__display_name')
+    search_fields = ('public_id', 'participants__display_name')
     inlines = [ChatParticipantInline]
 
 
@@ -34,7 +34,7 @@ class ChatAdmin(admin.ModelAdmin):
 class MessageAdmin(admin.ModelAdmin):
     list_display = ('id', 'sender', 'chat', 'timestamp', 'ttl_seconds', 'tombstoned_at')
     list_filter = ('timestamp', 'tombstoned_at')
-    search_fields = ('sender__display_name', 'chat__pin')
+    search_fields = ('sender__display_name', 'chat__public_id')
     readonly_fields = ('id', 'timestamp', 'tombstone_hash', 'tombstoned_at')
 
 
@@ -55,5 +55,5 @@ class ChainKeyWrapInline(admin.TabularInline):
 class ChainKeyAdmin(admin.ModelAdmin):
     list_display = ('sender', 'epoch', 'chat', 'created_at')
     list_filter = ('epoch',)
-    search_fields = ('sender__display_name', 'chat__pin')
+    search_fields = ('sender__display_name', 'chat__public_id')
     inlines = [ChainKeyWrapInline]

@@ -154,8 +154,10 @@
     <div class="waiting-card">
         <div class="waiting-pulse">🔐</div>
         <h2>Waiting for others to join…</h2>
-        <p>Share the PIN below. Others need to join from a <strong>different browser</strong>.</p>
+        <p>Give this invite to <strong>one</strong> person, over a channel you trust. It works once, for 15 minutes. They join from a <strong>different browser</strong>.</p>
         <div class="waiting-pin" id="waiting-pin"></div>
+        <p id="waiting-invite-status" style="font-size:0.8rem;color:var(--text-dim);margin-top:0.25rem"></p>
+        <button class="header-btn" id="waiting-new-invite" type="button" style="margin-top:0.5rem">New invite</button>
         <p id="waiting-count" style="font-size:0.8rem;color:var(--cyan);margin-top:0.25rem"></p>
         <p style="font-size:0.75rem;color:var(--text-muted);margin-top:0.5rem">Keys generated. Connection will start automatically.</p>
     </div>
@@ -177,6 +179,7 @@
         </div>
     </div>
     <div class="header-actions">
+        <button class="header-btn" id="invite-btn" type="button" style="display:none">Invite</button>
         <button class="header-btn" onclick="window.location.href='/chat/usermenu/'">Dashboard</button>
         <button class="header-btn danger" id="leave-chat">Leave</button>
     </div>
@@ -1007,6 +1010,7 @@
         localStorage.removeItem(pubKeyName(cid));
         localStorage.removeItem(participantIdName(cid));
         localStorage.removeItem(rosterName(cid));
+        localStorage.removeItem(inviteSeenName(cid));
         await idbDelete(privKeyName(cid));
         await idbDelete(tokenName(cid));
         await destroyChainState(cid);
@@ -1054,7 +1058,12 @@
                 if(maxParticipants) body.max_participants = Number(maxParticipants);
                 resp = await fetch('/chat/create-chat/', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
             } else {
-                body.pin = params.get('pin');
+                // Handed over by usermenu.html through sessionStorage, never
+                // the URL (history and sync are how links leak), and removed
+                // as soon as it's read.
+                body.invite = sessionStorage.getItem('pending_invite');
+                sessionStorage.removeItem('pending_invite');
+                if(!body.invite){ window.location.href = '/chat/usermenu/'; return false; }
                 resp = await fetch('/chat/join-chat/', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
             }
         }catch(e){ showFatalError('Network error.'); return false; }
@@ -1065,9 +1074,9 @@
             return false;
         }
         const data = await resp.json();
-        // The chat's address from here on; the PIN was only for getting in
-        // (#101 stage 1) and is never stored or put in a URL again.
+        // The chat's (non-secret) address from here on.
         chatId = data.chat_id;
+        if(data.invite) myInviteText = data.invite;
         token = data.participant_token;
         myParticipantId = String(data.participant_id);
 
@@ -1092,6 +1101,58 @@
         return Object.assign({'Authorization':'Token '+token}, extra||{});
     }
 
+    // ── Invites (#101 stage 2) ──────────────────────────────────────────────
+    // The code is shown exactly once, in the create/create-invite response,
+    // and kept only in this variable: never stored, so a reload loses it and
+    // "New invite" replaces it (the server revokes your earlier open one).
+    let myInviteText = null;
+
+    async function issueInvite(){
+        const r = await fetch(`/chat/create-invite/${chatId}/`, {method:'POST', headers: authHeaders()});
+        const data = await r.json().catch(()=>({}));
+        if(!r.ok){ showSystemNotice(data.message || 'Could not create an invite.'); return null; }
+        myInviteText = data.invite;
+        return data.invite;
+    }
+
+    // Shows the latest invite this user issued and what became of it.
+    function renderMyInvite(invites){
+        const mine = invites.filter(i => i.mine);
+        const latest = mine[mine.length - 1];
+        const pinEl = document.getElementById('waiting-pin');
+        const statusEl = document.getElementById('waiting-invite-status');
+        if(!latest){ pinEl.textContent = ''; statusEl.textContent = 'No open invite.'; return; }
+        const secs = Math.max(0, Math.round((new Date(latest.expires_at) - Date.now()) / 1000));
+        pinEl.textContent = (latest.state === 'open' && myInviteText) ? myInviteText : '';
+        statusEl.textContent = ({
+            open: myInviteText ? `Expires in ${Math.floor(secs/60)}:${String(secs%60).padStart(2,'0')}.`
+                               : 'Your open invite isn\'t shown again after a reload. Issue a new one to see a code.',
+            burned: 'That invite was burned after 3 wrong attempts: someone (or a typo) tried to use it. Issue a new one.',
+            consumed: 'That invite was used.',
+            expired: 'That invite expired. Issue a new one.',
+            revoked: 'That invite was replaced.',
+        })[latest.state] || '';
+    }
+
+    // Issuing is announced to every member (decision 3 in
+    // docs/DESIGN_JOIN_SECRET.md), and a burn to its issuer.
+    const inviteSeenName = cid => `invites_seen_${cid}`;
+    function announceInviteChanges(invites){
+        let seen = {};
+        try{ seen = JSON.parse(localStorage.getItem(inviteSeenName(chatId))) || {}; }catch(e){}
+        for(const inv of invites){
+            const before = seen[inv.id];
+            if(before === undefined && !inv.mine && inv.state === 'open'){
+                showSystemNotice(`${inv.issued_by || 'Someone'} created an invite for one more person.`);
+            }
+            if(before !== 'burned' && inv.state === 'burned' && inv.mine){
+                showSystemNotice(`Your invite ${inv.handle} was burned after 3 wrong attempts. Someone may have tried to guess it.`);
+            }
+            seen[inv.id] = inv.state;
+        }
+        localStorage.setItem(inviteSeenName(chatId), JSON.stringify(seen));
+    }
+
     // Reflects the current roster (others/is_group/max_participants) in the
     // header, so a mid-conversation joiner shows up without a page reload.
     function updateHeader(data){
@@ -1104,15 +1165,25 @@
         } else {
             partnerNameEl.textContent = `Group — ${1+others.length} people (${others.map(o=>o.display_name).join(', ')})`;
         }
+        document.getElementById('invite-btn').style.display =
+            (data.is_group && 1 + others.length < (data.max_participants || 2)) ? '' : 'none';
+        announceInviteChanges(data.invites || []);
     }
+
+    document.getElementById('waiting-new-invite').addEventListener('click', async () => {
+        if(await issueInvite()) await checkChatReady();
+    });
+    document.getElementById('invite-btn').addEventListener('click', async () => {
+        const text = await issueInvite();
+        if(text) showSystemNotice(`Invite for one person, valid once for 15 minutes (only you see this): ${text}`);
+    });
 
     function updateWaitingOverlay(data){
         const others = data.others || [];
         const max = data.max_participants || 2;
         const countEl = document.getElementById('waiting-count');
         if(countEl) countEl.textContent = `${1+others.length}/${max} joined`;
-        // The PIN to share comes from the server; chatId is an opaque id.
-        document.getElementById('waiting-pin').textContent = data.pin || '';
+        renderMyInvite(data.invites || []);
     }
 
     // Server-push notification channel (see chat/consumers.py) -- carries no

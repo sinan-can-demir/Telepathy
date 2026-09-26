@@ -114,16 +114,16 @@
                 <div class="action-icon join">🔗</div>
                 <div class="action-info">
                     <h3>Join Chat</h3>
-                    <p>Enter a 4-digit PIN to join an existing chat room</p>
+                    <p>Enter the invite code someone in the chat gave you</p>
                 </div>
             </div>
 
             <!-- Expandable join section -->
             <div class="join-section" id="join-section">
                 <div class="pin-input-row">
-                    <input type="text" class="pin-input" id="pin-input" maxlength="4" placeholder="0000" inputmode="numeric" />
+                    <input type="text" class="pin-input" id="pin-input" maxlength="24" placeholder="482913-7KQ2MX-V" autocomplete="off" autocapitalize="characters" spellcheck="false" style="font-size:1.1rem;letter-spacing:0.08em" />
                 </div>
-                <button class="btn btn-primary" onclick="joinChatByPin()">Join Chat Room</button>
+                <button class="btn btn-primary" onclick="joinChatByInvite()">Join Chat Room</button>
                 <p class="join-status" id="join-status"></p>
             </div>
         </div>
@@ -142,9 +142,10 @@
 
     // Key generation and the actual create-chat/join-chat API call both
     // happen in chatbox.html -- this page only collects what's needed
-    // (display name, and a PIN for joining) and hands off via query params,
-    // so there's one single place that generates a chat's keys instead of
-    // duplicating that logic here too.
+    // (display name, and an invite for joining) and hands off, so there's one
+    // single place that generates a chat's keys. The invite goes through
+    // sessionStorage, never the URL: a URL lands in browser history and
+    // sync, which is how links leak (docs/DESIGN_JOIN_SECRET.md).
     function createChat() {
         const name = encodeURIComponent(getDisplayName());
         window.location.href = `/chat/chatbox/?action=create&display_name=${name}`;
@@ -160,12 +161,30 @@
         window.location.href = `/chat/chatbox/?action=create&display_name=${name}&max_participants=${maxParticipants}`;
     }
 
-    function joinChatByPin() {
-        const pin = document.getElementById('pin-input').value.trim();
+    // Mirrors services.parse_invite: Crockford base32, with a mod-37 check
+    // symbol over handle+code. Catching a typo here matters because the
+    // server charges a wrong code as one of the invite's three strikes.
+    const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+    const CHECK_SYMBOLS = CROCKFORD + '*~$=U';
+    function parseInvite(raw) {
+        const s = raw.toUpperCase().replace(/[\s-]/g, '').replace(/[IL]/g, '1').replace(/O/g, '0');
+        if (s.length !== 13) return null;
+        const handle = s.slice(0, 6), code = s.slice(6, 12), check = s[12];
+        if (!/^\d{6}$/.test(handle) || [...code].some(c => !CROCKFORD.includes(c))) return null;
+        let value = Number(handle);
+        for (const c of code) value = value * 32 + CROCKFORD.indexOf(c);
+        if (CHECK_SYMBOLS[value % 37] !== check) return null;
+        return `${handle}-${code}-${check}`;
+    }
+
+    function joinChatByInvite() {
+        const invite = parseInvite(document.getElementById('pin-input').value);
         const st = document.getElementById('join-status');
-        if (!/^\d{4}$/.test(pin)) { st.style.color = 'var(--red)'; st.textContent = 'Enter a valid 4-digit PIN.'; return; }
+        if (!invite) { st.style.color = 'var(--red)'; st.textContent = 'That code has a typo -- check it and try again.'; return; }
+        try { sessionStorage.setItem('pending_invite', invite); }
+        catch (e) { st.style.color = 'var(--red)'; st.textContent = 'This browser blocks session storage, which joining needs.'; return; }
         const name = encodeURIComponent(getDisplayName());
-        window.location.href = `/chat/chatbox/?action=join&pin=${pin}&display_name=${name}`;
+        window.location.href = `/chat/chatbox/?action=join&display_name=${name}`;
     }
 </script>
 </body>

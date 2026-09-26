@@ -23,16 +23,12 @@ def new_chat_public_id():
 
 class Chat(models.Model):
     # The chat's address (#101 stage 1): API paths, the websocket group, the
-    # client's stored chat_id and the MAC's chat_id input all use this, never
-    # the PIN. The PIN is only the join secret now; it appears in the join
-    # request and nowhere after it, and is gone entirely once invites land.
+    # client's stored chat_id and the MAC's chat_id input all use this. It
+    # is not a secret; getting in takes an invite (ChatInvite).
     public_id = models.CharField(max_length=16, unique=True, default=new_chat_public_id, editable=False)
-    # A Chat row's existence *is* its "active" flag now (see #35):
-    # LeaveChatView hard-deletes the row once every participant has left,
-    # which is what actually frees the PIN for reuse -- a soft is_active=False
-    # flag would leave the PIN permanently retired against the unique
-    # constraint below, and there are only 10,000 possible 4-digit PINs.
-    pin = models.CharField(max_length=4, unique=True, db_index=True)
+    # A Chat row's existence *is* its "active" flag (see #35): it is
+    # hard-deleted once every participant has left or gone idle. There is no
+    # join secret on the chat itself any more; see ChatInvite.
     is_group = models.BooleanField(default=False)
     max_participants = models.IntegerField(default=2)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -231,3 +227,38 @@ class ChainKeyWrap(models.Model):
 
     def __str__(self):
         return f"Seed for {self.recipient} on {self.chain_key}"
+
+
+class ChatInvite(models.Model):
+    """One person's way into a chat (docs/DESIGN_JOIN_SECRET.md, #101 stage
+    2). Replaces the 4-digit PIN, which was a 13-bit secret guarded only by
+    a bypassable per-address limiter (#95) and a finite resource anyone
+    could exhaust (#98).
+
+    The invitee types `handle-code-check`, e.g. 482913-7KQ2MX-V. The handle
+    finds the invite and is unique only among OPEN invites; the code is the
+    secret (30 bits) and is stored only as a keyed HMAC, so a database copy
+    alone can't brute-force a live one. Every wrong code is a strike against
+    the invite itself, whoever sends it; three strikes burn it for good."""
+
+    OPEN, CONSUMED, BURNED, REVOKED = "open", "consumed", "burned", "revoked"
+    STATES = [(OPEN, "open"), (CONSUMED, "consumed"), (BURNED, "burned"), (REVOKED, "revoked")]
+
+    chat = models.ForeignKey(Chat, related_name="invites", on_delete=models.CASCADE)
+    issued_by = models.ForeignKey(ChatParticipant, related_name="invites_issued", null=True,
+                                  on_delete=models.SET_NULL)
+    handle = models.CharField(max_length=6)
+    code_hmac = models.CharField(max_length=64)
+    state = models.CharField(max_length=8, choices=STATES, default=OPEN)
+    failed_attempts = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["handle"], condition=models.Q(state="open"),
+                                    name="unique_open_invite_handle"),
+        ]
+
+    def __str__(self):
+        return f"Invite {self.handle} ({self.state}) for {self.chat}"

@@ -3,8 +3,6 @@ from rest_framework.views import APIView
 from rest_framework import status, permissions
 from .serializers import MessageSerializer
 import logging
-from collections import defaultdict
-import time
 from django.shortcuts import render, redirect
 from rest_framework.response import Response
 from .auth import ParticipantTokenAuthentication
@@ -12,21 +10,11 @@ from .realtime import notify_chat
 from . import services
 
 
-# Track failed chat-join attempts per source IP, to slow brute-forcing the
-# 4-digit PIN space (10,000 values). This can no longer be keyed on an
-# account -- CreateChatView/JoinChatView are unauthenticated entry points by
-# design, since there's no account to log into before you have a PIN. Under
-# a Tor hidden-service deployment this collapses to one shared bucket (every
-# client shares the loopback address) -- see ARCHITECTURE.md for why that's
-# an accepted tradeoff there, mitigated by Tor's own connection-level PoW
-# defense rather than an app-level throttle.
-failed_join_attempts = defaultdict(lambda: {'last_time': 0, 'wait_time': 0, 'fail_count': 0})
-
 logger = logging.getLogger(__name__)
 
-
-def _client_ip(request):
-    return request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
+# One response for every way a join can fail on the invite itself, so a
+# probe learns nothing about which handles are live (#101 stage 2).
+_INVALID_INVITE = {"message": "That invite isn't valid. Ask for a new one."}
 
 
 # Home Page View - renders index.html
@@ -81,17 +69,13 @@ class CreateChatView(APIView):
         if not (2 <= max_participants <= 8):
             return Response({"message": "max_participants must be between 2 and 8."}, status=400)
 
-        try:
-            chat, participant, raw_token = services.create_chat(display_name, public_key, max_participants)
-        except services.NoFreePin:
-            return Response({"message": "No chat PINs are free right now. Try again later."}, status=503)
-        # Logged by public id only: the PIN is the join secret (T-12).
+        chat, participant, raw_token, invite = services.create_chat(display_name, public_key, max_participants)
         logger.info(f"[CREATE-CHAT] Created {chat}.")
 
-        # chat_id is the address the client uses from here on; the PIN is
-        # only for sharing with whoever should join (#101 stage 1).
+        # chat_id is the chat's (non-secret) address from here on; `invite`
+        # is shown once, to be passed to whoever should join.
         return Response(
-            {"chat_id": chat.public_id, "pin": chat.pin, "participant_token": raw_token,
+            {"chat_id": chat.public_id, "invite": invite, "participant_token": raw_token,
              "participant_id": participant.pk},
             status=201,
         )
@@ -100,19 +84,19 @@ class CreateChatView(APIView):
 class JoinChatView(APIView):
     """
     POST /chat/join-chat/
-    No account needed. Expects JSON: { "pin": "<4-digit PIN>",
+    No account needed. Expects JSON: { "invite": "482913-7KQ2MX-V",
     "display_name": "...", "public_key": "..." }
     Returns: { "chat_id": "<public id>", "participant_token": "<raw token>",
     "participant_id": <int> } -- chat_id is the chat's address from then on.
+
+    There is no per-address rate limit any more (#95): a wrong code is a
+    strike against that invite, and three burn it. See
+    services.redeem_invite.
     """
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        pin = request.data.get("pin")
-        if not pin:
-            return Response({"message": "PIN is required."}, status=400)
-
         public_key = request.data.get("public_key")
         if not services.is_valid_rsa_public_key_pem(public_key):
             return Response({"message": "public_key must be a 2048-bit RSA public key in SPKI PEM form."}, status=400)
@@ -121,46 +105,49 @@ class JoinChatView(APIView):
         if not services.is_valid_display_name(display_name):
             return Response({"message": "Invalid display name."}, status=400)
 
-        # -- Rate limiting by source IP -- the only signal available before a
-        # participant token exists. See the failed_join_attempts comment above.
-        ip = _client_ip(request)
-        entry = failed_join_attempts[ip]
-        now_time = time.time()
-        if entry["fail_count"] >= 5 and now_time < entry["last_time"] + entry["wait_time"]:
-            wait_remaining = int(entry["last_time"] + entry["wait_time"] - now_time)
-            return Response(
-                {"message": f"Too many failed join attempts. Try again in {wait_remaining} seconds."},
-                status=429,
-            )
-
         try:
-            chat = services.get_chat_by_pin(pin)
-        except services.ChatNotFound:
-            entry["fail_count"] += 1
-            if entry["fail_count"] >= 5:
-                entry["wait_time"] = entry["wait_time"] * 2 if entry["wait_time"] else 10
-                entry["last_time"] = now_time
-                return Response(
-                    {"message": f"Too many failed join attempts. Try again in {entry['wait_time']} seconds."},
-                    status=429,
-                )
-            return Response({"message": "Chat not found."}, status=404)
-
-        failed_join_attempts.pop(ip, None)
-
-        try:
-            participant, raw_token = services.join_chat(chat, display_name, public_key)
+            chat, participant, raw_token = services.redeem_invite(
+                request.data.get("invite"), display_name, public_key)
+        except services.InvalidInvite:
+            return Response(_INVALID_INVITE, status=400)
         except services.ChatFull:
             return Response({"message": "Chat is full."}, status=400)
         except services.DisplayNameTaken:
             return Response({"message": "Someone in this chat already uses that name. Pick another."}, status=409)
 
-        logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat.public_id}'.")
+        logger.info(f"[JOIN-CHAT] A participant joined {chat}.")
         notify_chat(chat.public_id, "roster_changed")
         return Response(
             {"chat_id": chat.public_id, "participant_token": raw_token, "participant_id": participant.pk},
             status=200,
         )
+
+
+class CreateInviteView(APIView):
+    """
+    POST /chat/create-invite/<chat_id>/
+    Any active member may invite one more person; every other member sees
+    that they did (get-messages' `invites`). Revokes the caller's own
+    earlier open invites. Returns {"invite": "482913-7KQ2MX-V",
+    "expires_at": ...} -- the only time the code is ever shown.
+    """
+    authentication_classes = [ParticipantTokenAuthentication]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, chat_id):
+        try:
+            chat = services.get_chat(chat_id)
+            invite, invite_string = services.issue_invite(chat, request.user)
+        except services.ChatNotFound:
+            return Response({"message": "Chat not found."}, status=404)
+        except services.NotAParticipant:
+            return Response({"detail": "Forbidden"}, status=403)
+        except services.InviteLimit:
+            return Response({"message": "Every free seat already has an open invite."}, status=409)
+        except services.NoFreeHandle:
+            return Response({"message": "Couldn't allocate an invite right now. Try again."}, status=503)
+        notify_chat(chat.public_id, "roster_changed")
+        return Response({"invite": invite_string, "expires_at": invite.expires_at.isoformat()}, status=201)
 
 
 class LeaveChatView(APIView):
@@ -463,6 +450,7 @@ class GetMessagesView(APIView):
             "both_joined":                 len(active_participants) >= 2,
             "is_group":                    chat.is_group,
             "max_participants":            chat.max_participants,
-            # Only for showing members what to share with someone joining.
-            "pin":                         chat.pin,
+            # Issued invites (never codes): announced to every member,
+            # and a burn is shown to its issuer.
+            "invites":                     services.invites_for_roster(chat, me),
         }, status=status.HTTP_200_OK)

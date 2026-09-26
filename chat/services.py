@@ -13,19 +13,22 @@ be unit-tested directly against the test database in milliseconds, with no
 request/response plumbing involved.
 """
 
+import hashlib
+import hmac
 import re
 import secrets
 from datetime import timedelta
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import Max
 from django.utils import timezone
 
 from .auth import IDLE_TIMEOUT, hash_token
 from .chain import GENESIS_HASH, compute_chain_hash
-from .models import Chat, ChainKey, ChainKeyWrap, ChatParticipant, Message, MessageReadReceipt
+from .models import Chat, ChainKey, ChainKeyWrap, ChatInvite, ChatParticipant, Message, MessageReadReceipt
 
 
 class ChatServiceError(Exception):
@@ -68,8 +71,18 @@ class RosterMismatch(ChatServiceError):
     """A chain-key issuance's wraps don't cover exactly the current roster."""
 
 
-class NoFreePin(ChatServiceError):
-    """Every one of the PIN_SPACE PINs is held by a live chat."""
+class NoFreeHandle(ChatServiceError):
+    """No open-invite handle could be allocated (the space is ~1M)."""
+
+
+class InvalidInvite(ChatServiceError):
+    """Deliberately one error for every way an invite can fail -- malformed,
+    unknown, expired, burned, used, wrong code -- so a probe can't tell a
+    live handle from a dead one (docs/DESIGN_JOIN_SECRET.md)."""
+
+
+class InviteLimit(ChatServiceError):
+    """Open invites would outnumber the chat's free seats."""
 
 
 class InvalidTTL(ChatServiceError):
@@ -141,51 +154,178 @@ def issue_participant(chat, display_name, public_key):
 
 # ── Chat creation / joining / leaving ────────────────────────────────────
 
-PIN_SPACE = 10_000
-# Random draws before falling back to picking from the free PINs directly.
-# While the space is mostly empty the first draw almost always hits; the
-# fallback only runs when it's nearly full.
-_PIN_RANDOM_DRAWS = 20
+# ── Invites (docs/DESIGN_JOIN_SECRET.md, #101 stage 2) ───────────────────
+
+# Crockford base32: no I, L, O or U, so what's read aloud or typed is hard
+# to get wrong, and lookalikes can be mapped back when decoding.
+CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+# Crockford's check alphabet: the 32 digits plus five symbols for mod 37.
+CHECK_SYMBOLS = CROCKFORD + "*~$=U"
+HANDLE_DIGITS = 6
+CODE_LENGTH = 6            # 30 bits
+MAX_WRONG_ATTEMPTS = 3
+INVITE_LIFETIME = timedelta(minutes=15)
+_HANDLE_DRAWS = 20
 
 
-def _pick_free_pin():
-    """Returns a PIN no live chat holds, drawn with `secrets` -- the PIN is
-    a join secret, so a predictable generator (it used to be
-    random.randint, threat-model T-32) has no place here. Raises NoFreePin.
+def invite_check_symbol(handle, code):
+    """Crockford's mod-37 check symbol over the whole handle+code value.
+    It exists to catch typos before they cost a strike (a mistyped handle
+    could otherwise spend one of a stranger's three), not for security:
+    it's computed from what the user typed."""
+    value = int(handle)
+    for ch in code:
+        value = value * 32 + CROCKFORD.index(ch)
+    return CHECK_SYMBOLS[value % 37]
 
-    This used to be an unbounded `while True` loop: once every PIN was
-    taken (anyone can create chats anonymously), every create request
-    spun forever and pinned a worker (issue #98)."""
-    for _ in range(_PIN_RANDOM_DRAWS):
-        pin = f"{secrets.randbelow(PIN_SPACE):04d}"
-        if not Chat.objects.filter(pin=pin).exists():
-            return pin
-    used = set(Chat.objects.values_list("pin", flat=True))
-    free = [pin for pin in (f"{i:04d}" for i in range(PIN_SPACE)) if pin not in used]
-    if not free:
-        raise NoFreePin()
-    return secrets.choice(free)
+
+def format_invite(handle, code):
+    return f"{handle}-{code}-{invite_check_symbol(handle, code)}"
+
+
+def parse_invite(raw):
+    """Returns (handle, code), or None if malformed or the check symbol is
+    wrong. Case-insensitive; ignores spaces and hyphens; reads I/L as 1 and
+    O as 0, as Crockford specifies."""
+    if not isinstance(raw, str) or len(raw) > 40:
+        return None
+    s = raw.upper().replace("-", "").replace(" ", "")
+    s = s.translate(str.maketrans({"I": "1", "L": "1", "O": "0"}))
+    if len(s) != HANDLE_DIGITS + CODE_LENGTH + 1:
+        return None
+    handle, code, check = s[:HANDLE_DIGITS], s[HANDLE_DIGITS:-1], s[-1]
+    if not handle.isdigit() or any(ch not in CROCKFORD for ch in code):
+        return None
+    if invite_check_symbol(handle, code) != check:
+        return None
+    return handle, code
+
+
+def _code_hmac(code):
+    """Keyed, so a copy of the database alone can't brute-force a live
+    30-bit code (an unkeyed hash of one falls in seconds). The key is
+    derived from SECRET_KEY, which lives outside the database and which the
+    app refuses to run without (T-20)."""
+    key = hashlib.sha256(b"telepathy-invite-code:" + settings.SECRET_KEY.encode()).digest()
+    return hmac.new(key, code.encode(), hashlib.sha256).hexdigest()
+
+
+def _open_invites(chat=None):
+    qs = ChatInvite.objects.filter(state=ChatInvite.OPEN, expires_at__gt=timezone.now())
+    return qs.filter(chat=chat) if chat is not None else qs
+
+
+def issue_invite(chat, issuer):
+    """Any active member may invite (decision 3); the roster sees it via
+    get-messages. Issuing revokes the issuer's own earlier open invites for
+    this chat: the code is shown once and never stored in plaintext, so a
+    reload loses it, and without this a 1:1 creator couldn't issue a
+    replacement while the lost one held the only free seat. Returns
+    (invite, "handle-code-check"). Raises NotAParticipant, InviteLimit,
+    NoFreeHandle."""
+    with transaction.atomic():
+        chat = Chat.objects.select_for_update().get(pk=chat.pk)
+        if issuer.chat_id != chat.pk or issuer.left_at is not None:
+            raise NotAParticipant()
+        _open_invites(chat).filter(issued_by=issuer).update(state=ChatInvite.REVOKED)
+        free_seats = chat.max_participants - chat.participants.filter(left_at__isnull=True).count()
+        if _open_invites(chat).count() >= free_seats:
+            raise InviteLimit()
+        # Expired invites still marked open would hold their handles.
+        ChatInvite.objects.filter(state=ChatInvite.OPEN, expires_at__lte=timezone.now()) \
+            .update(state=ChatInvite.REVOKED)
+        code = "".join(secrets.choice(CROCKFORD) for _ in range(CODE_LENGTH))
+        for _ in range(_HANDLE_DRAWS):
+            handle = f"{secrets.randbelow(10 ** HANDLE_DIGITS):0{HANDLE_DIGITS}d}"
+            try:
+                with transaction.atomic():
+                    invite = ChatInvite.objects.create(
+                        chat=chat, issued_by=issuer, handle=handle, code_hmac=_code_hmac(code),
+                        expires_at=timezone.now() + INVITE_LIFETIME,
+                    )
+                return invite, format_invite(handle, code)
+            except IntegrityError:
+                continue  # that handle is on another open invite
+        raise NoFreeHandle()
+
+
+def redeem_invite(raw, display_name, public_key):
+    """Joins the chat an invite belongs to. Returns (chat, participant,
+    raw_token). Raises InvalidInvite (for everything the invitee gets
+    wrong), ChatFull, DisplayNameTaken.
+
+    A malformed string or bad check symbol costs no strike. A wrong code is
+    charged to the invite -- never to a source address, so nothing depends
+    on X-Forwarded-For or on Tor's shared address (#95) -- inside the same
+    row lock as the comparison, so parallel guesses can't all be evaluated
+    before the counter moves. The strike is committed even though the call
+    then fails; a correct code that can't be used (name taken, chat full)
+    leaves the invite open."""
+    parsed = parse_invite(raw)
+    if parsed is None:
+        raise InvalidInvite()
+    handle, code = parsed
+    guess = _code_hmac(code)
+
+    with transaction.atomic():
+        invite = (_open_invites().select_for_update().select_related("chat")
+                  .filter(handle=handle).first())
+        if invite is None:
+            hmac.compare_digest(guess, guess)  # same work as a real compare
+            wrong = True
+        elif not hmac.compare_digest(guess, invite.code_hmac):
+            invite.failed_attempts += 1
+            if invite.failed_attempts >= MAX_WRONG_ATTEMPTS:
+                invite.state = ChatInvite.BURNED
+            invite.save(update_fields=["failed_attempts", "state"])
+            wrong = True
+        else:
+            wrong = False
+    if wrong:
+        raise InvalidInvite()
+
+    with transaction.atomic():
+        invite = ChatInvite.objects.select_for_update().select_related("chat").get(pk=invite.pk)
+        if invite.state != ChatInvite.OPEN or invite.expires_at <= timezone.now():
+            raise InvalidInvite()  # consumed by a concurrent redeem of the same code
+        participant, raw_token = join_chat(invite.chat, display_name, public_key)
+        invite.state = ChatInvite.CONSUMED
+        invite.save(update_fields=["state"])
+    return invite.chat, participant, raw_token
+
+
+def invites_for_roster(chat, viewer):
+    """What members see about invites: who issued one and what became of
+    it, never a code. Issuance is announced to everyone (decision 3) and a
+    burn to its issuer, who then knows to issue another."""
+    now = timezone.now()
+    out = []
+    for inv in chat.invites.select_related("issued_by").order_by("created_at"):
+        state = inv.state
+        if state == ChatInvite.OPEN and inv.expires_at <= now:
+            state = "expired"
+        out.append({
+            "id": inv.pk,
+            "handle": inv.handle,
+            "issued_by": inv.issued_by.display_name if inv.issued_by else None,
+            "mine": inv.issued_by_id == viewer.pk,
+            "state": state,
+            "expires_at": inv.expires_at.isoformat(),
+        })
+    return out
 
 
 def create_chat(display_name, public_key, max_participants):
-    """Picks a free 4-digit PIN and creates a new Chat plus its first
-    participant. Returns (chat, participant, raw_token). Raises NoFreePin."""
-    for _ in range(3):
-        pin = _pick_free_pin()
-        try:
-            with transaction.atomic():
-                chat = Chat.objects.create(
-                    pin=pin,
-                    max_participants=max_participants,
-                    is_group=max_participants > 2,
-                )
-                participant, raw_token = issue_participant(chat, display_name, public_key)
-            return chat, participant, raw_token
-        except IntegrityError:
-            # A concurrent create took the same PIN between the check and
-            # the insert (Chat.pin is unique); pick again.
-            continue
-    raise NoFreePin()
+    """Creates a new Chat, its first participant and a first invite.
+    Returns (chat, participant, raw_token, invite_string)."""
+    with transaction.atomic():
+        chat = Chat.objects.create(
+            max_participants=max_participants,
+            is_group=max_participants > 2,
+        )
+        participant, raw_token = issue_participant(chat, display_name, public_key)
+        _, invite_string = issue_invite(chat, participant)
+    return chat, participant, raw_token, invite_string
 
 
 def get_chat(chat_id):
@@ -196,14 +336,6 @@ def get_chat(chat_id):
     except Chat.DoesNotExist:
         raise ChatNotFound()
 
-
-def get_chat_by_pin(pin):
-    """The join path only: the PIN is the join secret, not an address.
-    Raises ChatNotFound."""
-    try:
-        return Chat.objects.get(pin=pin)
-    except Chat.DoesNotExist:
-        raise ChatNotFound()
 
 
 def join_chat(chat, display_name, public_key):
@@ -226,13 +358,11 @@ def join_chat(chat, display_name, public_key):
 
 def mark_left(participant, now=None):
     """Marks participant as left and hard-deletes their chat if that empties
-    it -- see #35, this is what actually frees the PIN for reuse (a
-    permanently-retired-but-flagged row would make the PIN unavailable
-    forever, a hard ceiling given there are only 10,000 possible PINs).
+    it (#35), cascading to its messages, keys and invites.
     Every way out of a chat goes through here: an explicit leave, idle
     expiry on the participant's own next request (chat/auth.py) and the
     reaper (reap_idle_chats). Idle expiry used to only set left_at, so a
-    chat emptied that way kept its row, ciphertext and PIN forever (#97).
+    chat emptied that way kept its row and ciphertext forever (#97).
     Returns (chat_deleted: bool, remaining_count: int)."""
     participant.left_at = now or timezone.now()
     participant.save(update_fields=["left_at"])
@@ -288,6 +418,9 @@ def reap_idle_chats(now=None):
     )
     deleted += orphaned.count()
     orphaned.delete()
+    # Invite rows only matter while live, plus a while after so an issuer
+    # still sees that theirs was burned or used.
+    ChatInvite.objects.filter(expires_at__lt=now - timedelta(hours=1)).delete()
     return expired, deleted, changed_ids
 
 
