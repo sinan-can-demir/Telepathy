@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import Resolver404, resolve
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -205,6 +205,54 @@ class TokenAuthTests(TestCase):
         alice = ChatParticipant.objects.get(pk=self.alice_participant_id)
         self.assertIsNone(alice.left_at)
         self.assertGreater(alice.last_seen, stale_but_within_timeout)
+
+
+class DuplicateNameJoinTests(TestCase):
+    def test_join_with_a_taken_name_is_a_409(self):
+        failed_join_attempts.clear()
+        chat_id = _create_chat(APIClient(), display_name="alice").data["chat_id"]
+        response = _join_chat(APIClient(), chat_id, display_name="Alice")
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertEqual(ChatParticipant.objects.filter(chat__pin=chat_id).count(), 1)
+
+
+class ConcurrentJoinTests(TransactionTestCase):
+    """join_chat locks the chat row, so simultaneous joins can't both pass
+    the name or capacity check."""
+
+    def _race(self, chat, names):
+        import threading
+        from django.db import connection
+        barrier = threading.Barrier(len(names))
+        outcomes = []
+
+        def join(name):
+            try:
+                barrier.wait()
+                services.join_chat(chat, name, pem)
+                outcomes.append("ok")
+            except services.ChatServiceError as e:
+                outcomes.append(type(e).__name__)
+            finally:
+                connection.close()
+
+        pem = _fake_public_key_pem()
+        threads = [threading.Thread(target=join, args=(n,)) for n in names]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return sorted(outcomes)
+
+    def test_same_name_twice_at_once_admits_one(self):
+        chat = services.create_chat("alice", _fake_public_key_pem(), 8)[0]
+        self.assertEqual(self._race(chat, ["bob"] * 6), ["DisplayNameTaken"] * 5 + ["ok"])
+
+    def test_last_seat_raced_admits_one(self):
+        chat = services.create_chat("alice", _fake_public_key_pem(), 3)[0]
+        services.join_chat(chat, "bob", _fake_public_key_pem())
+        self.assertEqual(self._race(chat, [f"p{i}" for i in range(6)]), ["ChatFull"] * 5 + ["ok"])
+        self.assertEqual(chat.participants.filter(left_at__isnull=True).count(), 3)
 
 
 class IdleReaperTests(TestCase):
@@ -731,6 +779,27 @@ class ChatServicesUnitTests(TestCase):
             with patch.object(type(Chat.objects.none()), "exists", stale_exists):
                 chat, _, _ = services.create_chat("racer", _fake_public_key_pem(), 2)
         self.assertEqual(chat.pin, "1234")
+
+    def test_display_name_validation_rejects_newline_and_blank(self):
+        # T-22: '$' used to accept a trailing newline.
+        for bad in ("alice\n", "   ", "", "a" * 33, "al\nice", None):
+            self.assertFalse(services.is_valid_display_name(bad), repr(bad))
+        for good in ("alice", "Bob Smith", "x_y-z 2"):
+            self.assertTrue(services.is_valid_display_name(good), good)
+
+    def test_join_chat_rejects_a_name_already_in_use(self):
+        # #100: an intruder could join as a second "alice" and pass as her.
+        group = services.create_chat("alice", _fake_public_key_pem(), 4)[0]
+        for clash in ("alice", "ALICE", "alice ", " Alice"):
+            with self.assertRaises(services.DisplayNameTaken, msg=repr(clash)):
+                services.join_chat(group, clash, _fake_public_key_pem())
+        services.join_chat(group, "alicia", _fake_public_key_pem())
+
+    def test_a_name_frees_up_once_its_owner_leaves(self):
+        group, alice, _ = services.create_chat("alice", _fake_public_key_pem(), 4)
+        services.join_chat(group, "bob", _fake_public_key_pem())
+        services.mark_left(alice)
+        services.join_chat(group, "alice", _fake_public_key_pem())
 
     def test_join_chat_rejects_once_the_chat_is_full(self):
         with self.assertRaises(services.ChatFull):
