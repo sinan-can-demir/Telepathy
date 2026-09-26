@@ -9,7 +9,7 @@
 
 **Telepathy** is a secure, anonymous chat application where **privacy is guaranteed by design**. Messages are encrypted entirely on the client side using the Web Crypto API before they ever reach the server — meaning the server **never sees plaintext**. Even if the database were compromised, no readable message content would be exposed.
 
-Two parties join a chat room via a shared 4-digit PIN. Once both connect, they exchange messages secured by **hybrid RSA + AES-GCM encryption** and authenticated with a **deniable, ratchet-derived MAC** — verifiable by the chat's other participants, but not provable to anyone outside it. Every encryption step is visible to the user in real-time through a send progress modal and per-message verification badges.
+People join a chat with a single-use invite code (e.g. `482913-7KQ2MX-V`) that one of its members gives them. Once both connect, they exchange messages secured by **hybrid RSA + AES-GCM encryption** and authenticated with a **deniable, ratchet-derived MAC** — verifiable by the chat's other participants, but not provable to anyone outside it. Every encryption step is visible to the user in real-time through a send progress modal and per-message verification badges.
 
 > ⚠️ **Before you rely on this:** Telepathy is an unaudited learning project. [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) lays out who could attack it, what each attacker can actually do, which claims above hold only conditionally, and who it is (and isn't) suitable for.
 
@@ -30,7 +30,7 @@ Two parties join a chat room via a shared 4-digit PIN. Once both connect, they e
 | 📊 **Send Progress Modal** | An animated progress bar shows each encryption operation in real-time when sending a message |
 | 💾 **Encrypted-at-Rest** | Only ciphertext is stored in the database — decryption happens exclusively in the browser |
 | 🚫 **No Accounts** | No registration, no password, no persistent identity — a bearer token scoped to one chat is the only credential. See [docs/ACCOUNTLESS_IDENTITY.md](docs/ACCOUNTLESS_IDENTITY.md) for why |
-| 📌 **PIN-Based Chat Rooms** | Create or join a room using a 4-digit PIN, freed for reuse once the chat ends |
+| 🎟️ **Single-Use Invites** | Each invite admits one person, expires after 15 minutes, and is burned after 3 wrong codes, whoever sends them. See [docs/DESIGN_JOIN_SECRET.md](docs/DESIGN_JOIN_SECRET.md) |
 | 🚫 **Ephemeral History** | Message history is automatically deleted once every participant has left a chat, or after 30 minutes with nobody active in it |
 | 🎨 **Premium UI** | Dark glassmorphism theme with animated gradients, floating particles, and smooth transitions |
 
@@ -212,8 +212,8 @@ Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your browser.
 
 ### Step-by-step
 
-1. **Browser A** → `http://127.0.0.1:8000/chat/` → **Create Chat** (optionally enter a display name) → note the 4-digit PIN. No registration or login step — keys are generated and the chat is created in one action.
-2. **Browser B** → `http://127.0.0.1:8000/chat/` → **Join Chat** → enter the PIN (and optionally a display name)
+1. **Browser A** → `http://127.0.0.1:8000/chat/` → **Create Chat** (optionally enter a display name) → note the invite code it shows. No registration or login step — keys are generated and the chat is created in one action.
+2. **Browser B** → `http://127.0.0.1:8000/chat/` → **Join Chat** → enter the invite code (and optionally a display name). Each invite works once; the creator can make a new one from the waiting screen
 3. Both browsers show "Waiting for partner…" briefly, then the chat opens
 4. **Send a message** — a progress modal appears showing each encryption step in real-time:
    - Deriving forward-secret session key (ratchet)
@@ -226,7 +226,7 @@ Open **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)** in your browser.
 
 ### Group chats (3–8 people)
 
-Instead of **Create Chat**, use **Create Group** on the same landing page: pick a participant limit (2–8) and share the resulting PIN with everyone who should join. Every additional browser/device joins the same way as a 1:1 chat — **Join Chat** with the PIN. Each sender's messages are keyed from their own forward-secret ratchet (see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md)), seeded fresh and re-fanned-out to the current roster on every membership change, so a new joiner can't decrypt messages sent before they joined, and a participant who leaves can no longer decrypt anything sent afterward.
+Instead of **Create Chat**, use **Create Group** on the same landing page: pick a participant limit (2–8) and give each person who should join their own invite: any member can make one with the **Invite** button, and everyone in the chat is told when they do. Every additional browser/device joins the same way as a 1:1 chat — **Join Chat** with its invite. Each sender's messages are keyed from their own forward-secret ratchet (see [docs/FORWARD_SECRECY.md](docs/FORWARD_SECRECY.md)), seeded fresh and re-fanned-out to the current roster on every membership change, so a new joiner can't decrypt messages sent before they joined, and a participant who leaves can no longer decrypt anything sent afterward.
 
 ---
 
@@ -237,15 +237,16 @@ All "Participant Token" endpoints authenticate via `Authorization: Token <partic
 | Method | Endpoint | Description | Auth |
 |--------|----------|-------------|------|
 | `GET` | `/chat/usermenu/` | Dashboard (create/join chat) | None |
-| `POST` | `/chat/create-chat/` | Create a chat; generates keys client-side first. Returns the chat's opaque `chat_id` (its address for every other endpoint), the 4-digit `pin` to share, and a participant token | None |
-| `POST` | `/chat/join-chat/` | Join an existing chat with `pin`; returns its `chat_id` and a participant token. The PIN is used nowhere else | None |
+| `POST` | `/chat/create-chat/` | Create a chat; generates keys client-side first. Returns the chat's opaque `chat_id` (its address for every other endpoint), a first single-use `invite`, and a participant token | None |
+| `POST` | `/chat/join-chat/` | Join with an `invite`; returns the chat's `chat_id` and a participant token. Every invalid invite gets the same response | None |
+| `POST` | `/chat/create-invite/<chat_id>/` | Any member: make an invite for one more person (revokes your own earlier open one). The code is shown only in this response | Participant Token |
 | `GET` | `/chat/get-chat-participants/<chat_id>/` | List active participants' ids/display names/public keys | Participant Token |
 | `POST` | `/chat/issue-chain-key/<chat_id>/` | Issue a new forward-secrecy chain epoch, wrapped per current other participant | Participant Token |
 | `GET` | `/chat/get-chain-keys/<chat_id>/` | Fetch the latest chain-key epoch issued to you by each sender | Participant Token |
 | `POST` | `/chat/ack-chain-key/<chat_id>/` | Confirm you stored a sender's seed so the server deletes its wrapped copy (#99) | Participant Token |
 | `POST` | `/chat/send-message/<chat_id>/` | Send an encrypted message | Participant Token |
 | `GET` | `/chat/get-messages/<chat_id>/` | Retrieve encrypted messages | Participant Token |
-| `POST` | `/chat/leave-chat/` | Leave chat (deletes chat + history once fully empty, freeing its PIN) | Participant Token |
+| `POST` | `/chat/leave-chat/` | Leave chat (deletes chat + history once fully empty) | Participant Token |
 
 ---
 
@@ -257,7 +258,7 @@ Exists solely for Django's own admin/staff login. No end-user chat functionality
 ### `Chat`
 | Field | Type | Description |
 |-------|------|-------------|
-| `pin` | `CharField(4)` | Unique 4-digit room code, freed for reuse once every participant leaves (the `Chat` row is hard-deleted, not soft-flagged) |
+| `public_id` | `CharField(16)` | Random, never-reused address used by every endpoint and the websocket; not a secret. The row is hard-deleted once everyone has left |
 | `is_group` | `BooleanField` | Whether this chat allows more than 2 participants |
 | `max_participants` | `IntegerField` | Capacity (2–8) |
 
@@ -417,7 +418,7 @@ This repository was originally created by other contributors (the commit history
 
 Contributions are welcome! Please read [ContributorGuide.md](./ContributorGuide.md) for details on the project structure, where to place static files, and Git workflow conventions.
 
-Before proposing a feature that touches chat/message data, read [ARCHITECTURE.md](./ARCHITECTURE.md) — it documents known structural limitations (e.g. the PIN space, message-to-chat linkage) that will affect how new features should be designed.
+Before proposing a feature that touches chat/message data, read [ARCHITECTURE.md](./ARCHITECTURE.md) — it documents known structural limitations (e.g. message-to-chat linkage) that will affect how new features should be designed.
 
 ---
 

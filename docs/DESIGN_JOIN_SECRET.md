@@ -1,6 +1,6 @@
 # Design: replacing the 4-digit PIN with an invite (locator + secret)
 
-**Status: decisions settled 2026-09-21 (see "Decisions"). Stage 1 built 2026-09-26; stages 2-4 not started.**
+**Status: decisions settled 2026-09-21 (see "Decisions"). Stages 1 and 2 built 2026-09-26; stage 3 is partly covered by #100's fixes (roster notices, unique names, fingerprint gate); stage 4 (PAKE) not started.**
 Motivation: #95 (limiter bypass), #96 (enumeration), #98 (PIN exhaustion), #100 (silent admission), and the threat-model review in #93 (findings T-01, T-02, T-03, T-06, T-08, T-19). This doc also records the alternatives that were considered and rejected, so they don't get re-litigated.
 
 ## The problem in one paragraph
@@ -86,7 +86,7 @@ An earlier discussion said storing "a hash of the code" is sound because the cod
 ## Stages (one PR each)
 
 1. **Opaque chat id, and `secrets` everywhere. (Done.)** Add `Chat.public_id`; route on it (API paths, websocket group `chat_<public_id>`); return it as `chat_id` from create/join so the client barely changes; switch the remaining `random` use to `secrets`. Still no invites: the 4-digit PIN stays as the join mechanism for now. Fixes the recycled-PIN websocket cross-talk (T-19, the PIN-reuse half), takes the PIN out of every request path after the join (it still appears in the join request itself and in the `[JOIN-CHAT]` log line until Stage 2; T-12's logging fix is separate), and separates address from secret. **Breaking:** in-flight chats end on deploy (their stored `chat_id` no longer resolves). There is precedent: migration 0021 wiped pre-forward-secrecy messages.
-2. **Invites.** `ChatInvite` model; `POST /chat/create-invite/<chat_id>/` (any member); `create-chat` issues the first invite; join takes handle+code; per-invite atomic attempt cap; check character; single use; expiry; generic errors; keyed-hashed code. UI: two-part input in `usermenu.html`, invite display with expiry and "new invite" in the waiting overlay. Removes `Chat.pin`, the per-IP limiter (#95) and `check-chat` (#96, which has no first-party caller). Bounds the resource at the source: handles exist only while an invite is open.
+2. **Invites. (Done.)** `ChatInvite` model; `POST /chat/create-invite/<chat_id>/` (any member); `create-chat` issues the first invite; join takes handle+code; per-invite atomic attempt cap; check character; single use; expiry; generic errors; keyed-hashed code. UI: two-part input in `usermenu.html`, invite display with expiry and "new invite" in the waiting overlay. Removes `Chat.pin`, the per-IP limiter (#95) and `check-chat` (#96, which has no first-party caller). Bounds the resource at the source: handles exist only while an invite is open.
 3. **Companion (issue #100).** Roster-change notices, unique display names per chat, and the **fingerprint gate** before the first message to a new participant. Stage 2 makes admission deliberate; this makes a wrongly admitted person visible.
 4. **Optional, later.** A PAKE, if a vetted implementation exists (see above).
 
@@ -107,6 +107,16 @@ Consequences of the 3-attempt cap that the implementation must respect:
 - **A mistyped handle can hit another live invite.** That costs a stranger's invite one strike of three. With the check character the residual chance is a typo that still passes the checksum.
 - **Burn-DoS costs about 3 million requests** (three sweeps of the ~1 million handles) to burn every open invite. Accepted: it fails safe (no confidentiality loss) and Tor Client Authorization (#62) is the real gate against strangers reaching the app. Revisit the handle length (decision 6) if this is ever a public instance.
 - **The creator must be told** when an invite burns, so a burn is a visible event, not a silent failure.
+
+## Implementation notes (stage 2)
+
+Choices made while building it that the decisions above didn't cover:
+
+- **Issuing revokes your own open invites.** The code is shown once and stored only as an HMAC, so a reload loses it. Without revocation a 1:1 creator couldn't replace a lost invite, because it would still hold the chat's only free seat. Open invites per chat are capped at the number of free seats.
+- **The invite never travels in a URL.** `usermenu.html` hands it to the chat page through `sessionStorage`, which is cleared as soon as it's read.
+- **A right code that can't be used** (name taken, chat full) leaves the invite open; only a wrong code is a strike.
+- **Timing is only roughly uniform.** Responses are byte-identical for every failure, and an unknown handle still does an HMAC compare. But a wrong code against a live invite also writes the strike, so a careful timing attacker could tell a live handle from a dead one. That reveals the handle, not the code.
+- **The HMAC key** is SHA-256 of a fixed label plus `SECRET_KEY`, and the app refuses to run with the published default key (T-20, #111).
 
 ## What this does not fix
 

@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from unittest.mock import patch
+import secrets
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -8,8 +9,7 @@ from django.urls import Resolver404, resolve
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from chat.views import failed_join_attempts
-from chat.models import Chat, ChainKeyWrap, ChatParticipant, Message, MessageReadReceipt
+from chat.models import Chat, ChainKeyWrap, ChatInvite, ChatParticipant, Message, MessageReadReceipt
 from chat.auth import hash_token, IDLE_TIMEOUT
 from chat.chain import GENESIS_HASH, compute_chain_hash
 from chat import services
@@ -32,12 +32,25 @@ def _create_chat(client, display_name="alice", max_participants=None, public_key
     return client.post("/chat/create-chat/", body, format="json")
 
 
+def _make_invite(chat, expires_in=timedelta(minutes=15)):
+    """A redeemable invite string for `chat`, created directly so tests
+    aren't bound by issue_invite's free-seat cap (and can reach ChatFull)."""
+    code = "".join(secrets.choice(services.CROCKFORD) for _ in range(services.CODE_LENGTH))
+    while True:
+        handle = f"{secrets.randbelow(10 ** 6):06d}"
+        if not ChatInvite.objects.filter(handle=handle, state=ChatInvite.OPEN).exists():
+            break
+    ChatInvite.objects.create(chat=chat, handle=handle, code_hmac=services._code_hmac(code),
+                              expires_at=timezone.now() + expires_in)
+    return services.format_invite(handle, code)
+
+
 def _join_chat(client, chat_id, display_name="bob", public_key=None):
-    # Tests address chats by public id; the join itself takes the PIN (#101
-    # stage 1). Anything that isn't a live chat's id is sent as a PIN guess.
+    # Tests address chats by public id; joining takes an invite (#101).
+    # Anything that isn't a live chat's id is sent as the invite string.
     chat = Chat.objects.filter(public_id=chat_id).first()
-    pin = chat.pin if chat else chat_id
-    body = {"pin": pin, "display_name": display_name, "public_key": public_key or _fake_public_key_pem()}
+    invite = _make_invite(chat) if chat else chat_id
+    body = {"invite": invite, "display_name": display_name, "public_key": public_key or _fake_public_key_pem()}
     return client.post("/chat/join-chat/", body, format="json")
 
 
@@ -129,7 +142,6 @@ class TokenAuthTests(TestCase):
     ChatParticipant and invalidated the moment that participant leaves."""
 
     def setUp(self):
-        failed_join_attempts.clear()
         self.alice = APIClient()
         self.bob = APIClient()
         create = _create_chat(self.alice, display_name="alice")
@@ -212,34 +224,26 @@ class TokenAuthTests(TestCase):
 
 
 class OpaqueChatIdTests(TestCase):
-    """#101 stage 1: the PIN is a join secret, not the chat's address."""
+    """#101 stage 1: the chat's address is opaque and not a secret."""
 
     def setUp(self):
-        failed_join_attempts.clear()
         self.alice = APIClient()
         create = _create_chat(self.alice)
-        self.chat_id, self.pin = create.data["chat_id"], create.data["pin"]
+        self.chat_id, self.invite = create.data["chat_id"], create.data["invite"]
         self.alice.credentials(HTTP_AUTHORIZATION=f"Token {create.data['participant_token']}")
 
-    def test_create_returns_an_opaque_id_and_the_pin_separately(self):
-        self.assertRegex(self.pin, r"^\d{4}$")
+    def test_create_returns_an_opaque_id_and_a_first_invite(self):
         self.assertRegex(self.chat_id, r"^[A-Za-z0-9_-]{16}$")
+        self.assertRegex(self.invite, r"^\d{6}-[0-9A-HJKMNP-TV-Z]{6}-[0-9A-HJKMNP-TV-Z*~$=U]$")
 
-    def test_join_takes_the_pin_and_returns_the_id(self):
-        join = APIClient().post("/chat/join-chat/", {"pin": self.pin, "display_name": "bob",
+    def test_join_takes_an_invite_and_returns_the_id(self):
+        join = APIClient().post("/chat/join-chat/", {"invite": self.invite, "display_name": "bob",
                                                      "public_key": _fake_public_key_pem()}, format="json")
         self.assertEqual(join.status_code, 200, join.data)
         self.assertEqual(join.data["chat_id"], self.chat_id)
         missing = APIClient().post("/chat/join-chat/", {"display_name": "carol",
                                                         "public_key": _fake_public_key_pem()}, format="json")
         self.assertEqual(missing.status_code, 400)
-
-    def test_the_pin_is_not_an_address(self):
-        self.assertEqual(self.alice.get(f"/chat/get-messages/{self.chat_id}/").status_code, 200)
-        self.assertEqual(self.alice.get(f"/chat/get-messages/{self.pin}/").status_code, 404)
-
-    def test_members_are_shown_the_pin_to_share(self):
-        self.assertEqual(self.alice.get(f"/chat/get-messages/{self.chat_id}/").data["pin"], self.pin)
 
     def test_ids_come_from_secrets(self):
         with patch("chat.models.secrets.token_urlsafe", return_value="X" * 16) as gen:
@@ -253,9 +257,225 @@ class OpaqueChatIdTests(TestCase):
         notify.assert_called_once_with(self.chat_id, "roster_changed")
 
 
+class InviteFormatTests(TestCase):
+    def test_round_trip_and_forgiving_input(self):
+        text = services.format_invite("482913", "7KQ2MX")
+        self.assertEqual(services.parse_invite(text), ("482913", "7KQ2MX"))
+        # Case, spacing and Crockford lookalikes (I/L -> 1, O -> 0) are accepted.
+        messy = " " + text.lower().replace("-", " ") + " "
+        self.assertEqual(services.parse_invite(messy), ("482913", "7KQ2MX"))
+        self.assertEqual(services.parse_invite(services.format_invite("100000", "0ABC1D").replace("0ABC1D", "OABCID")),
+                         ("100000", "0ABC1D"))
+
+    def test_any_single_typo_fails_the_check_symbol(self):
+        good = services.format_invite("482913", "7KQ2MX").replace("-", "")
+        alphabet = "0123456789" + services.CROCKFORD
+        for i in range(len(good) - 1):
+            for ch in set(alphabet) - {good[i]}:
+                if i < 6 and not ch.isdigit():
+                    continue
+                typo = good[:i] + ch + good[i + 1:]
+                self.assertIsNone(services.parse_invite(typo), typo)
+
+    def test_rejects_malformed(self):
+        for bad in (None, "", "123", "12345-ABCDEF-0", "ABCDEF-123456-0", "x" * 100, 482913):
+            self.assertIsNone(services.parse_invite(bad), repr(bad))
+
+
+class InviteJoinTests(TestCase):
+    """#101 stage 2 (fixes #95): the join secret is a single-use,
+    short-lived invite with a per-invite attempt cap."""
+
+    def setUp(self):
+        self.alice = APIClient()
+        create = _create_chat(self.alice, max_participants=4)
+        self.chat_id, self.invite = create.data["chat_id"], create.data["invite"]
+        self.alice.credentials(HTTP_AUTHORIZATION=f"Token {create.data['participant_token']}")
+        self.chat = Chat.objects.get(public_id=self.chat_id)
+
+    def _join(self, invite, name="bob", **extra):
+        return APIClient().post("/chat/join-chat/", {"invite": invite, "display_name": name,
+                                                     "public_key": _fake_public_key_pem()}, format="json", **extra)
+
+    def _wrong(self, invite):
+        handle, code = services.parse_invite(invite)
+        other = next(c for c in services.CROCKFORD if c != code[0]) + code[1:]
+        return services.format_invite(handle, other)
+
+    def _invite_row(self):
+        return ChatInvite.objects.get(handle=services.parse_invite(self.invite)[0], chat=self.chat)
+
+    def test_code_is_stored_only_as_a_keyed_hash(self):
+        row = self._invite_row()
+        code = services.parse_invite(self.invite)[1]
+        self.assertNotIn(code, row.code_hmac)
+        self.assertEqual(row.code_hmac, services._code_hmac(code))
+        import hashlib
+        self.assertNotEqual(row.code_hmac, hashlib.sha256(code.encode()).hexdigest())
+
+    def test_three_wrong_codes_burn_it_whoever_sends_them(self):
+        wrong = self._wrong(self.invite)
+        for i, xff in enumerate(("1.1.1.1", "2.2.2.2", "3.3.3.3")):
+            self.assertEqual(self._join(wrong, HTTP_X_FORWARDED_FOR=xff).status_code, 400)
+        self.assertEqual(self._invite_row().state, ChatInvite.BURNED)
+        self.assertEqual(self._join(self.invite).status_code, 400)  # right code, too late
+        self.assertEqual(self.chat.participants.count(), 1)
+
+    def test_two_wrong_codes_still_leave_it_usable(self):
+        wrong = self._wrong(self.invite)
+        self._join(wrong)
+        self._join(wrong)
+        self.assertEqual(self._join(self.invite).status_code, 200)
+
+    def test_a_typo_costs_no_strike(self):
+        typo = self.invite[:-1] + ("0" if self.invite[-1] != "0" else "1")
+        for _ in range(5):
+            self.assertEqual(self._join(typo).status_code, 400)
+        self.assertEqual(self._invite_row().failed_attempts, 0)
+        self.assertEqual(self._join(self.invite).status_code, 200)
+
+    def test_strikes_on_one_invite_dont_lock_out_another(self):
+        # The old per-address limiter locked out everyone behind one address (#95).
+        other = _make_invite(self.chat)
+        wrong = self._wrong(self.invite)
+        for _ in range(3):
+            self._join(wrong)
+        self.assertEqual(self._join(other, name="carol").status_code, 200)
+
+    def test_single_use(self):
+        self.assertEqual(self._join(self.invite).status_code, 200)
+        self.assertEqual(self._join(self.invite, name="mallory").status_code, 400)
+
+    def test_expired_invite_never_admits(self):
+        ChatInvite.objects.filter(pk=self._invite_row().pk).update(expires_at=timezone.now())
+        self.assertEqual(self._join(self.invite).status_code, 400)
+
+    def test_every_failure_looks_the_same(self):
+        burned = _make_invite(self.chat)
+        for _ in range(3):
+            self._join(self._wrong(burned))
+        used = _make_invite(self.chat)
+        self._join(used, name="used")
+        expired = _make_invite(self.chat, expires_in=timedelta(seconds=-1))
+        unknown = services.format_invite("000000", "ZZZZZZ")
+        if ChatInvite.objects.filter(handle="000000").exists():
+            unknown = services.format_invite("000001", "ZZZZZZ")
+        responses = [self._join(x, name=f"p{i}") for i, x in
+                     enumerate((burned, used, expired, unknown, self._wrong(self.invite), "garbage"))]
+        self.assertEqual({(r.status_code, r.content) for r in responses}, {(responses[0].status_code, responses[0].content)})
+
+    def test_a_used_handle_can_be_reissued(self):
+        handle = services.parse_invite(self.invite)[0]
+        self._join(self.invite)
+        bob = ChatParticipant.objects.get(chat=self.chat, display_name="bob")
+        with patch("chat.services.secrets.randbelow", return_value=int(handle)):
+            invite, _ = services.issue_invite(self.chat, bob)
+        self.assertEqual(invite.handle, handle)
+
+    def test_any_member_can_invite_and_everyone_sees_it(self):
+        self._join(self.invite)
+        bob_row = ChatParticipant.objects.get(chat=self.chat, display_name="bob")
+        bob = APIClient()
+        bob.force_authenticate(user=bob_row)
+        issued = bob.post(f"/chat/create-invite/{self.chat_id}/")
+        self.assertEqual(issued.status_code, 201, issued.data)
+        self.assertIsNotNone(services.parse_invite(issued.data["invite"]))
+        seen = self.alice.get(f"/chat/get-messages/{self.chat_id}/").data["invites"]
+        mine = [i for i in seen if i["issued_by"] == "bob"]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0]["state"], "open")
+        self.assertFalse(mine[0]["mine"])
+        self.assertNotIn(services.parse_invite(issued.data["invite"])[1], str(seen))
+
+    def test_the_issuer_is_told_about_a_burn(self):
+        for _ in range(3):
+            self._join(self._wrong(self.invite))
+        seen = self.alice.get(f"/chat/get-messages/{self.chat_id}/").data["invites"]
+        self.assertEqual([(i["state"], i["mine"]) for i in seen], [("burned", True)])
+
+    def test_reissuing_revokes_your_own_open_invite(self):
+        # The code is shown once, so a 1:1 creator who reloads needs a new one.
+        chat_id = _create_chat(APIClient(), display_name="solo")
+        solo = APIClient()
+        solo.credentials(HTTP_AUTHORIZATION=f"Token {chat_id.data['participant_token']}")
+        first = chat_id.data["invite"]
+        second = solo.post(f"/chat/create-invite/{chat_id.data['chat_id']}/")
+        self.assertEqual(second.status_code, 201, second.data)
+        self.assertEqual(self._join(first).status_code, 400)
+        self.assertEqual(self._join(second.data["invite"]).status_code, 200)
+
+    def test_open_invites_cannot_outnumber_free_seats(self):
+        chat = services.create_chat("host", _fake_public_key_pem(), 3)[0]
+        host = chat.participants.get()
+        services.join_chat(chat, "guest", _fake_public_key_pem())
+        guest = chat.participants.get(display_name="guest")
+        # host's first invite holds the one free seat; guest can't open another
+        with self.assertRaises(services.InviteLimit):
+            services.issue_invite(chat, guest)
+        services.issue_invite(chat, host)  # replacing your own is fine
+
+    def test_outsiders_cannot_issue(self):
+        other = _create_chat(APIClient(), display_name="zed")
+        c = APIClient()
+        c.credentials(HTTP_AUTHORIZATION=f"Token {other.data['participant_token']}")
+        self.assertEqual(c.post(f"/chat/create-invite/{self.chat_id}/").status_code, 403)
+        self.assertEqual(APIClient().post(f"/chat/create-invite/{self.chat_id}/").status_code, 401)
+
+    def test_a_valid_code_with_a_taken_name_leaves_the_invite_open(self):
+        self.assertEqual(self._join(self.invite, name="alice").status_code, 409)
+        self.assertEqual(self._invite_row().state, ChatInvite.OPEN)
+        self.assertEqual(self._join(self.invite, name="bob").status_code, 200)
+
+
+class InviteConcurrencyTests(TransactionTestCase):
+    """The check and the strike are one atomic step, so parallel guesses
+    can't all be evaluated before the counter moves."""
+
+    def _race(self, invites):
+        import threading
+        from django.db import connection
+        barrier = threading.Barrier(len(invites))
+        outcomes = []
+        pem = _fake_public_key_pem()
+
+        def go(i, inv):
+            try:
+                barrier.wait()
+                services.redeem_invite(inv, f"p{i}", pem)
+                outcomes.append("ok")
+            except services.ChatServiceError as e:
+                outcomes.append(type(e).__name__)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=go, args=(i, inv)) for i, inv in enumerate(invites)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return sorted(outcomes)
+
+    def test_parallel_wrong_guesses_count_at_most_three(self):
+        chat, _, _, invite = services.create_chat("alice", _fake_public_key_pem(), 2)
+        handle, code = services.parse_invite(invite)
+        wrongs = []
+        for c in services.CROCKFORD:
+            if c != code[0]:
+                wrongs.append(services.format_invite(handle, c + code[1:]))
+        self._race(wrongs[:10])
+        row = ChatInvite.objects.get(chat=chat)
+        self.assertEqual((row.failed_attempts, row.state), (3, ChatInvite.BURNED))
+        with self.assertRaises(services.InvalidInvite):
+            services.redeem_invite(invite, "late", _fake_public_key_pem())
+
+    def test_the_right_code_sent_six_times_at_once_admits_one(self):
+        chat, _, _, invite = services.create_chat("alice", _fake_public_key_pem(), 8)
+        self.assertEqual(self._race([invite] * 6), ["InvalidInvite"] * 5 + ["ok"])
+        self.assertEqual(chat.participants.count(), 2)
+
+
 class DuplicateNameJoinTests(TestCase):
     def test_join_with_a_taken_name_is_a_409(self):
-        failed_join_attempts.clear()
         chat_id = _create_chat(APIClient(), display_name="alice").data["chat_id"]
         response = _join_chat(APIClient(), chat_id, display_name="Alice")
         self.assertEqual(response.status_code, 409, response.data)
@@ -305,7 +525,6 @@ class IdleReaperTests(TestCase):
     """#97: an abandoned chat is reclaimed without anyone coming back."""
 
     def setUp(self):
-        failed_join_attempts.clear()
         self.alice = APIClient()
         create = _create_chat(self.alice, display_name="alice", max_participants=3)
         self.chat_id = create.data["chat_id"]
@@ -317,15 +536,14 @@ class IdleReaperTests(TestCase):
                                aes_tag="x", mac="x", seq=0)
         self.stale = timezone.now() - IDLE_TIMEOUT - timedelta(seconds=1)
 
-    def test_abandoned_chat_is_fully_deleted_and_its_pin_freed(self):
+    def test_abandoned_chat_is_fully_deleted(self):
         ChatParticipant.objects.filter(chat=self.chat).update(last_seen=self.stale)
         expired, deleted, changed = services.reap_idle_chats()
         self.assertEqual((expired, deleted, changed), (2, 1, set()))
         self.assertFalse(Chat.objects.filter(public_id=self.chat_id).exists())
         self.assertEqual(Message.objects.count(), 0)
         self.assertEqual(ChatParticipant.objects.count(), 0)
-        with patch("chat.services.secrets.randbelow", return_value=int(self.chat.pin)):
-            self.assertEqual(_create_chat(APIClient()).data["pin"], self.chat.pin)
+        self.assertEqual(ChatInvite.objects.filter(chat_id=self.chat.pk).count(), 0)
 
     def test_only_idle_participants_are_expired(self):
         ChatParticipant.objects.filter(pk=self.bob_id).update(last_seen=self.stale)
@@ -351,30 +569,9 @@ class IdleReaperTests(TestCase):
         notify.assert_called_once_with(self.chat_id, "roster_changed")
 
 
-class JoinChatRateLimitTests(TestCase):
-    """Regression coverage for #20: brute-forcing the 4-digit chat PIN space
-    via repeated JoinChatView calls must be throttled. There's no account to
-    key this on before a join succeeds, so it's keyed on source IP -- see the
-    failed_join_attempts comment in chat/views.py for why that's an accepted,
-    Tor-collapses-this tradeoff rather than an oversight."""
-
+class JoinChatTests(TestCase):
     def setUp(self):
-        failed_join_attempts.clear()
         self.client = APIClient()
-
-    def test_repeated_wrong_pins_are_rate_limited(self):
-        for _ in range(4):
-            response = _join_chat(self.client, "0000")
-            self.assertEqual(response.status_code, 404)
-
-        # The 5th failed guess crosses the threshold and starts the cooldown immediately.
-        response = _join_chat(self.client, "0000")
-        self.assertEqual(response.status_code, 429)
-
-        # Even a real PIN is throttled during the cooldown window.
-        real_pin = _create_chat(APIClient(), display_name="creator").data["pin"]
-        response = _join_chat(self.client, real_pin)
-        self.assertEqual(response.status_code, 429)
 
     def test_group_chat_allows_joins_up_to_cap_then_rejects(self):
         create = _create_chat(self.client, display_name="alice", max_participants=3)
@@ -392,7 +589,8 @@ class JoinChatRateLimitTests(TestCase):
         chat_id = _create_chat(APIClient(), display_name="alice").data["chat_id"]
         response = self.client.post(
             "/chat/join-chat/",
-            {"chat_id": chat_id, "display_name": "bob", "public_key": "not a real key"},
+            {"invite": _make_invite(Chat.objects.get(public_id=chat_id)), "display_name": "bob",
+             "public_key": "not a real key"},
             format="json",
         )
         self.assertEqual(response.status_code, 400)
@@ -404,7 +602,6 @@ class MessageRoundTripTests(TestCase):
     leave-only-clears-history-once-fully-empty semantics."""
 
     def setUp(self):
-        failed_join_attempts.clear()
         self.alice = APIClient()
         self.bob = APIClient()
         create = _create_chat(self.alice, display_name="alice")
@@ -536,20 +733,16 @@ class MessageRoundTripTests(TestCase):
         self.assertEqual(Message.objects.count(), 0)
         self.assertFalse(Chat.objects.filter(public_id=self.chat_id).exists())
 
-    def test_emptied_chats_pin_becomes_reusable(self):
-        pin = Chat.objects.get(public_id=self.chat_id).pin
+    def test_emptied_chat_is_deleted_and_never_readdressed(self):
         leave = self.alice.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
         self.assertEqual(leave.status_code, 200)
         leave2 = self.bob.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
         self.assertEqual(leave2.status_code, 200)
         self.assertFalse(Chat.objects.filter(public_id=self.chat_id).exists())
 
-        # A brand-new chat can now legitimately reuse that same PIN -- but
-        # never the old chat's address (#101 stage 1).
-        with patch("chat.services.secrets.randbelow", return_value=int(pin)):
-            recreated = _create_chat(APIClient(), display_name="new-owner")
+        # A new chat never gets the old chat's address (#101 stage 1).
+        recreated = _create_chat(APIClient(), display_name="new-owner")
         self.assertEqual(recreated.status_code, 201, recreated.data)
-        self.assertEqual(recreated.data["pin"], pin)
         self.assertNotEqual(recreated.data["chat_id"], self.chat_id)
 
 
@@ -559,7 +752,6 @@ class GroupChatFeatureTests(TestCase):
     send/read round trip and response metadata for a >2-person chat."""
 
     def setUp(self):
-        failed_join_attempts.clear()
         self.alice = APIClient()
         create = _create_chat(self.alice, display_name="alice", max_participants=3)
         self.chat_id = create.data["chat_id"]
@@ -700,7 +892,6 @@ class TranscriptChainTests(TestCase):
     or replayed message rather than trusting GetMessagesView at face value."""
 
     def setUp(self):
-        failed_join_attempts.clear()
         self.alice = APIClient()
         self.bob = APIClient()
         create = _create_chat(self.alice, display_name="alice")
@@ -789,7 +980,7 @@ class ChatServicesUnitTests(TestCase):
     full request/response cycle for every domain-rule check."""
 
     def setUp(self):
-        self.chat, self.alice, self.alice_token = services.create_chat(
+        self.chat, self.alice, self.alice_token, _invite = services.create_chat(
             "alice", _fake_public_key_pem(), max_participants=2
         )
         self.bob, self.bob_token = services.join_chat(self.chat, "bob", _fake_public_key_pem())
@@ -802,45 +993,10 @@ class ChatServicesUnitTests(TestCase):
         kwargs.update(overrides)
         return services.send_message(self.chat.public_id, sender, **kwargs)
 
-    def test_create_chat_generates_a_4_digit_pin_and_first_participant(self):
-        self.assertRegex(self.chat.pin, r'^\d{4}$')
+    def test_create_chat_creates_first_participant_and_invite(self):
         self.assertEqual(self.alice.display_name, "alice")
         self.assertEqual(self.alice.chat_id, self.chat.pk)
-
-    def test_create_chat_finds_the_last_free_pin(self):
-        # Random draws alone would almost never hit the one free PIN; the
-        # fallback must find it rather than failing or looping.
-        taken = {self.chat.pin}
-        Chat.objects.bulk_create([Chat(pin=f"{i:04d}") for i in range(services.PIN_SPACE)
-                                  if f"{i:04d}" not in taken and i != 4321])
-        chat, _, _ = services.create_chat("late", _fake_public_key_pem(), 2)
-        self.assertEqual(chat.pin, "4321")
-
-    def test_create_chat_gives_up_when_every_pin_is_taken(self):
-        # Used to be an unbounded loop that pinned a worker forever (#98).
-        taken = {self.chat.pin}
-        Chat.objects.bulk_create([Chat(pin=f"{i:04d}") for i in range(services.PIN_SPACE)
-                                  if f"{i:04d}" not in taken])
-        with patch("chat.services.secrets.randbelow", wraps=services.secrets.randbelow) as draws:
-            with self.assertRaises(services.NoFreePin):
-                services.create_chat("late", _fake_public_key_pem(), 2)
-        self.assertLessEqual(draws.call_count, 3 * services._PIN_RANDOM_DRAWS)
-        response = _create_chat(APIClient())
-        self.assertEqual(response.status_code, 503, response.data)
-
-    def test_create_chat_retries_when_a_concurrent_create_takes_the_pin(self):
-        # Simulates losing the race between the free-PIN check and the insert.
-        real_exists = type(Chat.objects.none()).exists
-        calls = {"n": 0}
-
-        def stale_exists(qs):
-            calls["n"] += 1
-            return False if calls["n"] == 1 else real_exists(qs)
-
-        with patch("chat.services.secrets.randbelow", side_effect=[int(self.chat.pin), 1234]):
-            with patch.object(type(Chat.objects.none()), "exists", stale_exists):
-                chat, _, _ = services.create_chat("racer", _fake_public_key_pem(), 2)
-        self.assertEqual(chat.pin, "1234")
+        self.assertEqual(self.chat.invites.filter(state=ChatInvite.OPEN).count(), 1)
 
     def test_display_name_validation_rejects_newline_and_blank(self):
         # T-22: '$' used to accept a trailing newline.
@@ -858,7 +1014,7 @@ class ChatServicesUnitTests(TestCase):
         services.join_chat(group, "alicia", _fake_public_key_pem())
 
     def test_a_name_frees_up_once_its_owner_leaves(self):
-        group, alice, _ = services.create_chat("alice", _fake_public_key_pem(), 4)
+        group, alice, _, _invite = services.create_chat("alice", _fake_public_key_pem(), 4)
         services.join_chat(group, "bob", _fake_public_key_pem())
         services.mark_left(alice)
         services.join_chat(group, "alice", _fake_public_key_pem())
@@ -867,7 +1023,7 @@ class ChatServicesUnitTests(TestCase):
         with self.assertRaises(services.ChatFull):
             services.join_chat(self.chat, "carol", _fake_public_key_pem())
 
-    def test_get_chat_raises_not_found_for_an_unknown_pin(self):
+    def test_get_chat_raises_not_found_for_an_unknown_id(self):
         with self.assertRaises(services.ChatNotFound):
             services.get_chat("0000")
 
@@ -885,7 +1041,7 @@ class ChatServicesUnitTests(TestCase):
         self.assertFalse(Chat.objects.filter(pk=self.chat.pk).exists())
 
     def test_leave_chat_rejects_a_participant_who_isnt_in_that_chat(self):
-        _other_chat, carol, _token = services.create_chat("carol", _fake_public_key_pem(), max_participants=2)
+        _other_chat, carol, _token, _invite = services.create_chat("carol", _fake_public_key_pem(), max_participants=2)
         with self.assertRaises(services.NotAParticipant):
             services.leave_chat(carol, self.chat.public_id)
 
@@ -982,7 +1138,7 @@ class MessageExpiryUnitTests(TestCase):
     same rationale as ChatServicesUnitTests."""
 
     def setUp(self):
-        self.chat, self.alice, _ = services.create_chat("alice", _fake_public_key_pem(), max_participants=3)
+        self.chat, self.alice, _, _invite = services.create_chat("alice", _fake_public_key_pem(), max_participants=3)
         self.bob, _ = services.join_chat(self.chat, "bob", _fake_public_key_pem())
         services.issue_chain_key(self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}])
 
@@ -1091,7 +1247,6 @@ class MessageExpiryHTTPTests(TestCase):
     wired up correctly -- not just correct in isolation."""
 
     def setUp(self):
-        failed_join_attempts.clear()
         self.alice = APIClient()
         self.bob = APIClient()
         create = _create_chat(self.alice, display_name="alice")

@@ -45,47 +45,44 @@ class HttpProbes(TestCase):
     def setUp(self):
         self.c = APIClient()
 
-    def _join(self, pin, **extra):
-        return self.c.post("/chat/join-chat/", {"pin": pin, "public_key": PUB}, format="json", **extra)
+    def _join(self, invite, name=None, **extra):
+        body = {"invite": invite, "public_key": PUB}
+        if name:
+            body["display_name"] = name
+        return self.c.post("/chat/join-chat/", body, format="json", **extra)
+
+    @staticmethod
+    def _wrong(invite):
+        handle, code = services.parse_invite(invite)
+        return services.format_invite(handle, ("Z" if code[0] != "Z" else "Y") + code[1:])
 
     def test_1_join_limiter_bypass_and_pin_bruteforce(self):
-        print("\n[1] PIN brute force vs. the join rate limiter")
-        from chat import views
-        views.failed_join_attempts.clear()
+        # At 123be67: a 4-digit PIN behind a per-address limiter that trusted
+        # X-Forwarded-For; rotating it joined a live chat after ~8,000 tries
+        # with no throttling (T-01). Since #101 stage 2 the secret is a
+        # 30-bit single-use invite code, and wrong codes are charged to the
+        # invite itself: three and it's burned, whatever address sent them.
+        print("\n[1] Guessing an invite code (was: PIN brute force vs. the join limiter)")
         r = self.c.post("/chat/create-chat/", {"public_key": PUB, "max_participants": 8, "display_name": "victim"}, format="json")
-        target = r.data["pin"]
-        say(f"victim created a group chat, PIN={target}")
-        # control: same source address, no header games
-        codes = [self._join(f"{9000 + i}").status_code for i in range(7)]
-        say("control (one source, 7 wrong PINs) status codes:", codes)
-        views.failed_join_attempts.clear()
-        # attack: rotate a client-supplied X-Forwarded-For per request
-        attempts, n429, found = 0, 0, None
-        t0 = time.time()
-        for pin in range(10000):
-            attempts += 1
-            ip = f"10.{(attempts >> 16) & 255}.{(attempts >> 8) & 255}.{attempts & 255}"
-            resp = self._join(f"{pin:04d}", HTTP_X_FORWARDED_FOR=ip)
-            if resp.status_code == 429:
-                n429 += 1
-            if resp.status_code == 200:
-                found = f"{pin:04d}"
-                break
-        say(f"attacker rotating X-Forwarded-For: joined PIN {found} after {attempts} attempts, "
-            f"{n429} rate-limit responses, {time.time() - t0:.1f}s")
-        say(f"distinct limiter buckets created (memory grows per spoofed value): {len(views.failed_join_attempts)}")
-        self.assertEqual(found, target)
+        invite = r.data["invite"]
+        say(f"victim created a group chat; invite handle {invite[:6]} (the code is the secret)")
+        codes = []
+        for i in range(10):
+            ip = f"10.0.0.{i}"
+            codes.append(self._join(self._wrong(invite), HTTP_X_FORWARDED_FOR=ip).status_code)
+        say("attacker, 10 wrong codes from 10 spoofed addresses:", codes)
+        say("the real code afterwards ->", self._join(invite).status_code, "(the invite burned after 3 strikes)")
+        say("chance of guessing within 3 tries: 3 / 2^30 = ~3 in a billion per invite")
 
     def test_2_shared_bucket_lockout(self):
-        print("\n[2] One client's failures lock out everyone sharing the source address (Tor: all clients)")
-        from chat import views
-        views.failed_join_attempts.clear()
-        victim = self.c.post("/chat/create-chat/", {"public_key": PUB}, format="json").data["pin"]
+        # At 123be67 five bad guesses from a shared address (all of Tor)
+        # made a VALID PIN return 429 for everyone (T-08).
+        print("\n[2] Do one client's failures lock out others behind the same address?")
+        victim = self.c.post("/chat/create-chat/", {"public_key": PUB}, format="json").data["invite"]
         for i in range(5):
-            self._join(f"{8000 + i}")
+            self._join(services.format_invite(f"{800000 + i}", "ABCDEF"))
         legit = self._join(victim)
-        say(f"after 5 bad guesses from the shared address, a legitimate join of the VALID pin {victim} ->", legit.status_code, legit.data)
-        views.failed_join_attempts.clear()
+        say("after 5 bad guesses from the shared address, a legitimate join with a VALID invite ->", legit.status_code)
 
     def test_3_check_chat_enumeration(self):
         # At 123be67 this swept all 10,000 PINs in about a minute with no
@@ -100,39 +97,21 @@ class HttpProbes(TestCase):
             say("/chat/check-chat/<live pin>/ -> no such route")
 
     def test_4_create_chat_unthrottled_and_pin_exhaustion(self):
-        print("\n[4] Unauthenticated create-chat flood + PIN-space exhaustion")
+        # At 123be67 anyone could fill all 10,000 PINs and create_chat then
+        # looped forever (T-06). There is no PIN any more (#101 stage 2):
+        # creation still isn't throttled, but there's no fixed space to fill.
+        print("\n[4] Unauthenticated create-chat flood (was: + PIN-space exhaustion)")
         t0 = time.time()
         codes = {self.c.post("/chat/create-chat/", {"public_key": PUB}, format="json").status_code for _ in range(300)}
         say(f"300 anonymous create-chat calls in {time.time() - t0:.1f}s -> status codes {codes}")
-        have = set(Chat.objects.values_list("pin", flat=True))
-        Chat.objects.bulk_create([Chat(pin=f"{i:04d}") for i in range(10000) if f"{i:04d}" not in have])
-        say("PIN space now full:", Chat.objects.count(), "of 10000 rows")
-        # At 123be67 create_chat looped forever here (20,001 draws before the
-        # probe cut it off). Since #98 it gives up and the view returns 503.
-        calls = {"n": 0}
-        real_randbelow = services.secrets.randbelow
-
-        def counting_randbelow(n):
-            calls["n"] += 1
-            if calls["n"] > 20000:
-                raise RuntimeError("probe stopped it")
-            return real_randbelow(n)
-        with mock.patch("chat.services.secrets.randbelow", counting_randbelow):
-            try:
-                services.create_chat("late", PUB, 2)
-                say("create_chat returned (unexpected)")
-            except services.NoFreePin:
-                say(f"services.create_chat() gave up with NoFreePin after {calls['n']} PIN draws")
-            except RuntimeError:
-                say(f"services.create_chat() never terminated: {calls['n']} PIN draws with no exit condition (probe cut it off)")
-        r = self.c.post("/chat/create-chat/", {"public_key": PUB}, format="json")
-        say("create-chat with the space full ->", r.status_code, r.data)
+        say("fields left on Chat that come from a finite space:",
+            [f.name for f in Chat._meta.get_fields() if getattr(f, "max_length", None) == 4] or "none")
 
     def test_5_abandoned_chat_persists(self):
         print("\n[5] Abandoned chat: nobody returns, nothing reclaims it")
         r = self.c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "alice"}, format="json")
         pin = r.data["chat_id"]  # the chat's address (public id) since #101 stage 1
-        j = self._join(r.data["pin"])
+        j = self._join(r.data["invite"])
         chat = Chat.objects.get(public_id=pin)
         alice, bob = list(chat.participants.order_by("joined_at"))
         Message.objects.create(chat=chat, sender=alice, encrypted_text="x", aes_nonce="x", aes_tag="x", mac="x", seq=0)
@@ -140,9 +119,12 @@ class HttpProbes(TestCase):
         active = list(chat.participants.filter(left_at__isnull=True).values_list("display_name", flat=True))
         say(f"30 days idle, no one authenticated since: chat exists={Chat.objects.filter(public_id=pin).exists()} active participants={active}")
         say("Chat rows:", Chat.objects.filter(public_id=pin).count(), " Message rows:", Message.objects.filter(chat=chat).count(),
-            " -> PIN still held, ciphertext still stored")
-        third = self._join(r.data["pin"])
-        say("a third party trying to use that PIN:", third.status_code, third.data)
+            " -> seats still held, ciphertext still stored")
+        try:
+            services.issue_invite(chat, alice)
+            say("an invite for a third party could be issued (unexpected: ghosts hold both seats)")
+        except services.InviteLimit:
+            say("no invite can be issued for a third party: the ghosts hold both seats")
         # The one path that does reclaim an idle participant: their OWN next authenticated request.
         for who, tok in (("alice", r.data["participant_token"]), ("bob", j.data["participant_token"])):
             resp = APIClient().get(f"/chat/get-messages/{pin}/", HTTP_AUTHORIZATION=f"Token {tok}")
@@ -161,7 +143,7 @@ class HttpProbes(TestCase):
     def test_6_display_names_not_unique(self):
         print("\n[6] Display names are not unique within a chat")
         r = self.c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "alice"}, format="json")
-        j = self.c.post("/chat/join-chat/", {"pin": r.data["pin"], "public_key": PUB, "display_name": "alice"}, format="json")
+        j = self.c.post("/chat/join-chat/", {"invite": r.data["invite"], "public_key": PUB, "display_name": "alice"}, format="json")
         say("second participant joined as the same name 'alice' ->", j.status_code)
         roster = Chat.objects.get(public_id=r.data["chat_id"]).participants.values_list("display_name", flat=True)
         say("roster as stored:", list(roster))
@@ -179,9 +161,9 @@ class WsProbes(TransactionTestCase):
         from chat.realtime import notify_chat
 
         app = URLRouter(chat.routing.websocket_urlpatterns)
-        chat_obj, alice, tok_a = services.create_chat("alice", PUB, 2)
+        chat_obj, alice, tok_a, _invite = services.create_chat("alice", PUB, 2)
         bob, tok_b = services.join_chat(chat_obj, "bob", PUB)
-        pin, cid = chat_obj.pin, chat_obj.public_id
+        cid = chat_obj.public_id
 
         async def run():
             comm = WebsocketCommunicator(app, f"/ws/chat/{cid}/", subprotocols=[tok_b])
@@ -195,12 +177,12 @@ class WsProbes(TransactionTestCase):
                 say("bob's socket STILL receives signals for the chat he left:", msg)
             except asyncio.TimeoutError:
                 say("bob's socket received nothing (subscription was cut)")
-            # chat emptied -> deleted -> PIN recycled to a stranger's brand-new chat.
-            # At 123be67 the new chat shared the old group (chat_<pin>); since
-            # #101 stage 1 it gets a fresh public id, so the old socket hears nothing.
+            # chat emptied -> deleted -> a stranger's brand-new chat. At 123be67
+            # the new chat could get the same PIN and so the same group
+            # (chat_<pin>); since #101 every chat has its own random id.
             await dbasync(services.leave_chat)(alice, cid)
-            new_chat = await dbasync(Chat.objects.create)(pin=pin)
-            say(f"PIN {pin} recycled; new chat's id differs from the old one: {new_chat.public_id != cid}")
+            new_chat = await dbasync(Chat.objects.create)()
+            say(f"new chat created after the old one was deleted; ids differ: {new_chat.public_id != cid}")
             await asyncio.to_thread(notify_chat, new_chat.public_id, "new_message")
             try:
                 msg = await comm.receive_json_from(timeout=2)
@@ -209,7 +191,7 @@ class WsProbes(TransactionTestCase):
                 say("old socket received nothing after PIN recycling")
             await comm.disconnect()
             # positive control: a token for THIS chat must not open a socket on another chat
-            other, _, _ = await dbasync(services.create_chat)("other", PUB, 2)
+            other, _, _, _ = await dbasync(services.create_chat)("other", PUB, 2)
             cross = WebsocketCommunicator(app, f"/ws/chat/{other.public_id}/", subprotocols=[tok_a])
             ok, code = await cross.connect()
             say(f"token for chat {cid} opening a socket on chat {other.public_id}: accepted={ok} (close code {code})")
@@ -222,7 +204,7 @@ class FormatProbes(TestCase):
         print("\n[9] Server validates no ciphertext field format or size")
         c = APIClient()
         a = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "a"}, format="json").data
-        b = APIClient().post("/chat/join-chat/", {"pin": a["pin"], "public_key": PUB, "display_name": "b"}, format="json").data
+        b = APIClient().post("/chat/join-chat/", {"invite": a["invite"], "public_key": PUB, "display_name": "b"}, format="json").data
         h = {"HTTP_AUTHORIZATION": f"Token {a['participant_token']}"}
         r = c.post(f"/chat/issue-chain-key/{a['chat_id']}/", {"wraps": [{"recipient_id": b["participant_id"], "encrypted_seed": "!!not-a-wrapped-seed!!"}]}, format="json", **h)
         say("issue-chain-key with a garbage 'wrapped seed' ->", r.status_code)
@@ -242,7 +224,7 @@ class AuthzProbes(TestCase):
         c = APIClient()
         a = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "a1"}, format="json").data
         b = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "b1"}, format="json").data
-        APIClient().post("/chat/join-chat/", {"pin": b["pin"], "public_key": PUB, "display_name": "b2"}, format="json")
+        APIClient().post("/chat/join-chat/", {"invite": b["invite"], "public_key": PUB, "display_name": "b2"}, format="json")
         h = {"HTTP_AUTHORIZATION": f"Token {a['participant_token']}"}
         B = b["chat_id"]
         body = {"encrypted_text": "x", "aes_nonce": "x", "aes_tag": "x", "mac": "x", "prev_hash": "0" * 64, "sender_chain_epoch": 0,
@@ -275,7 +257,7 @@ class LoadProbes(TestCase):
         from django.test.utils import CaptureQueriesContext
         c = APIClient()
         a = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "a"}, format="json").data
-        APIClient().post("/chat/join-chat/", {"pin": a["pin"], "public_key": PUB, "display_name": "b"}, format="json")
+        APIClient().post("/chat/join-chat/", {"invite": a["invite"], "public_key": PUB, "display_name": "b"}, format="json")
         chat = Chat.objects.get(public_id=a["chat_id"])
         alice = chat.participants.order_by("joined_at").first()
         h = {"HTTP_AUTHORIZATION": f"Token {a['participant_token']}"}

@@ -12,6 +12,7 @@ from .views import (
     IssueChainKeyView,
     GetChainKeysView,
     AckChainKeyView,
+    CreateInviteView,
     chatbox,
 )
 
@@ -34,6 +35,7 @@ urlpatterns = [
 
     path("create-chat/",    CreateChatView.as_view(),   name="create-chat"),
     path("join-chat/",      JoinChatView.as_view(),     name="join-chat"),
+    path("create-invite/<str:chat_id>/", CreateInviteView.as_view(), name="create-invite"),
 
     # Chatbox page (renders chatbox.html)
     path("chatbox/", chatbox, name="chatbox"),
