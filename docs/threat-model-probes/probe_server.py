@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from channels.db import database_sync_to_async as dbasync
 from django.test import TestCase, TransactionTestCase, override_settings
+from django.urls import Resolver404, resolve
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -87,18 +88,16 @@ class HttpProbes(TestCase):
         views.failed_join_attempts.clear()
 
     def test_3_check_chat_enumeration(self):
-        print("\n[3] Unauthenticated, unthrottled /check-chat/ enumeration")
-        for name in ("alice", "carol", "dave"):
-            APIClient().post("/chat/create-chat/", {"public_key": PUB, "display_name": name}, format="json")
-        t0 = time.time()
-        live, n429 = {}, 0
-        for pin in range(10000):
-            r = self.c.get(f"/chat/check-chat/{pin:04d}/")
-            if r.status_code == 429:
-                n429 += 1
-            if r.status_code == 200:
-                live[f"{pin:04d}"] = r.data["participants"]
-        say(f"swept all 10,000 PINs in {time.time() - t0:.1f}s, {n429} rate-limit responses; live chats found:", live)
+        # At 123be67 this swept all 10,000 PINs in about a minute with no
+        # throttling and listed every live chat's participants (T-02). The
+        # endpoint was removed in #96; this now just confirms it is gone.
+        print("\n[3] /check-chat/ enumeration (endpoint removed in #96)")
+        r = self.c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "alice"}, format="json")
+        try:
+            resolve(f"/chat/check-chat/{r.data['chat_id']}/")
+            say("/chat/check-chat/<live pin>/ still resolves (unexpected)")
+        except Resolver404:
+            say("/chat/check-chat/<live pin>/ -> no such route")
 
     def test_4_create_chat_unthrottled_and_pin_exhaustion(self):
         print("\n[4] Unauthenticated create-chat flood + PIN-space exhaustion")
@@ -131,8 +130,8 @@ class HttpProbes(TestCase):
         alice, bob = list(chat.participants.order_by("joined_at"))
         Message.objects.create(chat=chat, sender=alice, encrypted_text="x", aes_nonce="x", aes_tag="x", mac="x", seq=0)
         ChatParticipant.objects.filter(chat=chat).update(last_seen=timezone.now() - timedelta(days=30))
-        c2 = APIClient().get(f"/chat/check-chat/{pin}/")
-        say(f"30 days idle, no one authenticated since: check-chat -> exists={c2.data.get('exists')} active participants={c2.data.get('participants')}")
+        active = list(chat.participants.filter(left_at__isnull=True).values_list("display_name", flat=True))
+        say(f"30 days idle, no one authenticated since: chat exists={Chat.objects.filter(pin=pin).exists()} active participants={active}")
         say("Chat rows:", Chat.objects.filter(pin=pin).count(), " Message rows:", Message.objects.filter(chat=chat).count(),
             " -> PIN still held, ciphertext still stored")
         third = self._join(pin)
@@ -151,8 +150,8 @@ class HttpProbes(TestCase):
         r = self.c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "alice"}, format="json")
         j = self.c.post("/chat/join-chat/", {"chat_id": r.data["chat_id"], "public_key": PUB, "display_name": "alice"}, format="json")
         say("second participant joined as the same name 'alice' ->", j.status_code)
-        chk = self.c.get(f"/chat/check-chat/{r.data['chat_id']}/")
-        say("roster as shown:", chk.data["participants"])
+        roster = Chat.objects.get(pin=r.data["chat_id"]).participants.values_list("display_name", flat=True)
+        say("roster as stored:", list(roster))
         v = services.is_valid_display_name("alice\n")
         say("is_valid_display_name('alice\\n') =", v, "(regex '$' tolerates a trailing newline)")
 

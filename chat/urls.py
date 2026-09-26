@@ -4,7 +4,6 @@ from django.urls import path
 
 from . import views
 from .views import (
-    CheckChatView,
     LeaveChatView,
     user_menu,
     CreateChatView,
@@ -20,7 +19,6 @@ urlpatterns = [
     path("usermenu/", user_menu, name="user_menu"),
 
     #  Chat‐related API endpoints
-    path("check-chat/<str:chat_id>/", CheckChatView.as_view(), name="check-chat"),
     path(
         "leave-chat/",
         LeaveChatView.as_view(),

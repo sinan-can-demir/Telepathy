@@ -153,21 +153,6 @@ class JoinChatView(APIView):
         )
 
 
-class CheckChatView(APIView):
-    """GET /chat/check-chat/<chat_id>/ -- no account needed, same reasoning
-    as CreateChatView/JoinChatView."""
-    authentication_classes = []
-    permission_classes = [permissions.AllowAny]
-
-    def get(self, request, chat_id):
-        try:
-            chat = services.get_chat(chat_id)
-        except services.ChatNotFound:
-            return Response({"exists": False}, status=status.HTTP_404_NOT_FOUND)
-        participants = services.list_active_display_names(chat)
-        return Response({"exists": True, "participants": participants}, status=status.HTTP_200_OK)
-
-
 class LeaveChatView(APIView):
     """Marks the calling participant as left, hard-deleting the chat once it
     fully empties (cascades to its participants/messages/keys). request.user

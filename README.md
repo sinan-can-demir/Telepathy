@@ -238,7 +238,6 @@ All "Participant Token" endpoints authenticate via `Authorization: Token <partic
 | `GET` | `/chat/usermenu/` | Dashboard (create/join chat) | None |
 | `POST` | `/chat/create-chat/` | Create a chat; generates keys client-side first. Returns a 4-digit PIN + participant token | None |
 | `POST` | `/chat/join-chat/` | Join an existing chat by PIN; returns a participant token | None |
-| `GET` | `/chat/check-chat/<chat_id>/` | Verify chat room exists and list participants | None |
 | `GET` | `/chat/get-chat-participants/<chat_id>/` | List active participants' ids/display names/public keys | Participant Token |
 | `POST` | `/chat/issue-chain-key/<chat_id>/` | Issue a new forward-secrecy chain epoch, wrapped per current other participant | Participant Token |
 | `GET` | `/chat/get-chain-keys/<chat_id>/` | Fetch the latest chain-key epoch issued to you by each sender | Participant Token |

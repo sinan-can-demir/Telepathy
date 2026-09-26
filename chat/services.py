@@ -161,14 +161,6 @@ def join_chat(chat, display_name, public_key):
     return issue_participant(chat, display_name, public_key)
 
 
-def list_active_display_names(chat):
-    return list(
-        chat.participants.filter(left_at__isnull=True)
-        .order_by("joined_at")
-        .values_list("display_name", flat=True)
-    )
-
-
 def leave_chat(participant, chat_id):
     """Marks participant as left; hard-deletes the chat if that empties it
     -- see #35, this is what actually frees the PIN for reuse (a
