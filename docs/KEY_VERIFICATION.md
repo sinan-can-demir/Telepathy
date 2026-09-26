@@ -21,9 +21,20 @@ This is entirely client-side. The point of TOFU here is specifically *not* trust
 
 A server that substitutes a participant's key *after* the first time this browser observed it — whether at storage time, at roster-fetch time, or by lying in a single message's embedded sender key — now produces a visible, blocking warning instead of a silent, undetectable interception.
 
+## Fingerprint gate (#100)
+
+Joining a chat needs no approval from its members, and every member's next send re-keys to include whoever is in the roster. So before this browser sends anything to a participant, it now requires the user to confirm they compared that participant's fingerprint out of band:
+
+- A banner lists each participant not yet confirmed, with the fingerprint this browser sees for them, and the user's **own** fingerprint (so the other side can compare it too; previously only the other participant's was shown).
+- Sending is blocked while anyone in the recipient list is unconfirmed. The check runs before the chain key is (re-)issued, so no seed is ever wrapped to an unconfirmed participant.
+- A confirmation is stored as the confirmed fingerprint (`fp_ack_<chat>_<participant>` in `localStorage`), so a key that later changes and is re-trusted through the mismatch banner needs a fresh comparison. It is wiped with the rest of the chat's local state.
+- Join and leave notices appear in the transcript, and names are unique per chat (case-insensitive), so an intruder can't wear an existing member's name.
+
+It's a speed bump that makes the comparison explicit, not a proof that it happened.
+
 ## What this explicitly does not give
 
-- **No protection against a MITM present from message one.** TOFU's entire model is "trust whatever you see first, catch it if it changes" — if a hostile server substitutes a key from the very start of a chat, pinning that substituted key doesn't help. The fingerprint display exists precisely so participants *can* actively verify identity out-of-band (voice, in person) rather than relying on pinning alone — but nothing forces them to.
+- **No protection against a MITM present from message one.** TOFU's entire model is "trust whatever you see first, catch it if it changes" — if a hostile server substitutes a key from the very start of a chat, pinning that substituted key doesn't help. The fingerprint comparison is what catches it, and since #100 it is a required step rather than an option (see "Fingerprint gate" below). It still only works if people actually compare over a channel the server doesn't control; clicking "They match" without comparing gives no protection.
 - **No cross-chat identity.** Every chat is a fresh burner identity by design (see `docs/ACCOUNTLESS_IDENTITY.md`), so there's no persistent "contact" to build trust with over time the way Signal's safety numbers can. A pin only ever protects one chat's lifetime.
 - **No recovery across devices/sessions.** Pins live in this browser's `localStorage`, tied to this specific chat. Joining the same chat PIN from a second device/browser starts trust over from scratch there.
 
