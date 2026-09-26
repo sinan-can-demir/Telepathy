@@ -107,19 +107,26 @@ class HttpProbes(TestCase):
         have = set(Chat.objects.values_list("pin", flat=True))
         Chat.objects.bulk_create([Chat(pin=f"{i:04d}") for i in range(10000) if f"{i:04d}" not in have])
         say("PIN space now full:", Chat.objects.count(), "of 10000 rows")
+        # At 123be67 create_chat looped forever here (20,001 draws before the
+        # probe cut it off). Since #98 it gives up and the view returns 503.
         calls = {"n": 0}
+        real_randbelow = services.secrets.randbelow
 
-        def counting_randint(a, b):
+        def counting_randbelow(n):
             calls["n"] += 1
             if calls["n"] > 20000:
                 raise RuntimeError("probe stopped it")
-            return 1234
-        with mock.patch("chat.services.random.randint", counting_randint):
+            return real_randbelow(n)
+        with mock.patch("chat.services.secrets.randbelow", counting_randbelow):
             try:
                 services.create_chat("late", PUB, 2)
                 say("create_chat returned (unexpected)")
+            except services.NoFreePin:
+                say(f"services.create_chat() gave up with NoFreePin after {calls['n']} PIN draws")
             except RuntimeError:
                 say(f"services.create_chat() never terminated: {calls['n']} PIN draws with no exit condition (probe cut it off)")
+        r = self.c.post("/chat/create-chat/", {"public_key": PUB}, format="json")
+        say("create-chat with the space full ->", r.status_code, r.data)
 
     def test_5_abandoned_chat_persists(self):
         print("\n[5] Abandoned chat: nobody returns, nothing reclaims it")

@@ -400,7 +400,7 @@ class MessageRoundTripTests(TestCase):
         self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
 
         # A brand-new chat can now legitimately reuse that same PIN.
-        with patch("random.randint", return_value=int(self.chat_id)):
+        with patch("chat.services.secrets.randbelow", return_value=int(self.chat_id)):
             recreated = _create_chat(APIClient(), display_name="new-owner")
         self.assertEqual(recreated.status_code, 201, recreated.data)
         self.assertEqual(recreated.data["chat_id"], self.chat_id)
@@ -636,6 +636,41 @@ class ChatServicesUnitTests(TestCase):
         self.assertRegex(self.chat.pin, r'^\d{4}$')
         self.assertEqual(self.alice.display_name, "alice")
         self.assertEqual(self.alice.chat_id, self.chat.pk)
+
+    def test_create_chat_finds_the_last_free_pin(self):
+        # Random draws alone would almost never hit the one free PIN; the
+        # fallback must find it rather than failing or looping.
+        taken = {self.chat.pin}
+        Chat.objects.bulk_create([Chat(pin=f"{i:04d}") for i in range(services.PIN_SPACE)
+                                  if f"{i:04d}" not in taken and i != 4321])
+        chat, _, _ = services.create_chat("late", _fake_public_key_pem(), 2)
+        self.assertEqual(chat.pin, "4321")
+
+    def test_create_chat_gives_up_when_every_pin_is_taken(self):
+        # Used to be an unbounded loop that pinned a worker forever (#98).
+        taken = {self.chat.pin}
+        Chat.objects.bulk_create([Chat(pin=f"{i:04d}") for i in range(services.PIN_SPACE)
+                                  if f"{i:04d}" not in taken])
+        with patch("chat.services.secrets.randbelow", wraps=services.secrets.randbelow) as draws:
+            with self.assertRaises(services.NoFreePin):
+                services.create_chat("late", _fake_public_key_pem(), 2)
+        self.assertLessEqual(draws.call_count, 3 * services._PIN_RANDOM_DRAWS)
+        response = _create_chat(APIClient())
+        self.assertEqual(response.status_code, 503, response.data)
+
+    def test_create_chat_retries_when_a_concurrent_create_takes_the_pin(self):
+        # Simulates losing the race between the free-PIN check and the insert.
+        real_exists = type(Chat.objects.none()).exists
+        calls = {"n": 0}
+
+        def stale_exists(qs):
+            calls["n"] += 1
+            return False if calls["n"] == 1 else real_exists(qs)
+
+        with patch("chat.services.secrets.randbelow", side_effect=[int(self.chat.pin), 1234]):
+            with patch.object(type(Chat.objects.none()), "exists", stale_exists):
+                chat, _, _ = services.create_chat("racer", _fake_public_key_pem(), 2)
+        self.assertEqual(chat.pin, "1234")
 
     def test_join_chat_rejects_once_the_chat_is_full(self):
         with self.assertRaises(services.ChatFull):

@@ -81,7 +81,10 @@ class CreateChatView(APIView):
         if not (2 <= max_participants <= 8):
             return Response({"message": "max_participants must be between 2 and 8."}, status=400)
 
-        chat, participant, raw_token = services.create_chat(display_name, public_key, max_participants)
+        try:
+            chat, participant, raw_token = services.create_chat(display_name, public_key, max_participants)
+        except services.NoFreePin:
+            return Response({"message": "No chat PINs are free right now. Try again later."}, status=503)
         logger.info(f"[CREATE-CHAT] Created chat {chat}, PIN: {chat.pin}")
 
         return Response(
