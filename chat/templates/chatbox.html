@@ -478,11 +478,11 @@
     }
 
     // Called once per NEW message from someone else, in strict seq order
-    // (see appendNewMessages). Caches the derived key under the message's
-    // own id first -- a page reload must be able to redisplay a message it
-    // already showed once without needing to re-run the ratchet backward
-    // (which is by construction impossible once it's advanced past that
-    // point). Only genuinely NEW messages ever touch the live ratchet state.
+    // (see appendNewMessages). Once a message has decrypted, its key is
+    // cached under the message's own id -- a page reload must be able to
+    // redisplay a message it already showed once without needing to re-run
+    // the ratchet backward (which is by construction impossible once it's
+    // advanced past that point).
     // Reset at the top of every appendNewMessages call (not cached across
     // polls) -- otherwise a sender's re-key after our first fetch would be
     // invisible to us for the rest of the session.
@@ -500,13 +500,23 @@
         return chainKeysFetchCache;
     }
 
-    // Returns { messageKey, authKey } -- both non-extractable CryptoKeys,
-    // both the freshly-derived and the cached-from-IndexedDB case.
-    // decryptWithAES and the MAC verify below only ever get CryptoKeys,
-    // never raw key bytes, on this (receiving) path. See #55/#61.
+    // Returns { messageKey, authKey, commit } -- both keys non-extractable
+    // CryptoKeys, both the freshly-derived and the cached-from-IndexedDB
+    // case. decryptWithAES and the MAC verify below only ever get
+    // CryptoKeys, never raw key bytes, on this (receiving) path. See #55/#61.
+    //
+    // Derive -> verify -> commit (issue #94): nothing here touches IndexedDB
+    // or localStorage. Every write (the message-key cache, skipped keys, the
+    // advanced chain position, a re-seeded epoch) is deferred into commit(),
+    // which the caller runs only after AES-GCM decrypt has succeeded with
+    // messageKey. chain_index and sender_chain_epoch are served by the server
+    // and aren't covered by the hash chain, so a lie about either must cost
+    // nothing but that one failed attempt: committing first used to cache the
+    // wrong key under the message id and ratchet the chain past the real
+    // position, destroying the message for good with no visible sign.
     async function deriveReceivedKeys(msg){
         const cached = await idbGet(msgKeyName(chatId, msg.id));
-        if (cached) return cached;
+        if (cached) return { ...cached, commit: async () => {} };
 
         const senderId = msg.sender_id, msgEpoch = msg.sender_chain_epoch, target = msg.chain_index;
         let epoch = localStorage.getItem(recvChainEpochName(chatId, senderId));
@@ -516,6 +526,7 @@
         // key and the position it belongs to can never be persisted out of
         // step with each other.
         let record = epoch === null ? null : await idbGet(recvChainKeyName(chatId, senderId));
+        let reseededEpoch = null;
 
         if (epoch === null || epoch < msgEpoch) {
             const remote = await fetchChainKeysOnce();
@@ -523,9 +534,7 @@
             if (!entry || entry.epoch < msgEpoch) throw new Error('No chain key available for this sender/epoch');
             const seedBuf = await crypto.subtle.decrypt({name:'RSA-OAEP'}, myEncKeys.privateKey, b642ab(entry.encrypted_seed));
             record = { chainKey: await importHmacKey(seedBuf), index: 0 };
-            await idbSet(recvChainKeyName(chatId, senderId), record);
-            localStorage.setItem(recvChainEpochName(chatId, senderId), String(entry.epoch));
-            epoch = entry.epoch;
+            epoch = reseededEpoch = entry.epoch;
         }
         if (epoch !== msgEpoch) throw new Error('Chain epoch mismatch; cannot derive message key');
 
@@ -537,31 +546,37 @@
             const skipName = skippedKeyName(chatId, senderId, epoch, target);
             const kept = typeof target === 'number' ? await idbGet(skipName) : null;
             if (!kept) throw new Error('Message key already consumed');
-            await idbSet(msgKeyName(chatId, msg.id), kept);
-            await idbDelete(skipName);
-            return kept;
+            return { ...kept, commit: async () => {
+                await idbSet(msgKeyName(chatId, msg.id), kept);
+                await idbDelete(skipName);
+            }};
         }
 
         const { skipped, messageKeyBytes, authKeyBytes, nextChainKey } =
             await advanceChainTo(record.chainKey, record.index, target);
-        for (const k of skipped) {
-            await idbSet(skippedKeyName(chatId, senderId, epoch, k.index), {
-                messageKey: await importAesKey(k.messageKeyBytes, ['decrypt']),
-                authKey: await importHmacKey(k.authKeyBytes, ['verify']),
-            });
-        }
         const messageKey = await importAesKey(messageKeyBytes, ['decrypt']);
         const authKey = await importHmacKey(authKeyBytes, ['verify']);
         const derived = { messageKey, authKey };
-        // Cache the message's own key BEFORE committing the advanced chain.
-        // If we're interrupted in between, the next call finds this cache and
-        // returns without advancing; the chain then catches up from `target`
-        // on the next message, re-deriving the gap as skipped keys -- the
-        // index makes that self-healing, where the old per-message
-        // advance-once scheme would have desynced for good.
-        await idbSet(msgKeyName(chatId, msg.id), derived);
-        await idbSet(recvChainKeyName(chatId, senderId), { chainKey: nextChainKey, index: target + 1 });
-        return derived;
+        const commit = async () => {
+            for (const k of skipped) {
+                await idbSet(skippedKeyName(chatId, senderId, epoch, k.index), {
+                    messageKey: await importAesKey(k.messageKeyBytes, ['decrypt']),
+                    authKey: await importHmacKey(k.authKeyBytes, ['verify']),
+                });
+            }
+            // Cache the message's own key BEFORE committing the advanced
+            // chain. If we're interrupted in between, the next call finds
+            // this cache and returns without advancing; the chain then
+            // catches up from `target` on the next message, re-deriving the
+            // gap as skipped keys -- the index makes that self-healing. The
+            // epoch goes last for the same reason: a new epoch recorded over
+            // an old chain record would fail every later message, while an
+            // old epoch over a new record only re-seeds once more.
+            await idbSet(msgKeyName(chatId, msg.id), derived);
+            await idbSet(recvChainKeyName(chatId, senderId), { chainKey: nextChainKey, index: target + 1 });
+            if (reseededEpoch !== null) localStorage.setItem(recvChainEpochName(chatId, senderId), String(reseededEpoch));
+        };
+        return { ...derived, commit };
     }
 
     // ── Plaintext padding (ciphertext-length hiding) ────────────────────────
@@ -1091,6 +1106,9 @@
     // since it's never cleared and a page reload starts a fresh in-memory
     // Set but relies on deriveReceivedKeys's own per-message cache
     // (keyed by msg.id, in IndexedDB) to avoid re-advancing on reload.
+    // The one exception is a message that failed to decrypt: renderMsg
+    // drops it from renderedIds so it's retried, which is safe because a
+    // failed attempt commits nothing to the ratchet (see #94).
     // Only ever called from processMessages, which serializes overlapping
     // callers (see #68) -- never call this directly.
     async function appendNewMessages(msgs){
@@ -1145,6 +1163,36 @@
         group.append(sender, bubble, meta);
     }
 
+    // Placeholders for messages that failed to decrypt, by message id, so a
+    // later successful retry lands in the same spot in the transcript
+    // instead of at the bottom, and a repeated failure isn't drawn twice.
+    const undecryptableGroups = new Map();
+    function placeMsgGroup(msgId, group){
+        const placeholder = undecryptableGroups.get(msgId);
+        if(placeholder){ placeholder.replaceWith(group); undecryptableGroups.delete(msgId); }
+        else messagesDiv.appendChild(group);
+    }
+
+    function renderUndecryptableMsg(group, sender, msg){
+        if(undecryptableGroups.has(msg.id)) return;
+        const bubble = document.createElement('div');
+        bubble.className = 'msg-bubble msg-expired';
+        bubble.textContent = '⚠ This message could not be decrypted';
+
+        const meta = document.createElement('div');
+        meta.className = 'msg-meta';
+        const timeEl = document.createElement('span');
+        timeEl.className = 'msg-time';
+        timeEl.textContent = new Date(msg.timestamp).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+        const badge = document.createElement('span');
+        badge.className = 'verify-badge failed';
+        badge.textContent = '✗ Undecryptable';
+        meta.append(timeEl, badge);
+        group.append(sender, bubble, meta);
+        undecryptableGroups.set(msg.id, group);
+        messagesDiv.appendChild(group);
+    }
+
     async function renderMsg(msg){
         const isMine = String(msg.sender_id) === String(myParticipantId);
         const group = document.createElement('div');
@@ -1161,7 +1209,7 @@
         // below against nulls.
         if(msg.tombstone_hash){
             renderExpiredMsg(group, sender, msg, isMine);
-            messagesDiv.appendChild(group);
+            placeMsgGroup(msg.id, group);
             return;
         }
 
@@ -1170,7 +1218,7 @@
         const cryptoSteps = []; // {label, ok}
 
         try{
-            let aesKey, authKey = null;
+            let aesKey, authKey = null, commitKeys = null;
             if(isMine){
                 cryptoSteps.push({label:'RSA-OAEP key unwrap (self)', ok:null});
                 const wk = msg.my_encrypted_symmetric_key;
@@ -1180,13 +1228,16 @@
                 cryptoSteps[0].ok = true;
             } else {
                 cryptoSteps.push({label:'Chain ratchet (forward-secret)', ok:null});
-                ({messageKey: aesKey, authKey} = await deriveReceivedKeys(msg));
+                ({messageKey: aesKey, authKey, commit: commitKeys} = await deriveReceivedKeys(msg));
                 cryptoSteps[0].ok = true;
             }
 
             cryptoSteps.push({label:'AES-256-GCM decrypt', ok:null});
             text = await decryptWithAES(aesKey,{ciphertext:msg.encrypted_text,nonce:msg.aes_nonce,tag:msg.aes_tag});
             cryptoSteps[1].ok = true;
+            // GCM authenticated, so the derived key is the right one: only
+            // now is it safe to persist it and advance the ratchet (#94).
+            if(commitKeys) await commitKeys();
 
             // Deniable by design (issue #61): this MAC is verifiable only by
             // someone who independently derives the same ratchet-chain auth
@@ -1205,8 +1256,14 @@
                 cryptoSteps.push({label:'Sent by you', ok:true});
             }
         }catch(e){
+            // Shown, not skipped (#94): a message the server tampered with
+            // (or that we can't derive a key for yet) must be visible as a
+            // gap. Nothing was committed, so it's retried on the next fetch
+            // and replaces this placeholder in place if it then decrypts.
             console.warn('Decrypt failed',msg.id,e);
-            return; // skip broken messages
+            renderUndecryptableMsg(group, sender, msg);
+            renderedIds.delete(msg.id);
+            return;
         }
 
         // TOFU: an attacker holding the *current* encryption key can produce
@@ -1275,7 +1332,7 @@
 
         meta.append(timeEl, badge);
         group.append(sender, bubble, meta, details);
-        messagesDiv.appendChild(group);
+        placeMsgGroup(msg.id, group);
 
         // See scheduleLocalExpiry above -- local-only, cosmetic countdown
         // for a message that has a TTL but hasn't been tombstoned yet.
