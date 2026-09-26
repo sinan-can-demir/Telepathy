@@ -16,9 +16,28 @@ This is the same idea as Signal's "Sender Keys": each participant maintains thei
 
 ## What the server sees (and doesn't)
 
-`MessageKey` now only ever holds the *sender's own* self-wrapped copy of a message's key (RSA-OAEP, unchanged from before) — kept specifically so a sender can always redisplay their own sent history after a page reload, the same way they always could. This does **not** weaken the security property being protected: forward secrecy is about an attacker who intercepts ciphertext and later steals a *recipient's* key being unable to decrypt what they intercepted — it was never about a device being unable to read messages it authored and can already see. Once a device is compromised, whatever it can already display is, definitionally, exposed; that's true of every messenger, not a gap introduced here.
+No per-message key is stored for anyone (since #99). The sender keeps its own copy of each message key in this browser's IndexedDB (`mykey_*`, by chain position) to redisplay its sent history; the server used to keep an RSA-OAEP self-wrapped copy instead (`MessageKey`, now removed).
 
-Other recipients get **no per-message wrapped key at all** anymore. They derive the same message key locally by advancing their own cached copy of the sender's chain — the only thing ever transmitted for them is the one-time wrapped seed at chain-issuance time (`GetChainKeysView`). This is also a genuine efficiency win: an N-person group chat no longer needs N RSA-OAEP wrap operations per message, just one HMAC step per recipient.
+**Correction.** An earlier version of this section said that server-side self-wrap "does not weaken" forward secrecy. It did. The wrap was made to the sender's long-lived RSA key and kept on the server for the chat's lifetime, so anyone who later got a copy of the database *and* that RSA key (the adversary forward secrecy exists for) could decrypt the sender's entire sent history, however far the ratchet had moved. Threat-model finding T-05 / issue #99.
+
+Other recipients get **no per-message wrapped key at all**. They derive the same message key locally by advancing their own cached copy of the sender's chain — the only thing ever transmitted for them is the one-time wrapped seed at chain-issuance time (`GetChainKeysView`). This is also a genuine efficiency win: an N-person group chat no longer needs N RSA-OAEP wrap operations per message, just one HMAC step per recipient.
+
+## What the server keeps, and the limits that remain (issue #99)
+
+The ratchet only protects the past if nothing *else* can re-derive it. Two server-side copies used to be able to:
+
+1. **The wrapped chain seed** (`ChainKeyWrap`) was kept for the chat's whole life. With the recipient's RSA key, it re-derives every key of that chain from index 0.
+2. **The sender's self-wrap** (`MessageKey`), described above.
+
+Now the receiver acknowledges a seed (`POST /chat/ack-chain-key/`) once a message under it has decrypted and the seed is stored locally, and the server deletes that wrap and any older ones for that sender. The ack comes only after a successful decrypt (#94): a seed that hasn't been proven good must stay fetchable, or a single message the server lies about would lose the whole epoch. The self-wrap is gone entirely.
+
+What still holds, stated precisely:
+
+- **A copy taken before the ack still works.** A wrapped seed exists on the server from issuance until the recipient's first successful decrypt under it. An operator who logs it at fetch time, or a database copy taken in that window, plus the recipient's RSA key, still yields that epoch from index 0 up to the next re-key. This defends against a *later* database copy, not against a hostile server (that is T-04's territory).
+- **A failed ack leaves the wrap.** The ack is best effort; if it's lost, the wrap stays until the chat is deleted (on leave, or by the idle reaper after 30 minutes, #97).
+- **The device holds history by design.** `msgkey_*` and `mykey_*` hold the key of every message this browser has shown, so anyone with this browser's storage can read everything it can display. That is the price of redisplaying history after a reload, as in any messenger that keeps history.
+- **The RSA key lives until you leave.** Non-extractable means JavaScript can't export it, not that it can't be used by any script in the page or recovered from the browser profile on disk.
+- **Losing local storage loses history**, now including your own sent messages, which show as "could not be decrypted" on another device or after clearing site data. Received messages already worked this way.
 
 ## The reload problem, and how it's actually solved
 
@@ -28,7 +47,7 @@ A forward-secret ratchet that's genuinely discarding old keys creates an obvious
 
 The sending chain key, each per-sender receiving chain key, and the per-message key cache (`chain_my_key_*`, `chain_recv_key_*`, `msgkey_*`, `skipkey_*` in `chatbox.html`) are stored as non-extractable `CryptoKey` objects in the same IndexedDB store `docs/CLIENT_KEY_STORAGE.md` set up for the RSA keys and bearer token, not as raw base64 bytes in `localStorage`. `ratchetStep` takes a chain key `CryptoKey` and signs with it directly (`crypto.subtle.sign` accepts a `CryptoKey`, no export round-trip needed); an HMAC's *output* is unavoidably a raw buffer, so it's re-imported into a fresh non-extractable key immediately, rather than ever touching storage as raw bytes.
 
-One exception, and it's inherent to the design, not an oversight: on the *sending* side, the freshly-derived message key briefly exists as raw bytes in memory, because it needs to be RSA-OAEP-wrapped for the self-decrypt copy (see "What the server sees" above) — `crypto.subtle.encrypt` needs a plaintext buffer there, not a `CryptoKey`. Those raw bytes are never persisted anywhere; they exist for the duration of one `submit` handler call and are then only reachable as the non-extractable `CryptoKey` used for the AES-GCM encrypt itself. The *received*-message path has no such exception: `deriveReceivedMessageKey` only ever returns a non-extractable `CryptoKey`, never raw bytes, since a receiver never needs to wrap it for anyone.
+An HMAC's output is always a raw buffer, so on both paths the freshly derived message key exists as raw bytes only long enough to be imported as a non-extractable `CryptoKey`; it is never persisted in that form. (Before #99 the sending side also had to keep the raw bytes around to RSA-wrap them for its self-copy; that's gone.)
 
 ## Missing messages: chain index and skipped keys (issue #90)
 
@@ -36,7 +55,7 @@ Advancing "once per message seen" only works if every message reaches every rece
 
 So each message carries `chain_index`: its position within the sender's current epoch (0 for the epoch's first message). A receiver keeps `{chainKey, index}` per sender (one IndexedDB record, so the key and its position can't be persisted out of step) and, on a message at index *n*, ratchets forward from `index` to *n*. The keys for the positions it stepped over are kept as `skipkey_*` entries, because the chain is one-way and a key not kept can never be recovered; if the missing message turns up late it is decrypted with its kept key, once. A message whose index is already behind the receiver and has no kept key is refused as a replay. A single message can make a receiver skip at most `MAX_SKIP` (100) positions, so a hostile index can't pin the tab in a huge HMAC loop.
 
-`chain_index` is not separately MAC'd: it selects which key decrypts the message, so a server that lies about it makes AES-GCM decryption fail before the MAC is reached. The receiver caches the message's own key *before* committing the advanced chain, so an interruption between the two self-heals on the next message (the gap is re-derived as skipped keys) instead of desyncing.
+`chain_index` is not separately MAC'd: it selects which key decrypts the message, so a server that lies about it makes AES-GCM decryption fail before the MAC is reached. Because that failure *is* the attack, nothing is written until the decrypt succeeds (#94): `deriveReceivedKeys` returns a `commit()` holding every write (skipped keys, the message's own key, the advanced chain, a re-seeded epoch, the seed ack), and the message is shown as undecryptable and retried if the decrypt fails. Within `commit()` the message's own key is cached *before* the advanced chain, so an interruption between the two self-heals on the next message (the gap is re-derived as skipped keys) instead of desyncing.
 
 This does not recover the *content* of a lost message -- that is gone -- it only stops one loss from taking the rest of the conversation with it.
 

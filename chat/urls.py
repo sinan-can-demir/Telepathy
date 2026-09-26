@@ -11,6 +11,7 @@ from .views import (
     GetChatParticipantsView,
     IssueChainKeyView,
     GetChainKeysView,
+    AckChainKeyView,
     chatbox,
 )
 
@@ -29,6 +30,7 @@ urlpatterns = [
     path('get-chat-participants/<str:chat_id>/', GetChatParticipantsView.as_view(), name='get-chat-participants'),
     path('issue-chain-key/<str:chat_id>/', IssueChainKeyView.as_view(), name='issue-chain-key'),
     path('get-chain-keys/<str:chat_id>/', GetChainKeysView.as_view(), name='get-chain-keys'),
+    path('ack-chain-key/<str:chat_id>/', AckChainKeyView.as_view(), name='ack-chain-key'),
 
     path("create-chat/",    CreateChatView.as_view(),   name="create-chat"),
     path("join-chat/",      JoinChatView.as_view(),     name="join-chat"),

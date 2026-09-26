@@ -8,7 +8,10 @@
 // Run:  node docs/threat-model-probes/crypto_probe.js      (Node 20+, no dependencies)
 // Probe A documented T-09 at 123be67 (a lied-about chain_index destroyed the
 // message for good); since the #94 fix it shows the message surviving the lie.
-// Probe B still documents T-05 until #99 lands.
+// Probe B documented T-05 at 123be67 (the server's retained wrapped seed plus
+// the recipient's RSA key decrypted everything); since #99 the client acks a
+// stored seed and the server deletes it, so the DB copy taken afterwards has
+// nothing to unwrap.
 const fs = require('fs');
 const path = require('path');
 const src = fs.readFileSync(path.join(__dirname, '..', '..', 'chat', 'templates', 'chatbox.html'), 'utf8');
@@ -46,9 +49,12 @@ async function makeReceiver(myPriv, chainKeysFromServer) {
   const chatId = '1234';
   const myEncKeys = { privateKey: myPriv };
   const fetchChainKeysOnce = async () => chainKeysFromServer;
+  // Models the server side of POST /chat/ack-chain-key/ (#99): the wrapped
+  // seed for that sender is deleted from the "database".
+  const ackChainKey = (senderId, epoch) => { const e = chainKeysFromServer.get(senderId); if (e && e.epoch <= epoch) chainKeysFromServer.delete(senderId); };
   const factory = new Function('crypto', 'localStorage', 'idbGet', 'idbSet', 'idbDelete', 'chatId', 'myEncKeys',
-    'fetchChainKeysOnce', code + '\nreturn {deriveReceivedKeys, decryptWithAES, encryptWithAES, ratchetStep, importHmacKey, importAesKey, b642ab, ab2b64};');
-  const api = factory(globalThis.crypto, localStorage, idbGet, idbSet, idbDelete, chatId, myEncKeys, fetchChainKeysOnce);
+    'fetchChainKeysOnce', 'ackChainKey', code + '\nreturn {deriveReceivedKeys, decryptWithAES, encryptWithAES, ratchetStep, importHmacKey, importAesKey, b642ab, ab2b64};');
+  const api = factory(globalThis.crypto, localStorage, idbGet, idbSet, idbDelete, chatId, myEncKeys, fetchChainKeysOnce, ackChainKey);
   api.idb = idb; return api;
 }
 
@@ -79,10 +85,10 @@ async function makeReceiver(myPriv, chainKeysFromServer) {
     catch (e) { return `FAILED (${e.constructor.name}: ${e.message || 'decrypt error'})`; }
   };
   console.log('== Probe A: server tampers with chain_index (not covered by the hash chain) ==');
-  const R0 = await makeReceiver(rsa.privateKey, serverChainKeys);
+  const R0 = await makeReceiver(rsa.privateKey, new Map(serverChainKeys)); // each recipient has its own wraps
   console.log('control  m0..m3 honest      :', await tryDecrypt(R0, sent[0]), '|', await tryDecrypt(R0, sent[1]));
 
-  const R1 = await makeReceiver(rsa.privateKey, serverChainKeys);
+  const R1 = await makeReceiver(rsa.privateKey, new Map(serverChainKeys));
   const lie = { ...sent[0], chain_index: 50 };                 // server rewrites one field in the JSON it serves
   console.log('m0 served with chain_index=50 :', await tryDecrypt(R1, lie));
   console.log('skipkey_* after the lie       :', [...R1.idb.keys()].filter(k => k.startsWith('skipkey_')).length, '(fixed in #94: a failed decrypt commits nothing)');
@@ -91,12 +97,16 @@ async function makeReceiver(myPriv, chainKeysFromServer) {
 
   // ── Probe B: forward secrecy vs. wrapped seed retained on the server + recipient RSA key ──
   console.log('\n== Probe B: receiver has ratcheted past m0..m3; attacker later gets RSA key + DB dump ==');
-  const R2 = await makeReceiver(rsa.privateKey, serverChainKeys);
+  const serverDb = new Map([[7, { sender_id: 7, epoch: 0, encrypted_seed: wrappedSeed }]]);
+  const R2 = await makeReceiver(rsa.privateKey, serverDb);
   for (const m of sent) await tryDecrypt(R2, m);              // victim reads everything, ratchet advances, old chain keys discarded
   const st = R2.idb.get('chain_recv_key_1234_7');
   console.log('victim chain position now     :', st.index, '(keys for indices <', st.index, 'are gone from the live ratchet)');
-  // Attacker: no access to the live ratchet state at all — only the server's stored wrapped seed, the ciphertext, and the RSA private key.
-  const seedBuf = await subtle.decrypt({ name: 'RSA-OAEP' }, rsa.privateKey, Buffer.from(wrappedSeed, 'base64'));
+  // Attacker: no access to the live ratchet state at all — only a copy of the server's database (taken now), the ciphertext, and the RSA private key.
+  const dumped = serverDb.get(7);
+  console.log('wrapped seed in the DB dump   :', dumped ? 'PRESENT' : 'none (deleted on ack, #99)');
+  if (!dumped) { console.log('attacker                      : nothing to unwrap with the RSA key; messages 0..3 stay sealed'); return; }
+  const seedBuf = await subtle.decrypt({ name: 'RSA-OAEP' }, rsa.privateKey, Buffer.from(dumped.encrypted_seed, 'base64'));
   const A = await makeReceiver(rsa.privateKey, new Map());
   let ck = await A.importHmacKey(seedBuf);
   for (const m of sent) {

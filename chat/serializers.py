@@ -10,7 +10,6 @@ class MessageSerializer(serializers.ModelSerializer):
     sender_id = serializers.IntegerField(read_only=True)
     sender_public_key = serializers.CharField(source="sender.public_key",         read_only=True)
     sender_username = serializers.CharField(source="sender.display_name",       read_only=True)
-    my_encrypted_symmetric_key = serializers.SerializerMethodField()
     # Bucketed to the minute -- see issue #59: a full (microsecond-precision)
     # timestamp lets anyone observing the API response correlate an exact
     # send moment against other signals (network traffic timing, a
@@ -25,7 +24,6 @@ class MessageSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "encrypted_text",
-            "my_encrypted_symmetric_key",
             "aes_nonce",
             "aes_tag",
             "mac",
@@ -48,16 +46,6 @@ class MessageSerializer(serializers.ModelSerializer):
             "ttl_seconds",
             "tombstone_hash",
         ]
-
-    def get_my_encrypted_symmetric_key(self, obj):
-        request = self.context.get("request")
-        if not request or not request.user or not request.user.is_authenticated:
-            return None
-        key = next(
-            (k for k in obj.wrapped_keys.all() if k.recipient_id == request.user.id),
-            None,
-        )
-        return key.encrypted_symmetric_key if key else None
 
     def get_timestamp(self, obj):
         return obj.timestamp.replace(second=0, microsecond=0).isoformat()

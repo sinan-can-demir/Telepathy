@@ -14,7 +14,7 @@ The crypto/API layer is solid: end-to-end encryption, transcript tamper-evidence
 
 ### 2. ~~The 4-digit PIN space (10,000 values) is never recycled~~ — Resolved
 
-`LeaveChatView` now hard-deletes the `Chat` row once every participant has left (cascading to its `ChatParticipant`/`Message`/`MessageKey`/`ChainKey` rows), instead of soft-flagging it with `is_active=False` forever. `Chat.pin`'s uniqueness constraint only applies to chats that still exist, so an ended chat's PIN is immediately available for a new chat to reuse (#35).
+`LeaveChatView` now hard-deletes the `Chat` row once every participant has left (cascading to its `ChatParticipant`/`Message`/`ChainKey` rows), instead of soft-flagging it with `is_active=False` forever. `Chat.pin`'s uniqueness constraint only applies to chats that still exist, so an ended chat's PIN is immediately available for a new chat to reuse (#35).
 
 ### 3. ~~`active_chats` in-process dict is dead code today, a landmine tomorrow~~ — Resolved
 
@@ -32,7 +32,7 @@ The server used to also stash `chat_id` in the Django session (read by the page-
 
 ### 6. ~~Fat views, no service layer~~ — Resolved
 
-Chat-pairing/leave/messaging/chain-key rules now live in `chat/services.py` as plain functions taking/returning model values and raising typed exceptions (`ChatNotFound`, `ChatFull`, `NotAParticipant`, `StaleTranscript`, `StaleChainEpoch`, `UnknownChainEpoch`, `MissingSelfWrap`, `RosterMismatch`, ...) for domain-rule violations — never a DRF `Response`. Every `APIView` method in `chat/views.py` is now a thin adapter: parse `request.data`, call into `services`, catch its exceptions, map each to the right HTTP status/body. `ChatServicesUnitTests` in `chat/tests.py` exercises these directly against the test database, with no `APIClient`/HTTP round trip at all (issue #39).
+Chat-pairing/leave/messaging/chain-key rules now live in `chat/services.py` as plain functions taking/returning model values and raising typed exceptions (`ChatNotFound`, `ChatFull`, `NotAParticipant`, `StaleTranscript`, `StaleChainEpoch`, `UnknownChainEpoch`, `RosterMismatch`, ...) for domain-rule violations — never a DRF `Response`. Every `APIView` method in `chat/views.py` is now a thin adapter: parse `request.data`, call into `services`, catch its exceptions, map each to the right HTTP status/body. `ChatServicesUnitTests` in `chat/tests.py` exercises these directly against the test database, with no `APIClient`/HTTP round trip at all (issue #39).
 
 One deliberate, non-behavior-preserving side effect: a handful of endpoints (`send-message`, `issue-chain-key`, `get-chain-keys`, `get-chat-participants`, `get-messages`) previously returned DRF's default `{"detail": "Not found."}` body for a missing chat, via `get_object_or_404`. They now return `{"message": "Chat not found."}`, matching the convention every other error response in this file already used — status codes are unchanged, and no test asserted the old body.
 

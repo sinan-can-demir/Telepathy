@@ -9,7 +9,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from chat.views import failed_join_attempts
-from chat.models import Chat, ChatParticipant, Message, MessageKey, MessageReadReceipt
+from chat.models import Chat, ChainKeyWrap, ChatParticipant, Message, MessageReadReceipt
 from chat.auth import hash_token, IDLE_TIMEOUT
 from chat.chain import GENESIS_HASH, compute_chain_hash
 from chat import services
@@ -378,7 +378,7 @@ class MessageRoundTripTests(TestCase):
         issued = _issue_chain_key(self.alice, self.chat_id, [self.bob_id])
         self.alice_epoch = issued.data["epoch"]
 
-    def _send(self, client, key_for_self="key-a", prev_hash=GENESIS_HASH, sender_id=None, epoch=None):
+    def _send(self, client, prev_hash=GENESIS_HASH, sender_id=None, epoch=None):
         sender_id = sender_id if sender_id is not None else self.alice_id
         epoch = epoch if epoch is not None else self.alice_epoch
         return client.post(
@@ -387,7 +387,6 @@ class MessageRoundTripTests(TestCase):
                 "encrypted_text": "ciphertext", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": prev_hash,
                 "sender_chain_epoch": epoch, "chain_index": 0,
-                "wrapped_keys": [{"recipient_id": sender_id, "encrypted_symmetric_key": key_for_self}],
             },
             format="json",
         )
@@ -398,7 +397,6 @@ class MessageRoundTripTests(TestCase):
             {
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": GENESIS_HASH, "sender_chain_epoch": self.alice_epoch, "chain_index": 7,
-                "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "k"}],
             },
             format="json",
         )
@@ -413,7 +411,6 @@ class MessageRoundTripTests(TestCase):
             body = {
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": GENESIS_HASH, "sender_chain_epoch": self.alice_epoch,
-                "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "k"}],
             }
             body.update(extra)
             return self.alice.post(f"/chat/send-message/{self.chat_id}/", body, format="json")
@@ -423,26 +420,23 @@ class MessageRoundTripTests(TestCase):
             self.assertEqual(post(chain_index=bad).status_code, 400, bad)
         self.assertEqual(Message.objects.count(), 0)
 
-    def test_round_trip_creates_one_message_and_self_wrap_only(self):
+    def test_round_trip_creates_one_message_and_no_per_message_key(self):
         send = self._send(self.alice)
         self.assertEqual(send.status_code, 201, send.data)
         self.assertEqual(Message.objects.count(), 1)
-        # Only the sender's own self-wrap is ever stored now -- other
-        # participants derive the key from their cached copy of alice's
-        # chain instead of unwrapping a per-message key.
-        self.assertEqual(MessageKey.objects.count(), 1)
+        # No per-message key is stored or served for anyone (#99): other
+        # participants derive it from alice's chain, and alice keeps her own
+        # copy locally instead of an RSA self-wrap on the server.
+        self.assertNotIn("my_encrypted_symmetric_key", send.data)
         self.assertEqual(send.data["sender_id"], self.alice_id)
         self.assertEqual(send.data["sender_chain_epoch"], self.alice_epoch)
 
         alice_view = self.alice.get(f"/chat/get-messages/{self.chat_id}/")
         self.assertEqual(alice_view.data["current_user_id"], self.alice_id)
-        self.assertEqual(alice_view.data["messages"][0]["my_encrypted_symmetric_key"], "key-a")
+        self.assertNotIn("my_encrypted_symmetric_key", alice_view.data["messages"][0])
 
         bob_view = self.bob.get(f"/chat/get-messages/{self.chat_id}/")
         self.assertEqual(bob_view.data["current_user_id"], self.bob_id)
-        # Bob has no server-stored wrapped key for alice's message -- he'd
-        # derive it client-side from the chain seed she issued him.
-        self.assertIsNone(bob_view.data["messages"][0]["my_encrypted_symmetric_key"])
 
     def test_served_timestamp_is_bucketed_to_the_minute(self):
         # Regression coverage for #59: the API-facing timestamp is bucketed
@@ -457,10 +451,6 @@ class MessageRoundTripTests(TestCase):
         parsed = datetime.fromisoformat(send.data["timestamp"])
         self.assertEqual(parsed.second, 0)
         self.assertEqual(parsed.microsecond, 0)
-
-    def test_send_rejects_missing_self_wrap(self):
-        response = self._send(self.alice, key_for_self="")
-        self.assertEqual(response.status_code, 400)
 
     def test_send_rejects_unknown_chain_epoch(self):
         response = self._send(self.alice, epoch=99)
@@ -552,7 +542,7 @@ class GroupChatFeatureTests(TestCase):
         self.assertEqual(by_id[self.bob_id]["display_name"], "bob")
         self.assertTrue(by_id[self.bob_id]["public_key"])
 
-    def test_send_message_in_group_stores_only_senders_self_wrap(self):
+    def test_send_message_in_group_stores_no_per_message_key(self):
         issued = _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])
         self.assertEqual(issued.status_code, 201, issued.data)
 
@@ -562,19 +552,14 @@ class GroupChatFeatureTests(TestCase):
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": GENESIS_HASH,
                 "sender_chain_epoch": issued.data["epoch"], "chain_index": 0,
-                "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"}],
             },
             format="json",
         )
         self.assertEqual(send.status_code, 201, send.data)
         self.assertEqual(Message.objects.count(), 1)
-        self.assertEqual(MessageKey.objects.count(), 1)
-
-        alice_view = self.alice.get(f"/chat/get-messages/{self.chat_id}/")
-        self.assertEqual(alice_view.data["messages"][0]["my_encrypted_symmetric_key"], "key-a")
-        for client in (self.bob, self.carol):
+        for client in (self.alice, self.bob, self.carol):
             view = client.get(f"/chat/get-messages/{self.chat_id}/")
-            self.assertIsNone(view.data["messages"][0]["my_encrypted_symmetric_key"])
+            self.assertNotIn("my_encrypted_symmetric_key", view.data["messages"][0])
 
     def test_issue_chain_key_must_cover_exactly_current_other_participants(self):
         missing_carol = _issue_chain_key(self.alice, self.chat_id, [self.bob_id])
@@ -598,6 +583,40 @@ class GroupChatFeatureTests(TestCase):
         [entry] = [e for e in bob_view.data["chain_keys"] if e["sender_id"] == self.alice_id]
         self.assertEqual(entry["epoch"], 1)
         self.assertEqual(entry["encrypted_seed"], f"seed-for-{self.bob_id}")
+
+    def test_ack_deletes_only_the_callers_wraps_up_to_that_epoch(self):
+        # #99 option A: a wrapped seed kept after delivery lets a later DB
+        # copy + the recipient's RSA key re-derive the whole chain.
+        _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])   # epoch 0
+        _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])   # epoch 1
+        _issue_chain_key(self.bob, self.chat_id, [self.alice_id, self.carol_id])   # bob's epoch 0
+        ack = self.bob.post(f"/chat/ack-chain-key/{self.chat_id}/",
+                            {"sender_id": self.alice_id, "epoch": 1}, format="json")
+        self.assertEqual(ack.status_code, 200, ack.data)
+        self.assertEqual(ack.data["deleted"], 2)
+        self.assertFalse(ChainKeyWrap.objects.filter(recipient_id=self.bob_id).exists())
+        # carol's wraps of both chains and alice's wrap of bob's are untouched
+        self.assertEqual(ChainKeyWrap.objects.filter(recipient_id=self.carol_id).count(), 3)
+        self.assertEqual(ChainKeyWrap.objects.filter(recipient_id=self.alice_id).count(), 1)
+        bob_view = self.bob.get(f"/chat/get-chain-keys/{self.chat_id}/")
+        self.assertEqual([e for e in bob_view.data["chain_keys"] if e["sender_id"] == self.alice_id], [])
+
+    def test_ack_of_an_older_epoch_keeps_the_newer_one(self):
+        _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])
+        _issue_chain_key(self.alice, self.chat_id, [self.bob_id, self.carol_id])
+        self.bob.post(f"/chat/ack-chain-key/{self.chat_id}/", {"sender_id": self.alice_id, "epoch": 0}, format="json")
+        self.assertEqual(list(ChainKeyWrap.objects.filter(recipient_id=self.bob_id)
+                              .values_list("chain_key__epoch", flat=True)), [1])
+
+    def test_ack_validates_input_and_membership(self):
+        url = f"/chat/ack-chain-key/{self.chat_id}/"
+        for bad in ({}, {"sender_id": "1", "epoch": 0}, {"sender_id": 1, "epoch": -1}, {"sender_id": True, "epoch": 0}):
+            self.assertEqual(self.bob.post(url, bad, format="json").status_code, 400, bad)
+        outsider = APIClient()
+        other = _create_chat(outsider, display_name="zed")
+        outsider.credentials(HTTP_AUTHORIZATION=f"Token {other.data['participant_token']}")
+        self.assertEqual(outsider.post(url, {"sender_id": self.alice_id, "epoch": 0}, format="json").status_code, 403)
+        self.assertEqual(APIClient().post(url, {"sender_id": 1, "epoch": 0}, format="json").status_code, 401)
 
     def test_get_chain_keys_requires_active_membership(self):
         outsider = _create_chat(APIClient(), display_name="mallory")
@@ -658,7 +677,6 @@ class TranscriptChainTests(TestCase):
                 "encrypted_text": text, "aes_nonce": "n", "aes_tag": "t", "mac": "s",
                 "prev_hash": prev_hash,
                 "sender_chain_epoch": epoch, "chain_index": 0,
-                "wrapped_keys": [{"recipient_id": sender_id, "encrypted_symmetric_key": "key-self"}],
             },
             format="json",
         )
@@ -678,10 +696,6 @@ class TranscriptChainTests(TestCase):
             f"/chat/send-message/{self.chat_id}/",
             {
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "s",
-                "wrapped_keys": [
-                    {"recipient_id": self.alice_id, "encrypted_symmetric_key": "key-a"},
-                    {"recipient_id": self.bob_id, "encrypted_symmetric_key": "key-b"},
-                ],
             },
             format="json",
         )
@@ -734,7 +748,6 @@ class ChatServicesUnitTests(TestCase):
     def _send(self, sender, **overrides):
         kwargs = dict(
             encrypted_text="ct", aes_nonce="n", aes_tag="t", mac="m",
-            wrapped_keys=[{"recipient_id": sender.pk, "encrypted_symmetric_key": "k"}],
             prev_hash=GENESIS_HASH, sender_chain_epoch=0, chain_index=0,
         )
         kwargs.update(overrides)
@@ -846,13 +859,6 @@ class ChatServicesUnitTests(TestCase):
             self._send(self.alice, prev_hash="not-the-real-genesis-hash")
         self.assertEqual(ctx.exception.expected_prev_hash, GENESIS_HASH)
 
-    def test_send_message_requires_the_senders_own_self_wrap(self):
-        services.issue_chain_key(
-            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
-        )
-        with self.assertRaises(services.MissingSelfWrap):
-            self._send(self.alice, wrapped_keys=[{"recipient_id": self.bob.pk, "encrypted_symmetric_key": "k"}])
-
     def test_send_message_appends_and_returns_the_created_message(self):
         services.issue_chain_key(
             self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
@@ -935,7 +941,6 @@ class MessageExpiryUnitTests(TestCase):
         return services.send_message(
             self.chat.pin, self.alice,
             encrypted_text="ct", aes_nonce="n", aes_tag="t", mac="m",
-            wrapped_keys=[{"recipient_id": self.alice.pk, "encrypted_symmetric_key": "k"}],
             prev_hash=GENESIS_HASH, sender_chain_epoch=0, chain_index=0, ttl_seconds=ttl_seconds,
         )
 
@@ -980,7 +985,6 @@ class MessageExpiryUnitTests(TestCase):
         self.assertIsNone(msg.aes_tag)
         self.assertIsNone(msg.mac)
         self.assertIsNotNone(msg.tombstoned_at)
-        self.assertEqual(MessageKey.objects.filter(message=msg).count(), 0)
         self.assertEqual(MessageReadReceipt.objects.filter(message=msg).count(), 0)
 
     def test_tombstoning_preserves_the_original_chain_hash(self):
@@ -1060,7 +1064,6 @@ class MessageExpiryHTTPTests(TestCase):
                 "encrypted_text": "ct", "aes_nonce": "n", "aes_tag": "t", "mac": "m",
                 "prev_hash": GENESIS_HASH, "sender_chain_epoch": self.epoch, "chain_index": 0,
                 "ttl_seconds": ttl_seconds,
-                "wrapped_keys": [{"recipient_id": self.alice_id, "encrypted_symmetric_key": "k"}],
             },
             format="json",
         )

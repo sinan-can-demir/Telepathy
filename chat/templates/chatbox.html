@@ -408,6 +408,13 @@
     const recvChainEpochName = (cid, sid) => `chain_recv_epoch_${cid}_${sid}`;
     const recvChainKeyName = (cid, sid) => `chain_recv_key_${cid}_${sid}`;
     const msgKeyName = (cid, msgId) => `msgkey_${cid}_${msgId}`;
+    // The sender's own copy of each message key, by chain position (#99).
+    // The server used to keep an RSA-wrapped copy of it per message so the
+    // sender could redisplay their history; that copy outlived the ratchet,
+    // so it now lives only here. Keyed by (epoch, index) rather than
+    // message id because both are known before the send, so the message
+    // can render the moment it comes back from the server.
+    const myMsgKeyName = (cid, epoch, idx) => `mykey_${cid}_${epoch}_${idx}`;
     // Keys for chain positions a receiver ratcheted *past* without a message
     // to use them on (the message was dropped or aged out of the relay; see
     // advanceChainTo). Kept so one that turns up late still decrypts.
@@ -447,7 +454,7 @@
             if (key && prefixes.some(p => key.startsWith(p))) toRemove.push(key);
         }
         toRemove.forEach(k => localStorage.removeItem(k));
-        await idbDeleteByPrefix([`chain_recv_key_${cid}_`, `msgkey_${cid}_`, `skipkey_${cid}_`]);
+        await idbDeleteByPrefix([`chain_recv_key_${cid}_`, `msgkey_${cid}_`, `skipkey_${cid}_`, `mykey_${cid}_`]);
     }
 
     // Issues a fresh chain-key epoch (wrapped RSA-OAEP per recipient) iff the
@@ -509,6 +516,20 @@
         }
         chainKeysFetchedThisBatch = true;
         return chainKeysFetchCache;
+    }
+
+    // Tells the server this browser has stored senderId's seed for `epoch`,
+    // so it deletes its wrapped copy (#99): kept, that copy plus this
+    // browser's RSA key would re-derive the whole chain from index 0 long
+    // after the ratchet here has moved past it. Only called from commit(),
+    // i.e. after a message under that seed actually decrypted -- a seed
+    // that hasn't been proven good must stay fetchable. Best effort: if the
+    // request fails the wrap stays until the chat is deleted.
+    function ackChainKey(senderId, epoch){
+        fetch(`/chat/ack-chain-key/${chatId}/`, {
+            method:'POST', headers: authHeaders({'Content-Type':'application/json'}),
+            body: JSON.stringify({sender_id: senderId, epoch}),
+        }).catch(e => console.warn('ack-chain-key failed', e));
     }
 
     // Returns { messageKey, authKey, commit } -- both keys non-extractable
@@ -585,7 +606,10 @@
             // old epoch over a new record only re-seeds once more.
             await idbSet(msgKeyName(chatId, msg.id), derived);
             await idbSet(recvChainKeyName(chatId, senderId), { chainKey: nextChainKey, index: target + 1 });
-            if (reseededEpoch !== null) localStorage.setItem(recvChainEpochName(chatId, senderId), String(reseededEpoch));
+            if (reseededEpoch !== null) {
+                localStorage.setItem(recvChainEpochName(chatId, senderId), String(reseededEpoch));
+                ackChainKey(senderId, reseededEpoch);
+            }
         };
         return { ...derived, commit };
     }
@@ -893,7 +917,7 @@
     const SEND_STEPS = [
         'Deriving forward-secret session key (ratchet)…',
         'Encrypting message (AES-256-GCM)…',
-        'Wrapping key for yourself (RSA-OAEP)…',
+        'Keeping your copy of the key on this device…',
         'Authenticating message (deniable MAC)…',
         'Sending encrypted payload…'
     ];
@@ -1320,11 +1344,13 @@
         try{
             let aesKey, authKey = null, commitKeys = null;
             if(isMine){
-                cryptoSteps.push({label:'RSA-OAEP key unwrap (self)', ok:null});
-                const wk = msg.my_encrypted_symmetric_key;
-                if(!wk) throw new Error('No self-wrapped key');
-                const rawKey = await crypto.subtle.decrypt({name:'RSA-OAEP'},myEncKeys.privateKey,b642ab(wk));
-                aesKey = await importAesKey(rawKey, ['decrypt']);
+                // Only this browser has it (#99): a sent message shows as
+                // undecryptable after local storage is cleared or on
+                // another device, the same as received ones already do.
+                cryptoSteps.push({label:'Own message key (kept on this device)', ok:null});
+                const own = await idbGet(myMsgKeyName(chatId, msg.sender_chain_epoch, msg.chain_index));
+                if(!own) throw new Error('No local copy of this sent message\'s key');
+                aesKey = own.messageKey;
                 cryptoSteps[0].ok = true;
             } else {
                 cryptoSteps.push({label:'Chain ratchet (forward-secret)', ok:null});
@@ -1478,9 +1504,6 @@
             }
             await ensureMyChainKey(recipients);
             const { chainKey: currentChainKey, index: chainIndex } = await idbGet(myChainKeyName(chatId));
-            // messageKeyBytes exists as raw bytes only transiently, here,
-            // because the RSA-OAEP self-wrap below needs plaintext bytes to
-            // encrypt -- it's never persisted anywhere in this form. See #55.
             const { messageKeyBytes, authKeyBytes, nextChainKey } = await ratchetStep(currentChainKey);
             // Do NOT commit nextChainKey yet. A 409 (someone else's message
             // landed first -- an ordinary outcome of concurrent sends, not
@@ -1495,13 +1518,16 @@
             completeSendStep(0);
 
             advanceSendStep(1);
-            const messageKey = await importAesKey(messageKeyBytes, ['encrypt']);
+            const messageKey = await importAesKey(messageKeyBytes, ['encrypt', 'decrypt']);
             const aesEnc=await encryptWithAES(messageKey,plaintext);
             completeSendStep(1);
 
             advanceSendStep(2);
-            const wSelf=await crypto.subtle.encrypt({name:'RSA-OAEP'},myEncKeys.publicKey,messageKeyBytes);
-            const wrapped_keys=[{recipient_id:Number(myParticipantId),encrypted_symmetric_key:ab2b64(wSelf)}];
+            // Stored before the POST so the message can render as soon as
+            // the server echoes it (the websocket push can beat this
+            // handler). A 409 retry reuses the same chain position and
+            // overwrites it; only one message ever lands there.
+            await idbSet(myMsgKeyName(chatId, senderChainEpoch, chainIndex), { messageKey });
             completeSendStep(2);
 
             advanceSendStep(3);
@@ -1527,7 +1553,7 @@
             const rawTtl = ttlSelect.value;
             const ttlSeconds = rawTtl ? Number(rawTtl) : null;
             const body = {
-                encrypted_text:aesEnc.ciphertext,wrapped_keys,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,
+                encrypted_text:aesEnc.ciphertext,aes_nonce:aesEnc.nonce,aes_tag:aesEnc.tag,
                 mac:ab2b64(mac),prev_hash:prevHash,sender_chain_epoch:senderChainEpoch,chain_index:chainIndex,
             };
             if(ttlSeconds) body.ttl_seconds = ttlSeconds;
