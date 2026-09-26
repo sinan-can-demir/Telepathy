@@ -121,6 +121,7 @@
         .waiting-pin{font-family:'JetBrains Mono',monospace;font-size:1.8rem;font-weight:700;color:var(--cyan);
             letter-spacing:0.3em;margin:1rem 0;text-shadow:0 0 20px rgba(0,229,255,0.4)}
 
+        .system-notice{color:var(--text-dim);font-size:0.78rem;text-align:center;margin:0.5rem auto;max-width:90%}
         .error-message{background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);color:var(--red);padding:0.6rem 0.9rem;border-radius:10px;margin:0.5rem;text-align:center;font-size:0.82rem}
 
         /* ── Transcript tamper-evidence ── */
@@ -293,6 +294,9 @@
     // can be checked against what was actually trusted before -- independent
     // of whatever the server hands back next. See docs/KEY_VERIFICATION.md.
     const pinnedEncKeyName = (cid, pid) => `pinned_enc_${cid}_${pid}`;
+    // Last roster this browser saw, {participantId: displayName}, so a join
+    // or leave is announced even if it happened while the tab was closed.
+    const rosterName = cid => `roster_${cid}`;
 
     // ── Crypto helpers ──────────────────────────────────────────────────────
     function derToPem(buf, label) {
@@ -753,7 +757,30 @@
         const {participants} = await r.json();
         const others = participants.filter(p => String(p.id) !== String(myParticipantId));
         for(const p of others) await verifyAndPinKey(p);
+        announceRosterChanges(others);
         return others;
+    }
+
+    // Joining needs no approval from existing members, and a group re-keys
+    // to include a newcomer on everyone's next send -- so a join must at
+    // least never be silent (#100). Runs on every roster fetch, including
+    // the one right before a send.
+    function announceRosterChanges(others){
+        const now = Object.fromEntries(others.map(p => [String(p.id), p.display_name]));
+        let before = null;
+        try{ before = JSON.parse(localStorage.getItem(rosterName(chatId))); }catch(e){}
+        localStorage.setItem(rosterName(chatId), JSON.stringify(now));
+        if(!before){
+            const names = Object.values(now);
+            if(names.length) showSystemNotice(`In this chat: ${names.join(', ')}.`);
+            return;
+        }
+        for(const [id, name] of Object.entries(now)){
+            if(!(id in before)) showSystemNotice(`${name} joined the chat. Compare their key fingerprint with them before trusting who they are.`);
+        }
+        for(const [id, name] of Object.entries(before)){
+            if(!(id in now)) showSystemNotice(`${name} left the chat.`);
+        }
     }
 
     // Re-checks TOFU trust for the current roster and refreshes the
@@ -787,6 +814,7 @@
     const chatMain=document.getElementById('chatMain');
     const leaveBtn=document.getElementById('leave-chat');
 
+    function showSystemNotice(msg){ const d=document.createElement('div');d.className='system-notice';d.textContent=msg;messagesDiv.appendChild(d);messagesDiv.scrollTop=messagesDiv.scrollHeight; }
     function showError(msg){ const d=document.createElement('div');d.className='error-message';d.textContent=msg;messagesDiv.appendChild(d);messagesDiv.scrollTop=messagesDiv.scrollHeight; }
     function showFatalError(msg){ alert(msg); window.location.href='/chat/usermenu/'; }
 
@@ -883,6 +911,7 @@
     async function destroyKeys(cid){
         localStorage.removeItem(pubKeyName(cid));
         localStorage.removeItem(participantIdName(cid));
+        localStorage.removeItem(rosterName(cid));
         await idbDelete(privKeyName(cid));
         await idbDelete(tokenName(cid));
         await destroyChainState(cid);

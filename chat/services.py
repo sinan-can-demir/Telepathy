@@ -40,6 +40,10 @@ class ChatFull(ChatServiceError):
     pass
 
 
+class DisplayNameTaken(ChatServiceError):
+    """Another active participant already goes by this name (issue #100)."""
+
+
 class NotAParticipant(ChatServiceError):
     """The caller isn't an active participant of the chat they're acting on."""
 
@@ -79,7 +83,17 @@ class InvalidTTL(ChatServiceError):
 # ── Validation ────────────────────────────────────────────────────────────
 
 def is_valid_display_name(name):
-    return bool(name) and re.match(r'^[a-zA-Z0-9_ -]{1,32}$', name) is not None
+    # fullmatch, not match with '$': '$' also matches before a trailing
+    # newline, so "alice\n" used to validate (threat-model T-22).
+    return (isinstance(name, str) and re.fullmatch(r'[a-zA-Z0-9_ -]{1,32}', name) is not None
+            and not name.isspace())
+
+
+def display_name_key(name):
+    """What two display names are compared by: "Alice", "alice" and
+    "alice  " render as the same person to a reader, so they count as the
+    same name."""
+    return " ".join(name.split()).casefold()
 
 
 # A 2048-bit RSA SPKI PEM is well under 1KB; capping length before ever
@@ -187,11 +201,21 @@ def get_chat(chat_id):
 
 
 def join_chat(chat, display_name, public_key):
-    """Raises ChatFull. Returns (participant, raw_token)."""
-    active_participants = chat.participants.filter(left_at__isnull=True)
-    if active_participants.count() >= chat.max_participants:
-        raise ChatFull()
-    return issue_participant(chat, display_name, public_key)
+    """Raises ChatFull, DisplayNameTaken. Returns (participant, raw_token).
+
+    Names must be unique among the chat's active participants (#100):
+    otherwise an intruder can join as a second "alice" and be read as the
+    real one. The chat row is locked so two concurrent joins can't both
+    pass the name or capacity check (the latter could overfill a group)."""
+    with transaction.atomic():
+        chat = Chat.objects.select_for_update().get(pk=chat.pk)
+        active_participants = list(chat.participants.filter(left_at__isnull=True))
+        if len(active_participants) >= chat.max_participants:
+            raise ChatFull()
+        key = display_name_key(display_name)
+        if any(display_name_key(p.display_name) == key for p in active_participants):
+            raise DisplayNameTaken()
+        return issue_participant(chat, display_name, public_key)
 
 
 def mark_left(participant, now=None):

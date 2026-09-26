@@ -147,6 +147,8 @@ class JoinChatView(APIView):
             participant, raw_token = services.join_chat(chat, display_name, public_key)
         except services.ChatFull:
             return Response({"message": "Chat is full."}, status=400)
+        except services.DisplayNameTaken:
+            return Response({"message": "Someone in this chat already uses that name. Pick another."}, status=409)
 
         logger.info(f"[JOIN-CHAT] '{display_name}' joined chat '{chat_id}'.")
         notify_chat(chat_id, "roster_changed")
