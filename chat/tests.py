@@ -33,7 +33,11 @@ def _create_chat(client, display_name="alice", max_participants=None, public_key
 
 
 def _join_chat(client, chat_id, display_name="bob", public_key=None):
-    body = {"chat_id": chat_id, "display_name": display_name, "public_key": public_key or _fake_public_key_pem()}
+    # Tests address chats by public id; the join itself takes the PIN (#101
+    # stage 1). Anything that isn't a live chat's id is sent as a PIN guess.
+    chat = Chat.objects.filter(public_id=chat_id).first()
+    pin = chat.pin if chat else chat_id
+    body = {"pin": pin, "display_name": display_name, "public_key": public_key or _fake_public_key_pem()}
     return client.post("/chat/join-chat/", body, format="json")
 
 
@@ -189,11 +193,11 @@ class TokenAuthTests(TestCase):
         # #97: idle expiry used to only set left_at, so a chat emptied that
         # way kept its row, messages and PIN forever.
         stale = timezone.now() - IDLE_TIMEOUT - timedelta(seconds=1)
-        ChatParticipant.objects.filter(chat__pin=self.chat_id).update(last_seen=stale)
+        ChatParticipant.objects.filter(chat__public_id=self.chat_id).update(last_seen=stale)
         self.assertEqual(self.alice.get(f"/chat/get-messages/{self.chat_id}/").status_code, 401)
-        self.assertTrue(Chat.objects.filter(pin=self.chat_id).exists())  # bob still counts
+        self.assertTrue(Chat.objects.filter(public_id=self.chat_id).exists())  # bob still counts
         self.assertEqual(self.bob.get(f"/chat/get-messages/{self.chat_id}/").status_code, 401)
-        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+        self.assertFalse(Chat.objects.filter(public_id=self.chat_id).exists())
 
     def test_active_use_keeps_last_seen_fresh(self):
         stale_but_within_timeout = timezone.now() - timedelta(minutes=1)
@@ -207,13 +211,55 @@ class TokenAuthTests(TestCase):
         self.assertGreater(alice.last_seen, stale_but_within_timeout)
 
 
+class OpaqueChatIdTests(TestCase):
+    """#101 stage 1: the PIN is a join secret, not the chat's address."""
+
+    def setUp(self):
+        failed_join_attempts.clear()
+        self.alice = APIClient()
+        create = _create_chat(self.alice)
+        self.chat_id, self.pin = create.data["chat_id"], create.data["pin"]
+        self.alice.credentials(HTTP_AUTHORIZATION=f"Token {create.data['participant_token']}")
+
+    def test_create_returns_an_opaque_id_and_the_pin_separately(self):
+        self.assertRegex(self.pin, r"^\d{4}$")
+        self.assertRegex(self.chat_id, r"^[A-Za-z0-9_-]{16}$")
+
+    def test_join_takes_the_pin_and_returns_the_id(self):
+        join = APIClient().post("/chat/join-chat/", {"pin": self.pin, "display_name": "bob",
+                                                     "public_key": _fake_public_key_pem()}, format="json")
+        self.assertEqual(join.status_code, 200, join.data)
+        self.assertEqual(join.data["chat_id"], self.chat_id)
+        missing = APIClient().post("/chat/join-chat/", {"display_name": "carol",
+                                                        "public_key": _fake_public_key_pem()}, format="json")
+        self.assertEqual(missing.status_code, 400)
+
+    def test_the_pin_is_not_an_address(self):
+        self.assertEqual(self.alice.get(f"/chat/get-messages/{self.chat_id}/").status_code, 200)
+        self.assertEqual(self.alice.get(f"/chat/get-messages/{self.pin}/").status_code, 404)
+
+    def test_members_are_shown_the_pin_to_share(self):
+        self.assertEqual(self.alice.get(f"/chat/get-messages/{self.chat_id}/").data["pin"], self.pin)
+
+    def test_ids_come_from_secrets(self):
+        with patch("chat.models.secrets.token_urlsafe", return_value="X" * 16) as gen:
+            chat = services.create_chat("zed", _fake_public_key_pem(), 2)[0]
+        gen.assert_any_call(12)
+        self.assertEqual(chat.public_id, "X" * 16)
+
+    def test_join_notifies_the_chat_by_its_id(self):
+        with patch("chat.views.notify_chat") as notify:
+            _join_chat(APIClient(), self.chat_id)
+        notify.assert_called_once_with(self.chat_id, "roster_changed")
+
+
 class DuplicateNameJoinTests(TestCase):
     def test_join_with_a_taken_name_is_a_409(self):
         failed_join_attempts.clear()
         chat_id = _create_chat(APIClient(), display_name="alice").data["chat_id"]
         response = _join_chat(APIClient(), chat_id, display_name="Alice")
         self.assertEqual(response.status_code, 409, response.data)
-        self.assertEqual(ChatParticipant.objects.filter(chat__pin=chat_id).count(), 1)
+        self.assertEqual(ChatParticipant.objects.filter(chat__public_id=chat_id).count(), 1)
 
 
 class ConcurrentJoinTests(TransactionTestCase):
@@ -265,7 +311,7 @@ class IdleReaperTests(TestCase):
         self.chat_id = create.data["chat_id"]
         self.alice.credentials(HTTP_AUTHORIZATION=f"Token {create.data['participant_token']}")
         self.bob_id = _join_chat(APIClient(), self.chat_id, display_name="bob").data["participant_id"]
-        self.chat = Chat.objects.get(pin=self.chat_id)
+        self.chat = Chat.objects.get(public_id=self.chat_id)
         alice = self.chat.participants.get(display_name="alice")
         Message.objects.create(chat=self.chat, sender=alice, encrypted_text="x", aes_nonce="x",
                                aes_tag="x", mac="x", seq=0)
@@ -275,11 +321,11 @@ class IdleReaperTests(TestCase):
         ChatParticipant.objects.filter(chat=self.chat).update(last_seen=self.stale)
         expired, deleted, changed = services.reap_idle_chats()
         self.assertEqual((expired, deleted, changed), (2, 1, set()))
-        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+        self.assertFalse(Chat.objects.filter(public_id=self.chat_id).exists())
         self.assertEqual(Message.objects.count(), 0)
         self.assertEqual(ChatParticipant.objects.count(), 0)
-        with patch("chat.services.secrets.randbelow", return_value=int(self.chat_id)):
-            self.assertEqual(_create_chat(APIClient()).data["chat_id"], self.chat_id)
+        with patch("chat.services.secrets.randbelow", return_value=int(self.chat.pin)):
+            self.assertEqual(_create_chat(APIClient()).data["pin"], self.chat.pin)
 
     def test_only_idle_participants_are_expired(self):
         ChatParticipant.objects.filter(pk=self.bob_id).update(last_seen=self.stale)
@@ -295,7 +341,7 @@ class IdleReaperTests(TestCase):
         # chat still present.
         ChatParticipant.objects.filter(chat=self.chat).update(left_at=timezone.now())
         self.assertEqual(services.reap_idle_chats(), (0, 1, set()))
-        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+        self.assertFalse(Chat.objects.filter(public_id=self.chat_id).exists())
 
     def test_management_command_notifies_chats_that_lost_a_member(self):
         from django.core.management import call_command
@@ -326,7 +372,7 @@ class JoinChatRateLimitTests(TestCase):
         self.assertEqual(response.status_code, 429)
 
         # Even a real PIN is throttled during the cooldown window.
-        real_pin = _create_chat(APIClient(), display_name="creator").data["chat_id"]
+        real_pin = _create_chat(APIClient(), display_name="creator").data["pin"]
         response = _join_chat(self.client, real_pin)
         self.assertEqual(response.status_code, 429)
 
@@ -481,27 +527,30 @@ class MessageRoundTripTests(TestCase):
         leave = self.alice.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
         self.assertEqual(leave.status_code, 200)
         self.assertEqual(Message.objects.count(), 1)
-        self.assertTrue(Chat.objects.filter(pin=self.chat_id).exists())
+        self.assertTrue(Chat.objects.filter(public_id=self.chat_id).exists())
 
         # Bob leaves too; chat is now fully empty -- it (and its messages,
         # via cascade) is hard-deleted, freeing its PIN for reuse (#35).
         leave2 = self.bob.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
         self.assertEqual(leave2.status_code, 200)
         self.assertEqual(Message.objects.count(), 0)
-        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+        self.assertFalse(Chat.objects.filter(public_id=self.chat_id).exists())
 
     def test_emptied_chats_pin_becomes_reusable(self):
+        pin = Chat.objects.get(public_id=self.chat_id).pin
         leave = self.alice.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
         self.assertEqual(leave.status_code, 200)
         leave2 = self.bob.post("/chat/leave-chat/", {"chat_id": self.chat_id}, format="json")
         self.assertEqual(leave2.status_code, 200)
-        self.assertFalse(Chat.objects.filter(pin=self.chat_id).exists())
+        self.assertFalse(Chat.objects.filter(public_id=self.chat_id).exists())
 
-        # A brand-new chat can now legitimately reuse that same PIN.
-        with patch("chat.services.secrets.randbelow", return_value=int(self.chat_id)):
+        # A brand-new chat can now legitimately reuse that same PIN -- but
+        # never the old chat's address (#101 stage 1).
+        with patch("chat.services.secrets.randbelow", return_value=int(pin)):
             recreated = _create_chat(APIClient(), display_name="new-owner")
         self.assertEqual(recreated.status_code, 201, recreated.data)
-        self.assertEqual(recreated.data["chat_id"], self.chat_id)
+        self.assertEqual(recreated.data["pin"], pin)
+        self.assertNotEqual(recreated.data["chat_id"], self.chat_id)
 
 
 class GroupChatFeatureTests(TestCase):
@@ -728,7 +777,7 @@ class TranscriptChainTests(TestCase):
         second = self._send(self.bob, prev_hash=tip_hash, text="from bob", sender_id=self.bob_id)
         self.assertEqual([first.data["seq"], second.data["seq"]], [0, 1])
         self.assertEqual(
-            list(Message.objects.filter(chat__pin=self.chat_id).order_by("seq").values_list("seq", flat=True)),
+            list(Message.objects.filter(chat__public_id=self.chat_id).order_by("seq").values_list("seq", flat=True)),
             [0, 1],
         )
 
@@ -751,7 +800,7 @@ class ChatServicesUnitTests(TestCase):
             prev_hash=GENESIS_HASH, sender_chain_epoch=0, chain_index=0,
         )
         kwargs.update(overrides)
-        return services.send_message(self.chat.pin, sender, **kwargs)
+        return services.send_message(self.chat.public_id, sender, **kwargs)
 
     def test_create_chat_generates_a_4_digit_pin_and_first_participant(self):
         self.assertRegex(self.chat.pin, r'^\d{4}$')
@@ -823,14 +872,14 @@ class ChatServicesUnitTests(TestCase):
             services.get_chat("0000")
 
     def test_leave_chat_keeps_the_chat_alive_while_someone_remains(self):
-        deleted, remaining = services.leave_chat(self.alice, self.chat.pin)
+        deleted, remaining = services.leave_chat(self.alice, self.chat.public_id)
         self.assertFalse(deleted)
         self.assertEqual(remaining, 1)
         self.assertTrue(Chat.objects.filter(pk=self.chat.pk).exists())
 
     def test_leave_chat_deletes_the_chat_once_everyone_has_left(self):
-        services.leave_chat(self.alice, self.chat.pin)
-        deleted, remaining = services.leave_chat(self.bob, self.chat.pin)
+        services.leave_chat(self.alice, self.chat.public_id)
+        deleted, remaining = services.leave_chat(self.bob, self.chat.public_id)
         self.assertTrue(deleted)
         self.assertEqual(remaining, 0)
         self.assertFalse(Chat.objects.filter(pk=self.chat.pk).exists())
@@ -838,7 +887,7 @@ class ChatServicesUnitTests(TestCase):
     def test_leave_chat_rejects_a_participant_who_isnt_in_that_chat(self):
         _other_chat, carol, _token = services.create_chat("carol", _fake_public_key_pem(), max_participants=2)
         with self.assertRaises(services.NotAParticipant):
-            services.leave_chat(carol, self.chat.pin)
+            services.leave_chat(carol, self.chat.public_id)
 
     def test_send_message_requires_a_chain_key_to_be_issued_first(self):
         with self.assertRaises(services.UnknownChainEpoch):
@@ -846,14 +895,14 @@ class ChatServicesUnitTests(TestCase):
 
     def test_send_message_rejects_a_stale_chain_epoch(self):
         epoch = services.issue_chain_key(
-            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
+            self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
         )
         with self.assertRaises(services.StaleChainEpoch):
             self._send(self.alice, sender_chain_epoch=epoch + 1)
 
     def test_send_message_rejects_a_stale_prev_hash(self):
         services.issue_chain_key(
-            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
+            self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
         )
         with self.assertRaises(services.StaleTranscript) as ctx:
             self._send(self.alice, prev_hash="not-the-real-genesis-hash")
@@ -861,7 +910,7 @@ class ChatServicesUnitTests(TestCase):
 
     def test_send_message_appends_and_returns_the_created_message(self):
         services.issue_chain_key(
-            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
+            self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}]
         )
         msg = self._send(self.alice)
         self.assertEqual(msg.seq, 0)
@@ -870,28 +919,28 @@ class ChatServicesUnitTests(TestCase):
 
     def test_issue_chain_key_rejects_wraps_that_dont_cover_exactly_the_roster(self):
         with self.assertRaises(services.RosterMismatch):
-            services.issue_chain_key(self.chat.pin, self.alice, [])  # missing bob's wrap entirely
+            services.issue_chain_key(self.chat.public_id, self.alice, [])  # missing bob's wrap entirely
         with self.assertRaises(services.RosterMismatch):
-            services.issue_chain_key(self.chat.pin, self.alice, [
+            services.issue_chain_key(self.chat.public_id, self.alice, [
                 {"recipient_id": self.bob.pk, "encrypted_seed": "seed"},
                 {"recipient_id": 999999, "encrypted_seed": "seed"},  # extra, unrelated recipient
             ])
 
     def test_issue_chain_key_epoch_increments_per_sender(self):
         epoch0 = services.issue_chain_key(
-            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "s0"}]
+            self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "s0"}]
         )
         epoch1 = services.issue_chain_key(
-            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "s1"}]
+            self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "s1"}]
         )
         self.assertEqual([epoch0, epoch1], [0, 1])
 
     def test_get_latest_chain_keys_dedupes_to_the_newest_epoch_per_sender(self):
         services.issue_chain_key(
-            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "old-seed"}]
+            self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "old-seed"}]
         )
         services.issue_chain_key(
-            self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "new-seed"}]
+            self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "new-seed"}]
         )
         result = services.get_latest_chain_keys_for_recipient(self.chat, self.bob)
         self.assertEqual(len(result), 1)
@@ -906,7 +955,7 @@ class ChatServicesUnitTests(TestCase):
         # request can ever reach either check with a left participant --
         # this test exercises the service functions directly, bypassing
         # that guarantee, specifically to make the distinction visible.
-        services.leave_chat(self.bob, self.chat.pin)
+        services.leave_chat(self.bob, self.chat.public_id)
         bob_row = ChatParticipant.objects.get(pk=self.bob.pk)
 
         services.require_same_chat(self.chat, bob_row)  # does not raise -- FK check only
@@ -935,11 +984,11 @@ class MessageExpiryUnitTests(TestCase):
     def setUp(self):
         self.chat, self.alice, _ = services.create_chat("alice", _fake_public_key_pem(), max_participants=3)
         self.bob, _ = services.join_chat(self.chat, "bob", _fake_public_key_pem())
-        services.issue_chain_key(self.chat.pin, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}])
+        services.issue_chain_key(self.chat.public_id, self.alice, [{"recipient_id": self.bob.pk, "encrypted_seed": "seed"}])
 
     def _send(self, ttl_seconds=None):
         return services.send_message(
-            self.chat.pin, self.alice,
+            self.chat.public_id, self.alice,
             encrypted_text="ct", aes_nonce="n", aes_tag="t", mac="m",
             prev_hash=GENESIS_HASH, sender_chain_epoch=0, chain_index=0, ttl_seconds=ttl_seconds,
         )
@@ -1013,7 +1062,7 @@ class MessageExpiryUnitTests(TestCase):
 
     def test_expiry_unblocks_once_a_never_reading_participant_leaves(self):
         msg = self._send(ttl_seconds=60)
-        services.leave_chat(self.bob, self.chat.pin)  # bob never read it, then left
+        services.leave_chat(self.bob, self.chat.public_id)  # bob never read it, then left
 
         services.sweep_expired_messages(self.chat)
         msg.refresh_from_db()

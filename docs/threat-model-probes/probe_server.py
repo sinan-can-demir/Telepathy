@@ -46,14 +46,14 @@ class HttpProbes(TestCase):
         self.c = APIClient()
 
     def _join(self, pin, **extra):
-        return self.c.post("/chat/join-chat/", {"chat_id": pin, "public_key": PUB}, format="json", **extra)
+        return self.c.post("/chat/join-chat/", {"pin": pin, "public_key": PUB}, format="json", **extra)
 
     def test_1_join_limiter_bypass_and_pin_bruteforce(self):
         print("\n[1] PIN brute force vs. the join rate limiter")
         from chat import views
         views.failed_join_attempts.clear()
         r = self.c.post("/chat/create-chat/", {"public_key": PUB, "max_participants": 8, "display_name": "victim"}, format="json")
-        target = r.data["chat_id"]
+        target = r.data["pin"]
         say(f"victim created a group chat, PIN={target}")
         # control: same source address, no header games
         codes = [self._join(f"{9000 + i}").status_code for i in range(7)]
@@ -80,7 +80,7 @@ class HttpProbes(TestCase):
         print("\n[2] One client's failures lock out everyone sharing the source address (Tor: all clients)")
         from chat import views
         views.failed_join_attempts.clear()
-        victim = self.c.post("/chat/create-chat/", {"public_key": PUB}, format="json").data["chat_id"]
+        victim = self.c.post("/chat/create-chat/", {"public_key": PUB}, format="json").data["pin"]
         for i in range(5):
             self._join(f"{8000 + i}")
         legit = self._join(victim)
@@ -131,42 +131,42 @@ class HttpProbes(TestCase):
     def test_5_abandoned_chat_persists(self):
         print("\n[5] Abandoned chat: nobody returns, nothing reclaims it")
         r = self.c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "alice"}, format="json")
-        pin = r.data["chat_id"]
-        j = self._join(pin, )
-        chat = Chat.objects.get(pin=pin)
+        pin = r.data["chat_id"]  # the chat's address (public id) since #101 stage 1
+        j = self._join(r.data["pin"])
+        chat = Chat.objects.get(public_id=pin)
         alice, bob = list(chat.participants.order_by("joined_at"))
         Message.objects.create(chat=chat, sender=alice, encrypted_text="x", aes_nonce="x", aes_tag="x", mac="x", seq=0)
         ChatParticipant.objects.filter(chat=chat).update(last_seen=timezone.now() - timedelta(days=30))
         active = list(chat.participants.filter(left_at__isnull=True).values_list("display_name", flat=True))
-        say(f"30 days idle, no one authenticated since: chat exists={Chat.objects.filter(pin=pin).exists()} active participants={active}")
-        say("Chat rows:", Chat.objects.filter(pin=pin).count(), " Message rows:", Message.objects.filter(chat=chat).count(),
+        say(f"30 days idle, no one authenticated since: chat exists={Chat.objects.filter(public_id=pin).exists()} active participants={active}")
+        say("Chat rows:", Chat.objects.filter(public_id=pin).count(), " Message rows:", Message.objects.filter(chat=chat).count(),
             " -> PIN still held, ciphertext still stored")
-        third = self._join(pin)
+        third = self._join(r.data["pin"])
         say("a third party trying to use that PIN:", third.status_code, third.data)
         # The one path that does reclaim an idle participant: their OWN next authenticated request.
         for who, tok in (("alice", r.data["participant_token"]), ("bob", j.data["participant_token"])):
             resp = APIClient().get(f"/chat/get-messages/{pin}/", HTTP_AUTHORIZATION=f"Token {tok}")
             say(f"{who} finally returns after 30 days -> {resp.status_code} (idle-expired, marked left)")
-        say("after BOTH were idle-expired: Chat rows:", Chat.objects.filter(pin=pin).count(),
+        say("after BOTH were idle-expired: Chat rows:", Chat.objects.filter(public_id=pin).count(),
             " Message rows:", Message.objects.filter(chat=chat).count(),
             " active participants:", ChatParticipant.objects.filter(chat=chat, left_at__isnull=True).count())
         # At 123be67 the chat row and its messages survived this (T-07); since
         # #97 idle expiry deletes an emptied chat like an explicit leave does.
         # The reaper does it without anyone returning:
         r2 = self.c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "zoe"}, format="json")
-        ChatParticipant.objects.filter(chat__pin=r2.data["chat_id"]).update(last_seen=timezone.now() - timedelta(days=30))
+        ChatParticipant.objects.filter(chat__public_id=r2.data["chat_id"]).update(last_seen=timezone.now() - timedelta(days=30))
         say("second abandoned chat, nobody returns; one reaper pass ->", services.reap_idle_chats(),
-            " Chat rows left:", Chat.objects.filter(pin=r2.data["chat_id"]).count())
+            " Chat rows left:", Chat.objects.filter(public_id=r2.data["chat_id"]).count())
 
     def test_6_display_names_not_unique(self):
         print("\n[6] Display names are not unique within a chat")
         r = self.c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "alice"}, format="json")
-        j = self.c.post("/chat/join-chat/", {"chat_id": r.data["chat_id"], "public_key": PUB, "display_name": "alice"}, format="json")
+        j = self.c.post("/chat/join-chat/", {"pin": r.data["pin"], "public_key": PUB, "display_name": "alice"}, format="json")
         say("second participant joined as the same name 'alice' ->", j.status_code)
-        roster = Chat.objects.get(pin=r.data["chat_id"]).participants.values_list("display_name", flat=True)
+        roster = Chat.objects.get(public_id=r.data["chat_id"]).participants.values_list("display_name", flat=True)
         say("roster as stored:", list(roster))
         v = services.is_valid_display_name("alice\n")
-        say("is_valid_display_name('alice\\n') =", v, "(regex '$' tolerates a trailing newline)")
+        say("is_valid_display_name('alice\\n') =", v, "(True at 123be67: regex '$' tolerated a trailing newline; fixed in #107)")
 
 
 @override_settings(CHANNEL_LAYERS={"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}})
@@ -181,24 +181,27 @@ class WsProbes(TransactionTestCase):
         app = URLRouter(chat.routing.websocket_urlpatterns)
         chat_obj, alice, tok_a = services.create_chat("alice", PUB, 2)
         bob, tok_b = services.join_chat(chat_obj, "bob", PUB)
-        pin = chat_obj.pin
+        pin, cid = chat_obj.pin, chat_obj.public_id
 
         async def run():
-            comm = WebsocketCommunicator(app, f"/ws/chat/{pin}/", subprotocols=[tok_b])
+            comm = WebsocketCommunicator(app, f"/ws/chat/{cid}/", subprotocols=[tok_b])
             ok, _ = await comm.connect()
             say("bob connected:", ok)
-            await dbasync(services.leave_chat)(bob, pin)
+            await dbasync(services.leave_chat)(bob, cid)
             say("bob has left the chat via services.leave_chat (left_at set); alice still there")
-            await asyncio.to_thread(notify_chat, pin, "new_message")
+            await asyncio.to_thread(notify_chat, cid, "new_message")
             try:
                 msg = await comm.receive_json_from(timeout=2)
                 say("bob's socket STILL receives signals for the chat he left:", msg)
             except asyncio.TimeoutError:
                 say("bob's socket received nothing (subscription was cut)")
-            # chat emptied -> deleted -> PIN recycled to a stranger's brand-new chat
-            await dbasync(services.leave_chat)(alice, pin)
-            await dbasync(Chat.objects.create)(pin=pin)
-            await asyncio.to_thread(notify_chat, pin, "new_message")
+            # chat emptied -> deleted -> PIN recycled to a stranger's brand-new chat.
+            # At 123be67 the new chat shared the old group (chat_<pin>); since
+            # #101 stage 1 it gets a fresh public id, so the old socket hears nothing.
+            await dbasync(services.leave_chat)(alice, cid)
+            new_chat = await dbasync(Chat.objects.create)(pin=pin)
+            say(f"PIN {pin} recycled; new chat's id differs from the old one: {new_chat.public_id != cid}")
+            await asyncio.to_thread(notify_chat, new_chat.public_id, "new_message")
             try:
                 msg = await comm.receive_json_from(timeout=2)
                 say("after the PIN was recycled to an UNRELATED chat, bob's old socket receives:", msg)
@@ -207,9 +210,9 @@ class WsProbes(TransactionTestCase):
             await comm.disconnect()
             # positive control: a token for THIS chat must not open a socket on another chat
             other, _, _ = await dbasync(services.create_chat)("other", PUB, 2)
-            cross = WebsocketCommunicator(app, f"/ws/chat/{other.pin}/", subprotocols=[tok_a])
+            cross = WebsocketCommunicator(app, f"/ws/chat/{other.public_id}/", subprotocols=[tok_a])
             ok, code = await cross.connect()
-            say(f"token for chat {pin} opening a socket on chat {other.pin}: accepted={ok} (close code {code})")
+            say(f"token for chat {cid} opening a socket on chat {other.public_id}: accepted={ok} (close code {code})")
             await cross.disconnect()
         asyncio.run(run())
 
@@ -219,7 +222,7 @@ class FormatProbes(TestCase):
         print("\n[9] Server validates no ciphertext field format or size")
         c = APIClient()
         a = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "a"}, format="json").data
-        b = APIClient().post("/chat/join-chat/", {"chat_id": a["chat_id"], "public_key": PUB, "display_name": "b"}, format="json").data
+        b = APIClient().post("/chat/join-chat/", {"pin": a["pin"], "public_key": PUB, "display_name": "b"}, format="json").data
         h = {"HTTP_AUTHORIZATION": f"Token {a['participant_token']}"}
         r = c.post(f"/chat/issue-chain-key/{a['chat_id']}/", {"wraps": [{"recipient_id": b["participant_id"], "encrypted_seed": "!!not-a-wrapped-seed!!"}]}, format="json", **h)
         say("issue-chain-key with a garbage 'wrapped seed' ->", r.status_code)
@@ -239,7 +242,7 @@ class AuthzProbes(TestCase):
         c = APIClient()
         a = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "a1"}, format="json").data
         b = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "b1"}, format="json").data
-        APIClient().post("/chat/join-chat/", {"chat_id": b["chat_id"], "public_key": PUB, "display_name": "b2"}, format="json")
+        APIClient().post("/chat/join-chat/", {"pin": b["pin"], "public_key": PUB, "display_name": "b2"}, format="json")
         h = {"HTTP_AUTHORIZATION": f"Token {a['participant_token']}"}
         B = b["chat_id"]
         body = {"encrypted_text": "x", "aes_nonce": "x", "aes_tag": "x", "mac": "x", "prev_hash": "0" * 64, "sender_chain_epoch": 0,
@@ -255,7 +258,7 @@ class AuthzProbes(TestCase):
         ]
         for name, r in rows:
             say(f"{name:32s} -> {r.status_code}")
-        say("B's roster untouched:", Chat.objects.get(pin=B).participants.filter(left_at__isnull=True).count(), "active")
+        say("B's roster untouched:", Chat.objects.get(public_id=B).participants.filter(left_at__isnull=True).count(), "active")
         # a token whose participant has left must stop working
         ChatParticipant.objects.filter(pk=a["participant_id"]).update(left_at=timezone.now())
         r = c.get(f"/chat/get-messages/{a['chat_id']}/", **h)
@@ -272,8 +275,8 @@ class LoadProbes(TestCase):
         from django.test.utils import CaptureQueriesContext
         c = APIClient()
         a = c.post("/chat/create-chat/", {"public_key": PUB, "display_name": "a"}, format="json").data
-        APIClient().post("/chat/join-chat/", {"chat_id": a["chat_id"], "public_key": PUB, "display_name": "b"}, format="json")
-        chat = Chat.objects.get(pin=a["chat_id"])
+        APIClient().post("/chat/join-chat/", {"pin": a["pin"], "public_key": PUB, "display_name": "b"}, format="json")
+        chat = Chat.objects.get(public_id=a["chat_id"])
         alice = chat.participants.order_by("joined_at").first()
         h = {"HTTP_AUTHORIZATION": f"Token {a['participant_token']}"}
         made = 0

@@ -44,7 +44,7 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
 
     @database_sync_to_async
     def _authenticate(self, chat_id, raw_token):
-        return authenticate_participant(raw_token, chat_pin=chat_id)
+        return authenticate_participant(raw_token, chat_id=chat_id)
 
     # Group-sent event; "type": "chat.notify" maps to this method name.
     async def chat_notify(self, event):

@@ -237,8 +237,8 @@ All "Participant Token" endpoints authenticate via `Authorization: Token <partic
 | Method | Endpoint | Description | Auth |
 |--------|----------|-------------|------|
 | `GET` | `/chat/usermenu/` | Dashboard (create/join chat) | None |
-| `POST` | `/chat/create-chat/` | Create a chat; generates keys client-side first. Returns a 4-digit PIN + participant token | None |
-| `POST` | `/chat/join-chat/` | Join an existing chat by PIN; returns a participant token | None |
+| `POST` | `/chat/create-chat/` | Create a chat; generates keys client-side first. Returns the chat's opaque `chat_id` (its address for every other endpoint), the 4-digit `pin` to share, and a participant token | None |
+| `POST` | `/chat/join-chat/` | Join an existing chat with `pin`; returns its `chat_id` and a participant token. The PIN is used nowhere else | None |
 | `GET` | `/chat/get-chat-participants/<chat_id>/` | List active participants' ids/display names/public keys | Participant Token |
 | `POST` | `/chat/issue-chain-key/<chat_id>/` | Issue a new forward-secrecy chain epoch, wrapped per current other participant | Participant Token |
 | `GET` | `/chat/get-chain-keys/<chat_id>/` | Fetch the latest chain-key epoch issued to you by each sender | Participant Token |

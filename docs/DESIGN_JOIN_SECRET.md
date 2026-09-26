@@ -1,6 +1,6 @@
 # Design: replacing the 4-digit PIN with an invite (locator + secret)
 
-**Status: proposal, not built. The design decisions were settled on 2026-09-21 (see "Decisions"); implementation has not started.**
+**Status: decisions settled 2026-09-21 (see "Decisions"). Stage 1 built 2026-09-26; stages 2-4 not started.**
 Motivation: #95 (limiter bypass), #96 (enumeration), #98 (PIN exhaustion), #100 (silent admission), and the threat-model review in #93 (findings T-01, T-02, T-03, T-06, T-08, T-19). This doc also records the alternatives that were considered and rejected, so they don't get re-litigated.
 
 ## The problem in one paragraph
@@ -85,7 +85,7 @@ An earlier discussion said storing "a hash of the code" is sound because the cod
 
 ## Stages (one PR each)
 
-1. **Opaque chat id, and `secrets` everywhere.** Add `Chat.public_id`; route on it (API paths, websocket group `chat_<public_id>`); return it as `chat_id` from create/join so the client barely changes; switch the remaining `random` use to `secrets`. Still no invites: the 4-digit PIN stays as the join mechanism for now. Fixes the recycled-PIN websocket cross-talk (T-19, the PIN-reuse half), takes the PIN out of every request path after the join (it still appears in the join request itself and in the `[JOIN-CHAT]` log line until Stage 2; T-12's logging fix is separate), and separates address from secret. **Breaking:** in-flight chats end on deploy (their stored `chat_id` no longer resolves). There is precedent: migration 0021 wiped pre-forward-secrecy messages.
+1. **Opaque chat id, and `secrets` everywhere. (Done.)** Add `Chat.public_id`; route on it (API paths, websocket group `chat_<public_id>`); return it as `chat_id` from create/join so the client barely changes; switch the remaining `random` use to `secrets`. Still no invites: the 4-digit PIN stays as the join mechanism for now. Fixes the recycled-PIN websocket cross-talk (T-19, the PIN-reuse half), takes the PIN out of every request path after the join (it still appears in the join request itself and in the `[JOIN-CHAT]` log line until Stage 2; T-12's logging fix is separate), and separates address from secret. **Breaking:** in-flight chats end on deploy (their stored `chat_id` no longer resolves). There is precedent: migration 0021 wiped pre-forward-secrecy messages.
 2. **Invites.** `ChatInvite` model; `POST /chat/create-invite/<chat_id>/` (any member); `create-chat` issues the first invite; join takes handle+code; per-invite atomic attempt cap; check character; single use; expiry; generic errors; keyed-hashed code. UI: two-part input in `usermenu.html`, invite display with expiry and "new invite" in the waiting overlay. Removes `Chat.pin`, the per-IP limiter (#95) and `check-chat` (#96, which has no first-party caller). Bounds the resource at the source: handles exist only while an invite is open.
 3. **Companion (issue #100).** Roster-change notices, unique display names per chat, and the **fingerprint gate** before the first message to a new participant. Stage 2 makes admission deliberate; this makes a wrongly admitted person visible.
 4. **Optional, later.** A PAKE, if a vetted implementation exists (see above).

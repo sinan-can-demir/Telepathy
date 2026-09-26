@@ -24,7 +24,7 @@ def hash_token(raw_token):
     return hashlib.sha256(raw_token.encode()).hexdigest()
 
 
-def authenticate_participant(raw_token, chat_pin=None):
+def authenticate_participant(raw_token, chat_id=None):
     """Shared lookup for both HTTP (ParticipantTokenAuthentication) and
     WebSocket (chat.consumers.ChatConsumer) auth. Returns the matching
     ChatParticipant, or None if the token is invalid/unknown, already
@@ -42,8 +42,8 @@ def authenticate_participant(raw_token, chat_pin=None):
         auth_token_hash=hash_token(raw_token),
         left_at__isnull=True,
     )
-    if chat_pin is not None:
-        qs = qs.filter(chat__pin=chat_pin)
+    if chat_id is not None:
+        qs = qs.filter(chat__public_id=chat_id)
     try:
         participant = qs.get()
     except ChatParticipant.DoesNotExist:

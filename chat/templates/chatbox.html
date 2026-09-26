@@ -1054,7 +1054,7 @@
                 if(maxParticipants) body.max_participants = Number(maxParticipants);
                 resp = await fetch('/chat/create-chat/', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
             } else {
-                body.chat_id = params.get('chat_id');
+                body.pin = params.get('pin');
                 resp = await fetch('/chat/join-chat/', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
             }
         }catch(e){ showFatalError('Network error.'); return false; }
@@ -1065,7 +1065,9 @@
             return false;
         }
         const data = await resp.json();
-        chatId = data.chat_id || body.chat_id;
+        // The chat's address from here on; the PIN was only for getting in
+        // (#101 stage 1) and is never stored or put in a URL again.
+        chatId = data.chat_id;
         token = data.participant_token;
         myParticipantId = String(data.participant_id);
 
@@ -1077,13 +1079,11 @@
         return true;
     }
 
-    document.getElementById('waiting-pin').textContent = chatId||'';
 
     // ── Chat logic ──────────────────────────────────────────────────────────
     async function startChat(){
         const ok = await ensureParticipation();
         if(!ok) return;
-        document.getElementById('waiting-pin').textContent = chatId||'';
         pollInterval=setInterval(checkChatReady,2000);
         await checkChatReady();
     }
@@ -1111,6 +1111,8 @@
         const max = data.max_participants || 2;
         const countEl = document.getElementById('waiting-count');
         if(countEl) countEl.textContent = `${1+others.length}/${max} joined`;
+        // The PIN to share comes from the server; chatId is an opaque id.
+        document.getElementById('waiting-pin').textContent = data.pin || '';
     }
 
     // Server-push notification channel (see chat/consumers.py) -- carries no

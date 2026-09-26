@@ -189,9 +189,19 @@ def create_chat(display_name, public_key, max_participants):
 
 
 def get_chat(chat_id):
-    """Raises ChatNotFound."""
+    """Looks a chat up by its public id, its address everywhere after the
+    join. Raises ChatNotFound."""
     try:
-        return Chat.objects.get(pin=chat_id)
+        return Chat.objects.get(public_id=chat_id)
+    except Chat.DoesNotExist:
+        raise ChatNotFound()
+
+
+def get_chat_by_pin(pin):
+    """The join path only: the PIN is the join secret, not an address.
+    Raises ChatNotFound."""
+    try:
+        return Chat.objects.get(pin=pin)
     except Chat.DoesNotExist:
         raise ChatNotFound()
 
@@ -252,24 +262,24 @@ def reap_idle_chats(now=None):
     (#97). Run on a schedule by `manage.py reap_idle_chats` (the `reaper`
     service in compose.yaml).
 
-    Returns (participants_expired, chats_deleted, pins_of_chats_still_live
-    whose roster changed) -- the caller notifies those so remaining members
+    Returns (participants_expired, chats_deleted, public ids of chats still
+    live whose roster changed) -- the caller notifies those so remaining members
     see the departure and re-key on their next send."""
     now = now or timezone.now()
     expired = 0
     deleted = 0
-    changed_pins = set()
+    changed_ids = set()
     idle = (ChatParticipant.objects.select_related("chat")
             .filter(left_at__isnull=True, last_seen__lt=now - IDLE_TIMEOUT))
     for participant in idle:
-        pin = participant.chat.pin
+        chat_id = participant.chat.public_id
         chat_deleted, _ = mark_left(participant, now)
         expired += 1
         if chat_deleted:
             deleted += 1
-            changed_pins.discard(pin)
+            changed_ids.discard(chat_id)
         else:
-            changed_pins.add(pin)
+            changed_ids.add(chat_id)
 
     # Chats already emptied before idle expiry deleted them (anything
     # idle-expired before #97), or by any other path that set left_at alone.
@@ -278,7 +288,7 @@ def reap_idle_chats(now=None):
     )
     deleted += orphaned.count()
     orphaned.delete()
-    return expired, deleted, changed_pins
+    return expired, deleted, changed_ids
 
 
 # ── Messaging / forward-secrecy ratchet ──────────────────────────────────
@@ -309,7 +319,7 @@ def send_message(chat_id, sender, *, encrypted_text, aes_nonce, aes_tag, mac,
 
     with transaction.atomic():
         try:
-            chat = Chat.objects.select_for_update().get(pin=chat_id)
+            chat = Chat.objects.select_for_update().get(public_id=chat_id)
         except Chat.DoesNotExist:
             raise ChatNotFound()
         if sender.chat_id != chat.pk or sender.left_at is not None:
@@ -433,7 +443,7 @@ def issue_chain_key(chat_id, sender, wraps):
     Returns the new epoch number."""
     with transaction.atomic():
         try:
-            chat = Chat.objects.select_for_update().get(pin=chat_id)
+            chat = Chat.objects.select_for_update().get(public_id=chat_id)
         except Chat.DoesNotExist:
             raise ChatNotFound()
         participant = ChatParticipant.objects.select_for_update().get(pk=sender.pk)

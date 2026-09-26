@@ -165,7 +165,7 @@
         const st = document.getElementById('join-status');
         if (!/^\d{4}$/.test(pin)) { st.style.color = 'var(--red)'; st.textContent = 'Enter a valid 4-digit PIN.'; return; }
         const name = encodeURIComponent(getDisplayName());
-        window.location.href = `/chat/chatbox/?action=join&chat_id=${pin}&display_name=${name}`;
+        window.location.href = `/chat/chatbox/?action=join&pin=${pin}&display_name=${name}`;
     }
 </script>
 </body>
